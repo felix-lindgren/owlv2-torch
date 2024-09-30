@@ -2,9 +2,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import torchvision.transforms.v2 as T
+from PIL import Image
+
 from typing import Optional, Tuple
 
 from transformers.modeling_attn_mask_utils import _create_4d_causal_attention_mask, _prepare_4d_attention_mask
+
+OPENAI_CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
+OPENAI_CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
 
 class QuickGELUActivation(nn.Module):
     """
@@ -304,6 +310,24 @@ class OwlV2(nn.Module):
         self.sqrt_num_patches = self.image_size // self.patch_size
         self.box_bias = self.compute_box_bias(self.sqrt_num_patches)
 
+        self.image_transform = T.Compose([
+            T.ToImage(),
+            T.ToDtype(torch.float32,scale=True),
+            T.Resize((self.image_size, self.image_size), antialias=True),
+            T.Normalize(mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD),
+        ])
+
+    
+    def preprocess_image(self, image):
+        if isinstance(image, str):
+            image = Image.open(image)
+        
+        pixel_values = self.image_transform(image)
+        pixel_values = pixel_values.unsqueeze(0)
+
+        return pixel_values
+
+
     def get_vision_features(self, pixel_values, normalize=True):
         vision_pooled, vision_full = self.vision_model(pixel_values)
         vision_features = self.visual_projection(vision_pooled)
@@ -376,13 +400,15 @@ class OwlV2(nn.Module):
         query_mask = token_ids[..., 0] > 0
 
         # Predict object classes [batch_size, num_patches, num_queries+1]
-        (pred_logits, class_embeds) = self.class_predictor(image_feats, text_features, query_mask)
+        (pred_logits, class_embeds) = self.class_head(image_feats, text_features, query_mask)
 
         # Predict objectness
         objectness_logits = self.objectness_predictor(image_feats)
 
         # Predict object boxes
         pred_boxes = self.box_predictor(image_feats, feature_map)
+
+        return pred_logits, objectness_logits, pred_boxes, class_embeds, (feature_map, text_features)
 
     def objectness_predictor(self, image_features: torch.FloatTensor) -> torch.FloatTensor:
         """Predicts the probability that each image feature token is an object.
@@ -497,8 +523,14 @@ if __name__ == '__main__':
         x = x.cuda()
         token_id = token_id.cuda()
         attn_mask = attn_mask.cuda()
-        y = model.forward_object_detection(x, token_id, attn_mask)
-        #print(y[0].shape)
+        pred_logits, _, pred_boxes, _ = model.forward_object_detection(x, token_id, attn_mask)
+        print("pred_logits",pred_logits.shape)
+        print("pred_boxes",pred_boxes.shape)
+
+
+
+        
+        
 
     """ with torch.no_grad():
         x = torch.ones(1, 12, dtype=torch.int64)

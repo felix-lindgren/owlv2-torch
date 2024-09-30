@@ -124,7 +124,40 @@ def test_vision_tower(hf_model, torch_model):
         y_cls,y_pool = pt_y
     print(f"Vision tower match cls_token:", torch.allclose(y_cls, pt_y[0], atol=1e-3))
     print(f"Vision tower match full_map:", torch.allclose(y_pool, pt_y[1], atol=1e-3))
+
+def test_obj_detection(hf_model, torch_model):
+    test_img = Image.open('img.jpg')
+    processor = Owlv2Processor.from_pretrained("google/owlv2-base-patch16-ensemble")
+    inputs = processor(images=[test_img], text=["a cat"], return_tensors="pt")
+    inputs = {k: v.cuda() for k, v in inputs.items()}
     
+    with torch.no_grad():
+        hf_y = hf_model(**inputs)
+        hf_logits = hf_y.logits
+        hf_pred_boxes = hf_y.pred_boxes
+        hf_class_embeds = hf_y.class_embeds
+        hf_objectness_logits = hf_y.objectness_logits
+
+        hf_vision_feat = hf_y.image_embeds
+        hf_text_raw = hf_y.text_embeds
+
+        print(hf_vision_feat.shape, hf_text_raw.shape)
+
+    
+    with torch.no_grad():
+        pt_pred_logits, pt_objectness_logits, pt_pred_boxes, pt_class_embeds, (vision_feat, text_raw) = torch_model.forward_object_detection(inputs['pixel_values'], inputs['input_ids'], inputs['attention_mask'])
+        print(vision_feat.shape, text_raw.shape)
+
+    print(hf_logits.shape, pt_pred_logits.shape)
+    print(hf_pred_boxes.shape, pt_pred_boxes.shape)
+
+    print(f"Vision feature match:", torch.allclose(hf_vision_feat, vision_feat, atol=1e-3))
+    print(f"Text feature match:", torch.allclose(hf_text_raw, text_raw, atol=1e-3))
+
+    print(f"Object detection logits match:", torch.allclose(hf_logits, pt_pred_logits, atol=1e-2))
+    print(f"Object detection boxes match:", torch.allclose(hf_pred_boxes, pt_pred_boxes, atol=1e-3))
+    print(f"Object detection class embeddings match:", torch.allclose(hf_class_embeds, pt_class_embeds, atol=1e-3))
+    print(f"Object detection objectness logits match:", torch.allclose(hf_objectness_logits, pt_objectness_logits, atol=1e-2))
 
 if __name__ == '__main__':
     hf_model = Owlv2ForObjectDetection.from_pretrained("google/owlv2-base-patch16-ensemble")
@@ -139,10 +172,15 @@ if __name__ == '__main__':
             k = k.replace("mlp.fc1","mlp.0").replace("mlp.fc2","mlp.2")
             state_dict[k] = tens
     torch_model = torch_model.eval()
-    torch_model.load_state_dict(state_dict, strict=False)
+    torch_model.load_state_dict(state_dict, strict=True)
     
     torch_model.eval()
     hf_model.eval()
+
+    torch_model.cuda()
+    hf_model.cuda()
+
+    
     
     #for i in range(12):
     #    test_vision_encoder_layer(hf_model, torch_model, layer_idx=i)
@@ -152,4 +190,5 @@ if __name__ == '__main__':
     #test_text_embeddings_encoder(hf_model, torch_model)
     #test_text_tower(hf_model, torch_model)
     #test_vision_encoder(hf_model, torch_model)
-    test_vision_tower(hf_model, torch_model)
+    #test_vision_tower(hf_model, torch_model)
+    test_obj_detection(hf_model, torch_model)

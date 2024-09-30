@@ -21,7 +21,7 @@ def test_hf():
         inputs = {k: v.cuda() for k, v in inputs.items()}
         outputs = model(**inputs)
     target_sizes = torch.Tensor([image.size[::-1]])
-    results = processor.post_process_object_detection(outputs=outputs, target_sizes=target_sizes, threshold=0.25)
+    results = processor.post_process_object_detection(outputs=outputs, target_sizes=target_sizes, threshold=0.1)
     i = 0  # Retrieve predictions for the first image for the corresponding text queries
     boxes, scores, labels = results[i]["boxes"], results[i]["scores"], results[i]["labels"]
 
@@ -30,7 +30,7 @@ def test_hf():
         box = [round(i, 2) for i in box.tolist()]
         print(f"Detected with confidence {round(score.item(), 3)} at location {box}")
         draw_img = utils.draw_bbox(draw_img, box)
-    #utils.show_image(draw_img)
+    utils.show_image(draw_img)
 
 
 if __name__ == '__main__':
