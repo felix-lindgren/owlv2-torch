@@ -10,8 +10,8 @@ from torch_version.owlv2 import OwlV2
 from safetensors import safe_open
 
 
-def test_vision_encoder_layer(hf_model, torch_model, layer_idx=0):
-    x = torch.randn(1, 196, 768)
+def test_vision_encoder_layer(hf_model, torch_model, device="cuda", layer_idx=0):
+    x = torch.randn(1, 196, 768).to(device)
     with torch.no_grad():
         hf_y = hf_model.owlv2.vision_model.encoder.layers[layer_idx].forward(x, None, None)[0]
 
@@ -20,8 +20,8 @@ def test_vision_encoder_layer(hf_model, torch_model, layer_idx=0):
 
     print(f"Vision encoder layer{layer_idx} match:", torch.allclose(hf_y, pt_y, atol=1e-4))
 
-def test_vision_encoder(hf_model, torch_model):
-    x = torch.randn(1, 196, 768)
+def test_vision_encoder(hf_model, torch_model, device="cuda"):
+    x = torch.randn(1, 196, 768).to(device)
     with torch.no_grad():
         hf_y = hf_model.owlv2.vision_model.encoder.forward(x, None, None, False, False, False)[0]
 
@@ -30,11 +30,12 @@ def test_vision_encoder(hf_model, torch_model):
 
     print(f"Vision encoder match:", torch.allclose(hf_y, pt_y, atol=1e-4))
 
-def test_text_encoder_layer(hf_model, torch_model, layer_idx=0):
+def test_text_encoder_layer(hf_model, torch_model, device="cuda", layer_idx=0):
     test_sentence = "a cat"
     processor = Owlv2Processor.from_pretrained("google/owlv2-base-patch16-ensemble")
     inputs = processor(text=[test_sentence], return_tensors="pt")
-    input_embeddings = torch.rand(1, inputs['attention_mask'].shape[1], 512)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    input_embeddings = torch.rand(1, inputs['attention_mask'].shape[1], 512).to(device)
     with torch.no_grad():
         attention_mask = _prepare_4d_attention_mask(inputs['attention_mask'], input_embeddings.dtype)
         hf_y = hf_model.owlv2.text_model.encoder.layers[layer_idx].forward(input_embeddings, None, attention_mask)[0]
@@ -44,10 +45,11 @@ def test_text_encoder_layer(hf_model, torch_model, layer_idx=0):
     
     print(f"Text encoder layer{layer_idx} match:", torch.allclose(hf_y, pt_y, atol=1e-4))
 
-def test_text_embeddings(hf_model, torch_model):
+def test_text_embeddings(hf_model, torch_model, device="cuda"):
     test_sentence = "a cat"
     processor = Owlv2Processor.from_pretrained("google/owlv2-base-patch16-ensemble")
     inputs = processor(text=[test_sentence], return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
         hf_y = hf_model.owlv2.text_model.embeddings(inputs['input_ids'])
     with torch.no_grad():
@@ -60,12 +62,13 @@ def test_text_embeddings(hf_model, torch_model):
     print(hf_y.shape, pt_y.shape)
     print("Text embeddings match:", torch.allclose(hf_y, pt_y, atol=1e-4))
 
-def test_text_encoder(hf_model, torch_model):
+def test_text_encoder(hf_model, torch_model, device="cuda"):
     test_sentence = "a cat"
     processor = Owlv2Processor.from_pretrained("google/owlv2-base-patch16-ensemble")
     inputs = processor(text=[test_sentence], return_tensors="pt")
-    input_embeddings = torch.rand(1, inputs['attention_mask'].shape[1], 512)
-    attention_mask = _prepare_4d_attention_mask(inputs['attention_mask'], input_embeddings.dtype)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    input_embeddings = torch.rand(1, inputs['attention_mask'].shape[1], 512).to(device)
+    attention_mask = _prepare_4d_attention_mask(inputs['attention_mask'], input_embeddings.dtype).to(device=device)
     with torch.no_grad():
         hf_y = hf_model.owlv2.text_model.encoder.forward(input_embeddings, None, attention_mask, False, False, False)[0]
         hf_y = hf_y[0]
@@ -74,10 +77,11 @@ def test_text_encoder(hf_model, torch_model):
     
     print(f"Text encoder match:", torch.allclose(hf_y, pt_y, atol=1e-4))
 
-def test_text_embeddings_encoder(hf_model, torch_model):
+def test_text_embeddings_encoder(hf_model, torch_model, device="cuda"):
     test_sentence = "a cat"
     processor = Owlv2Processor.from_pretrained("google/owlv2-base-patch16-ensemble")
     inputs = processor(text=[test_sentence], return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
 
     with torch.no_grad():
         hidden = hf_model.owlv2.text_model.embeddings(inputs['input_ids'], None)
@@ -100,10 +104,11 @@ def test_text_embeddings_encoder(hf_model, torch_model):
     print(pt_y)
     print("Text embedding encoder match:", torch.allclose(hf_y, pt_y, atol=1e-4))
 
-def test_text_tower(hf_model, torch_model):
+def test_text_tower(hf_model, torch_model, device="cuda"):
     test_sentence = "a cat"
     processor = Owlv2Processor.from_pretrained("google/owlv2-base-patch16-ensemble")
     inputs = processor(text=[test_sentence], return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
         hf_y = hf_model.owlv2.text_model(inputs['input_ids'], inputs['attention_mask'], None, False, False, False)
         hf_y = hf_y[0]
@@ -111,10 +116,11 @@ def test_text_tower(hf_model, torch_model):
         pt_y = torch_model.text_model(inputs['input_ids'], inputs['attention_mask'])
     print(f"Text tower match:", torch.allclose(hf_y, pt_y, atol=1e-4))
 
-def test_vision_tower(hf_model, torch_model):
+def test_vision_tower(hf_model, torch_model, device="cuda"):
     test_img = Image.open('img.jpg')
     processor = Owlv2Processor.from_pretrained("google/owlv2-base-patch16-ensemble")
     inputs = processor(images=[test_img], return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
         hf_y = hf_model.owlv2.vision_model(inputs['pixel_values'])
         print(hf_y)
@@ -125,7 +131,7 @@ def test_vision_tower(hf_model, torch_model):
     print(f"Vision tower match cls_token:", torch.allclose(y_cls, pt_y[0], atol=1e-3))
     print(f"Vision tower match full_map:", torch.allclose(y_pool, pt_y[1], atol=1e-3))
 
-def test_obj_detection(hf_model, torch_model):
+def test_obj_detection(hf_model, torch_model, device="cuda"):
     test_img = Image.open('img.jpg')
     processor = Owlv2Processor.from_pretrained("google/owlv2-base-patch16-ensemble")
     inputs = processor(images=[test_img], text=["a cat"], return_tensors="pt")
@@ -182,13 +188,13 @@ if __name__ == '__main__':
 
     
     
-    #for i in range(12):
-    #    test_vision_encoder_layer(hf_model, torch_model, layer_idx=i)
-        #test_text_encoder_layer(hf_model, torch_model, layer_idx=i)
-    #test_text_embeddings(hf_model, torch_model)
-    #test_text_encoder(hf_model, torch_model)
-    #test_text_embeddings_encoder(hf_model, torch_model)
-    #test_text_tower(hf_model, torch_model)
-    #test_vision_encoder(hf_model, torch_model)
-    #test_vision_tower(hf_model, torch_model)
-    test_obj_detection(hf_model, torch_model)
+    for i in range(12):
+        test_vision_encoder_layer(hf_model, torch_model, device="cuda", layer_idx=i)
+        test_text_encoder_layer(hf_model, torch_model, device="cuda", layer_idx=i)
+    test_text_embeddings(hf_model, torch_model, device="cuda")
+    test_text_encoder(hf_model, torch_model, device="cuda")
+    test_text_embeddings_encoder(hf_model, torch_model, device="cuda")
+    test_text_tower(hf_model, torch_model, device="cuda")
+    test_vision_encoder(hf_model, torch_model, device="cuda")
+    test_vision_tower(hf_model, torch_model, device="cuda")
+    test_obj_detection(hf_model, torch_model, device="cuda")

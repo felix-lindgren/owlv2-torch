@@ -2,7 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import numpy as np
+
 import torchvision.transforms.v2 as T
+import torchvision.transforms.v2.functional as TF
 from PIL import Image
 
 from typing import Optional, Tuple
@@ -20,6 +23,14 @@ class QuickGELUActivation(nn.Module):
     def forward(self, input):
         return input * torch.sigmoid(1.702 * input)
 
+class SquarePad:
+	def __call__(self, image):
+		h, w = image.shape[-2:]
+		max_wh = np.max([w, h])
+		hp = int(max_wh - w)
+		vp = int(max_wh - h)
+		padding = (0, 0, hp, vp)
+		return TF.pad(image, padding, 0.5, 'constant')
 
 """ def _create_4d_causal_attention_mask(
     input_shape,
@@ -313,6 +324,7 @@ class OwlV2(nn.Module):
         self.image_transform = T.Compose([
             T.ToImage(),
             T.ToDtype(torch.float32,scale=True),
+            SquarePad(),
             T.Resize((self.image_size, self.image_size), antialias=True),
             T.Normalize(mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD),
         ])
@@ -403,27 +415,19 @@ class OwlV2(nn.Module):
         (pred_logits, class_embeds) = self.class_head(image_feats, text_features, query_mask)
 
         # Predict objectness
-        objectness_logits = self.objectness_predictor(image_feats)
+        #objectness_logits = self.objectness_predictor(image_feats)
+        objectness_logits = self.objectness_head(image_feats)
+        objectness_logits = objectness_logits[..., 0]
 
         # Predict object boxes
-        pred_boxes = self.box_predictor(image_feats, feature_map)
+        pred_boxes = self.box_head(image_feats)
+        # Compute the location of each token on the grid and use it to compute a bias for the bbox prediction
+        box_bias = self.box_bias.to(feature_map.device)
+        pred_boxes += box_bias
+        pred_boxes = F.sigmoid(pred_boxes)
 
         return pred_logits, objectness_logits, pred_boxes, class_embeds, (feature_map, text_features)
 
-    def objectness_predictor(self, image_features: torch.FloatTensor) -> torch.FloatTensor:
-        """Predicts the probability that each image feature token is an object.
-
-        Args:
-            image_features (`torch.FloatTensor` of shape `(batch_size, num_patches, hidden_dim)`)):
-                Features extracted from the image.
-        Returns:
-            Objectness scores.
-        """
-        image_features = image_features.detach()
-        objectness_logits = self.objectness_head(image_features)
-        objectness_logits = objectness_logits[..., 0]
-        return objectness_logits
-    
     @staticmethod
     def normalize_grid_corner_coordinates(num_patches: int) -> torch.Tensor:
         # Create grid coordinates using torch
@@ -458,50 +462,7 @@ class OwlV2(nn.Module):
         box_bias = torch.cat([box_coord_bias, box_size_bias], dim=-1)
         return box_bias
 
-    # Copied from transformers.models.owlvit.modeling_owlvit.OwlViTForObjectDetection.box_predictor
-    def box_predictor(
-        self,
-        image_feats: torch.FloatTensor,
-        feature_map: torch.FloatTensor,
-    ) -> torch.FloatTensor:
-        """
-        Args:
-            image_feats:
-                Features extracted from the image, returned by the `image_text_embedder` method.
-            feature_map:
-                A spatial re-arrangement of image_features, also returned by the `image_text_embedder` method.
-        Returns:
-            pred_boxes:
-                List of predicted boxes (cxcywh normalized to 0, 1) nested within a dictionary.
-        """
-        # Bounding box detection head [batch_size, num_boxes, 4].
-        pred_boxes = self.box_head(image_feats)
-
-        # Compute the location of each token on the grid and use it to compute a bias for the bbox prediction
-        box_bias = self.box_bias.to(feature_map.device)
-        pred_boxes += box_bias
-        pred_boxes = F.sigmoid(pred_boxes)
-        return pred_boxes
-
-    # Copied from transformers.models.owlvit.modeling_owlvit.OwlViTForObjectDetection.class_predictor
-    def class_predictor(
-        self,
-        image_feats: torch.FloatTensor,
-        query_embeds: Optional[torch.FloatTensor] = None,
-        query_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.FloatTensor]:
-        """
-        Args:
-            image_feats:
-                Features extracted from the `image_text_embedder`.
-            query_embeds:
-                Text query embeddings.
-            query_mask:
-                Must be provided with query_embeddings. A mask indicating which query embeddings are valid.
-        """
-        (pred_logits, image_class_embeds) = self.class_head(image_feats, query_embeds, query_mask)
-
-        return (pred_logits, image_class_embeds)
+    
 
     
 if __name__ == '__main__':
@@ -526,11 +487,6 @@ if __name__ == '__main__':
         pred_logits, _, pred_boxes, _ = model.forward_object_detection(x, token_id, attn_mask)
         print("pred_logits",pred_logits.shape)
         print("pred_boxes",pred_boxes.shape)
-
-
-
-        
-        
 
     """ with torch.no_grad():
         x = torch.ones(1, 12, dtype=torch.int64)

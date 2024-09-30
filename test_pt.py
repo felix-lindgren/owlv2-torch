@@ -25,23 +25,15 @@ def test_pt():
     model.eval()
     model.cuda()
     #print(model)
-    
 
     image = Image.open('img.jpg')
-    #image_inputs = model.preprocess_image(image)
-    #print(image_inputs.shape)
-    processor = Owlv2Processor.from_pretrained("google/owlv2-base-patch16-ensemble")
-    inputs = processor(images=[image], text=["a cat", "a scale", "a plastic bag"], return_tensors="pt")
-    inputs = {k: v.cuda() for k, v in inputs.items()}
-    #text_inputs = tokenizer(["a cat", "a scale", "a plastic bag"], return_tensors="pt", padding=True, truncation=True)
-    
+    image_inputs = model.preprocess_image(image)
+    text_inputs = tokenizer(["a cat", "a scale", "a plastic bag"], return_tensors="pt", padding=True, truncation=True)
 
     with torch.no_grad():
-        #image_inputs = image_inputs.cuda()
-        #text_inputs = {k: v.cuda() for k, v in text_inputs.items()}
-        #outputs = model.forward_object_detection(image_inputs, text_inputs["input_ids"], text_inputs["attention_mask"]) 
-        inputs = {k: v.cuda() for k, v in inputs.items()}
-        outputs = model.forward_object_detection(inputs['pixel_values'], inputs['input_ids'], inputs['attention_mask'])
+        image_inputs = image_inputs.cuda()
+        text_inputs = {k: v.cuda() for k, v in text_inputs.items()}
+        outputs = model.forward_object_detection(image_inputs, text_inputs["input_ids"], text_inputs["attention_mask"]) 
     
     class dotdict(dict):
         """dot.notation access to dictionary attributes"""
