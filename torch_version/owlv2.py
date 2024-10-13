@@ -226,7 +226,7 @@ class TextTower(nn.Module):
             input_ids.to(torch.int).argmax(dim=-1).to(last_hidden_state.device),
         ]
 
-        return pooled_output
+        return pooled_output, encoder_outputs
 
 class BoxPredictionHead(nn.Module):
     def __init__(self, hidden_size, out_dim: int = 4):
