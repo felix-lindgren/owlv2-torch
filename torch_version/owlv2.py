@@ -208,12 +208,15 @@ class TextTower(nn.Module):
         inputs_embeds = self.token_embedding(input_ids)
         position_embeddings = self.position_embedding(position_ids)
         hidden = inputs_embeds + position_embeddings
+
         
         # attn masks
         input_shape = input_ids.size()
         causal_attention_mask = _create_4d_causal_attention_mask(input_shape, hidden.dtype, hidden.device)
         attention_mask = _prepare_4d_attention_mask(attention_mask, hidden.dtype)
         attention_mask = attention_mask + causal_attention_mask
+
+        
 
         # Encoder
         encoder_outputs = self.encoder(hidden, attention_mask)

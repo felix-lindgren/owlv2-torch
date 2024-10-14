@@ -8,7 +8,7 @@ from hf_version.processing_owlv2 import Owlv2Processor
 from transformers.modeling_attn_mask_utils import _create_4d_causal_attention_mask, _prepare_4d_attention_mask
 
 from torch_version.owlv2 import OwlV2
-from torch_func.owlv2 import encode_text, encode_vision, attention, feed_forward
+from torch_func.owlv2 import encode_text, encode_vision, attention, feed_forward, create_mask, build_attn_mask, combine_masks, pad_sequences
 from torch_func.owlv2_config import OWLV2_B16, ModelParams
 from torch_func.owlv2_weights import load_owlv2_weights, OWLv2Weights
 from safetensors import safe_open
@@ -61,6 +61,62 @@ def test_attention(torch_model: OwlV2, weights: OWLv2Weights, model_params: Mode
 
     print(f"Vision attention{layer_idx} match:", torch.allclose(func_y, pt_y, atol=1e-4))
     #print(pt_y, func_y)
+    
+def test_attention_masked(torch_model: OwlV2, weights: OWLv2Weights, model_params: ModelParams, device="cuda", layer_idx=0):
+    
+    seqlen = 8
+    x = torch.rand(1,seqlen,512).to(device)
+    seq_ = torch.arange(seqlen).unsqueeze(0).tolist()
+    seq = pad_sequences(seq_)
+    pad_mask = create_mask(seq_)
+    causal_mask = build_attn_mask(1, seqlen, 0)
+    attn_mask = combine_masks(pad_mask, causal_mask)
+
+    with torch.no_grad():
+        #pt_y, _ = torch_model.vision_model.encoder.layers[layer_idx].self_attn.forward(x, None)
+        bsz, tgt_len, _ = x.size()
+        # project the hidden states to the query, key, and value states
+        query_states = torch_model.text_model.encoder.layers[layer_idx].self_attn.q_proj(x) #* torch_model.vision_model.encoder.layers[layer_idx].self_attn.scale
+        key_states = torch_model.text_model.encoder.layers[layer_idx].self_attn._shape(torch_model.text_model.encoder.layers[layer_idx].self_attn.k_proj(x), -1, bsz)
+        value_states = torch_model.text_model.encoder.layers[layer_idx].self_attn._shape(torch_model.text_model.encoder.layers[layer_idx].self_attn.v_proj(x), -1, bsz)
+        query_states = torch_model.text_model.encoder.layers[layer_idx].self_attn._shape(query_states, tgt_len, bsz)
+
+        # compute the attention weights
+        sdpa_attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=attn_mask,
+            dropout_p=torch_model.text_model.encoder.layers[layer_idx].self_attn.dropout if torch_model.text_model.encoder.layers[layer_idx].self_attn.training else 0.0,
+            scale=torch_model.text_model.encoder.layers[layer_idx].self_attn.scale
+        )
+        sdpa_attn_output_ = sdpa_attn_output
+        sdpa_attn_output = sdpa_attn_output.transpose(1, 2)
+        sdpa_attn_output = sdpa_attn_output.reshape(bsz, tgt_len, torch_model.text_model.encoder.layers[layer_idx].self_attn.embed_dim)
+        attn_output = torch_model.text_model.encoder.layers[layer_idx].self_attn.out_proj(sdpa_attn_output)
+        pt_y = attn_output
+    with torch.no_grad():
+        layer_weights = weights.text_weights.layer_weights[layer_idx]
+        xq = F.linear(x, layer_weights.wq, bias=layer_weights.wq_b).view(bsz, -1 ,model_params.text_encoder.n_heads, model_params.text_encoder.head_dim).transpose(1,2).contiguous()
+        xk = F.linear(x, layer_weights.wk, bias=layer_weights.wk_b).view(bsz, -1 ,model_params.text_encoder.n_heads, model_params.text_encoder.head_dim).transpose(1,2).contiguous()
+        xv = F.linear(x, layer_weights.wv, bias=layer_weights.wv_b).view(bsz, -1 ,model_params.text_encoder.n_heads, model_params.text_encoder.head_dim).transpose(1,2).contiguous()
+
+        output = torch.nn.functional.scaled_dot_product_attention(
+            xq,
+            xk,
+            xv,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            scale=model_params.text_encoder.head_dim**-0.5
+        )
+
+        output = output.transpose(1,2)
+        output = output.reshape(bsz, -1, model_params.text_encoder.dim)
+        output = F.linear(output, layer_weights.wo, layer_weights.wo_b)
+        func_y = output
+
+    print(f"Text attention{layer_idx} match:", torch.allclose(func_y, pt_y, atol=1e-4))
+    #print(pt_y, func_y)
 def test_vision_encoder_layer(torch_model, weights: OWLv2Weights, model_params: ModelParams, device="cuda", layer_idx=0):
     x_ = torch.randn(1, 196, 768).to(device)
     with torch.no_grad():
@@ -108,6 +164,26 @@ def test_vision_encoder_full(torch_model, weights: OWLv2Weights, model_params: M
     print(pt_y.shape,unpooled.shape, func_y.shape)
     print(f"Vision encoder pooled match:", torch.allclose(func_y,pt_y, atol=1e-4))
     print(f"Vision encoder unpooled match:", torch.allclose(unpooled_func,unpooled, atol=1e-4))
+    #print(pt_y, func_y)
+
+def test_text_encoder_full(torch_model, weights: OWLv2Weights, model_params: ModelParams, device="cuda"):
+    from transformers.modeling_attn_mask_utils import _create_4d_causal_attention_mask, _prepare_4d_attention_mask
+    input_string = "a cat."
+    processor = Owlv2Processor.from_pretrained("google/owlv2-base-patch16-ensemble")
+    inputs = processor(text=input_string, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        pt_y, unpooled = torch_model.text_model.forward(inputs['input_ids'], inputs['attention_mask'])
+    weights = weights.text_weights
+    with torch.no_grad():
+        input_shape = inputs['input_ids'].size()
+        causal_attention_mask = _create_4d_causal_attention_mask(input_shape, torch.float32, "cpu")
+        attention_mask = _prepare_4d_attention_mask(inputs['attention_mask'], torch.float32)
+        attention_mask = attention_mask + causal_attention_mask
+        func_y, unpooled_func = encode_text(inputs['input_ids'], weights, model_params, attn_mask=attention_mask)
+    print(pt_y.shape,unpooled.shape, func_y.shape)
+    print(f"Text encoder pooled match:", torch.allclose(func_y,pt_y, atol=1e-4))
+    print(f"Text encoder unpooled match:", torch.allclose(unpooled_func,unpooled, atol=1e-4))
     #print(pt_y, func_y)
 def test_vision_encoder(hf_model, torch_model, device="cuda"):
     x = torch.randn(1, 196, 768).to(device)
@@ -277,12 +353,14 @@ if __name__ == '__main__':
 
     weights = load_owlv2_weights(state_dict)
     
-    for layer_idx in range(1):
+    for layer_idx in range(12):
         ...
         #test_attention(torch_model, weights, OWLV2_B16, device="cpu", layer_idx=layer_idx)
+        #test_attention_masked(torch_model, weights, OWLV2_B16, device="cpu", layer_idx=layer_idx)
         #test_vision_encoder_layer(torch_model, weights, model_params=OWLV2_B16, device="cpu", layer_idx=layer_idx)
         #test_text_encoder_layer(hf_model, weights, device="cpu", layer_idx=i)
-    test_vision_encoder_full(torch_model, weights, model_params=OWLV2_B16, device="cpu")
+    #test_vision_encoder_full(torch_model, weights, model_params=OWLV2_B16, device="cpu")
+    test_text_encoder_full(torch_model, weights, model_params=OWLV2_B16, device="cpu")
     quit()
     test_text_embeddings(hf_model, torch_model, device="cuda")
     test_text_encoder(hf_model, torch_model, device="cuda")

@@ -39,21 +39,20 @@ class SquarePad:
 
 def attention(x: torch.Tensor, layer_weights: LayerWeights, model_params, attn_mask = None):
     bsz, _, _ = x.shape
-    xq = F.linear(x, layer_weights.wq, bias=layer_weights.wq_b).view(bsz, -1 ,model_params.vision_encoder.n_heads, model_params.vision_encoder.head_dim).transpose(1,2).contiguous()
-    xk = F.linear(x, layer_weights.wk, bias=layer_weights.wk_b).view(bsz, -1 ,model_params.vision_encoder.n_heads, model_params.vision_encoder.head_dim).transpose(1,2).contiguous()
-    xv = F.linear(x, layer_weights.wv, bias=layer_weights.wv_b).view(bsz, -1 ,model_params.vision_encoder.n_heads, model_params.vision_encoder.head_dim).transpose(1,2).contiguous()
-
+    xq = F.linear(x, layer_weights.wq, bias=layer_weights.wq_b).view(bsz, -1 ,model_params.n_heads, model_params.head_dim).transpose(1,2).contiguous()
+    xk = F.linear(x, layer_weights.wk, bias=layer_weights.wk_b).view(bsz, -1 ,model_params.n_heads, model_params.head_dim).transpose(1,2).contiguous()
+    xv = F.linear(x, layer_weights.wv, bias=layer_weights.wv_b).view(bsz, -1 ,model_params.n_heads, model_params.head_dim).transpose(1,2).contiguous()
     output = torch.nn.functional.scaled_dot_product_attention(
         xq,
         xk,
         xv,
-        attn_mask=None,
+        attn_mask=attn_mask,
         dropout_p=0.0,
-        scale=model_params.vision_encoder.head_dim**-0.5
+        scale=model_params.head_dim**-0.5
     )
 
     output = output.transpose(1,2)
-    output = output.reshape(bsz, -1, model_params.vision_encoder.dim)
+    output = output.reshape(bsz, -1, model_params.dim)
     output = F.linear(output, layer_weights.wo, layer_weights.wo_b)
     return output
 
@@ -98,21 +97,26 @@ def combine_masks(padding_mask: torch.Tensor, attn_mask: torch.Tensor) -> torch.
     return combined_mask
 
 
-def encode_text(tokens, weights: TextTransformerWeights, model_params: EncoderParams, attn_mask):
-
+def encode_text(tokens, weights: TextTransformerWeights, model_params: ModelParams, attn_mask):
     seq_length = tokens.shape[-1] if tokens is not None else tokens.shape[-2]
     h = weights.tok_embeddings[tokens]
-    pos_embs = weights.pos_embeddings[:seq_length]
+    pos_ids = torch.arange(16).expand((1, -1))
+    pos_embs = weights.pos_embeddings[pos_ids[:,:seq_length]]
     h = h + pos_embs
 
-    weights.pos_embeddings
-    for i in range(model_params.n_layers):
-        h_attn  = attention(h, weights.layer_weights[i], model_params, attn_mask=attn_mask)
-        h = h + h_attn
-        h_ = F.layer_norm(h, (model_params.dim,), weight=weights.layer_weights[i].ffn_norm, bias=weights.layer_weights[i].ffn_norm)
-        h = h + feed_forward(h_, weights.layer_weights[i])
-    norm_x = F.layer_norm(h, (model_params.dim,), weight=weights.post_norm, bias=weights.post_norm_b)
-    return norm_x 
+
+    for i in range(model_params.text_encoder.n_layers):
+        residual = h
+        h = F.layer_norm(h, (model_params.text_encoder.dim,), weight=weights.layer_weights[i].attention_norm, bias=weights.layer_weights[i].attention_norm_b)
+        h_attn  = attention(h, weights.layer_weights[i], model_params.text_encoder, attn_mask=attn_mask)
+        h = residual + h_attn
+        residual = h
+        h = F.layer_norm(h, (model_params.text_encoder.dim,), weight=weights.layer_weights[i].ffn_norm, bias=weights.layer_weights[i].ffn_norm_b)
+        h = residual + feed_forward(h, weights.layer_weights[i])
+    
+    norm_x = F.layer_norm(h, (model_params.text_encoder.dim,), weight=weights.post_norm, bias=weights.post_norm_b)
+    pooled_output = norm_x[torch.arange(norm_x.shape[0], device=norm_x.device),tokens.to(torch.int).argmax(dim=-1).to(norm_x.device),    ]
+    return pooled_output, h
 
 def encode_vision(pixel_data: torch.Tensor, weights: VisionTransformerWeights, model_params: ModelParams):
     batch_size = pixel_data.shape[0]
@@ -126,7 +130,7 @@ def encode_vision(pixel_data: torch.Tensor, weights: VisionTransformerWeights, m
     for i in range(model_params.vision_encoder.n_layers):
         residual = h
         h = F.layer_norm(h, (model_params.vision_encoder.dim,), weight=weights.layer_weights[i].attention_norm, bias=weights.layer_weights[i].attention_norm_b)
-        h_attn  = attention(h, weights.layer_weights[i], model_params, attn_mask=None)
+        h_attn  = attention(h, weights.layer_weights[i], model_params.vision_encoder, attn_mask=None)
         h = residual + h_attn
         residual = h
         h = F.layer_norm(h, (model_params.vision_encoder.dim,), weight=weights.layer_weights[i].ffn_norm, bias=weights.layer_weights[i].ffn_norm_b)
