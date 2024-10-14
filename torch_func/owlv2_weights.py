@@ -62,6 +62,12 @@ class HeadLayerWeights(NamedTuple):
    w2_b: torch.Tensor
    w3_b: torch.Tensor
 
+   logit_scale: torch.Tensor
+   logit_scale_b: torch.Tensor 
+   logit_shift: torch.Tensor
+   logit_shift_b: torch.Tensor
+
+
 class OWLv2Weights(NamedTuple):
   logit_scale: torch.Tensor
   text_proj: torch.Tensor 
@@ -69,8 +75,9 @@ class OWLv2Weights(NamedTuple):
   layer_norm: torch.Tensor
   layer_norm_b: torch.Tensor
 
-
-  
+  class_head: HeadLayerWeights
+  box_head: HeadLayerWeights 
+  objectness_head: HeadLayerWeights
 
   vision_weights: VisionTransformerWeights
   text_weights: TextTransformerWeights
@@ -130,12 +137,54 @@ def load_owlv2_weights(state_dict):
     text_weights = load_encoder_weights(state_dict=state_dict, encoder_name="text_model")
     vision_weights = load_encoder_weights(state_dict=state_dict, encoder_name="vision_model")
 
+    box_head = HeadLayerWeights(
+       w1=state_dict['box_head.dense0.weight'],
+       w1_b=state_dict['box_head.dense0.bias'],
+       w2=state_dict['box_head.dense1.weight'],
+       w2_b=state_dict['box_head.dense1.bias'],
+       w3=state_dict['box_head.dense2.weight'],
+       w3_b=state_dict['box_head.dense2.bias'],
+       logit_scale=None, 
+       logit_scale_b=None, 
+       logit_shift=None, 
+       logit_shift_b=None, 
+    )
+    cls_head = HeadLayerWeights(
+       w1=state_dict['class_head.dense0.weight'],
+       w1_b=state_dict['class_head.dense0.bias'],
+       w2=None,
+       w2_b=None,
+       w3=None,
+       w3_b=None,
+       logit_scale=state_dict['class_head.logit_scale.weight'], 
+       logit_scale_b=state_dict['class_head.logit_scale.bias'], 
+       logit_shift=state_dict['class_head.logit_shift.weight'], 
+       logit_shift_b=state_dict['class_head.logit_shift.bias'], 
+    )
+    objectness_head = HeadLayerWeights(
+       w1=state_dict['objectness_head.dense0.weight'],
+       w1_b=state_dict['objectness_head.dense0.bias'],
+       w2=state_dict['objectness_head.dense1.weight'],
+       w2_b=state_dict['objectness_head.dense1.bias'],
+       w3=state_dict['objectness_head.dense2.weight'],
+       w3_b=state_dict['objectness_head.dense2.bias'],
+       logit_scale=None, 
+       logit_scale_b=None, 
+       logit_shift=None, 
+       logit_shift_b=None, 
+    )
+
     return OWLv2Weights(
         logit_scale=state_dict['logit_scale'],
         text_proj=state_dict['text_projection.weight'],
         vision_proj=state_dict['visual_projection.weight'],
+        layer_norm=state_dict['layer_norm.weight'],
+        layer_norm_b=state_dict['layer_norm.bias'],
         vision_weights=vision_weights,
-        text_weights=text_weights
+        text_weights=text_weights,
+        box_head=box_head,
+        class_head=cls_head,
+        objectness_head=objectness_head
     )
 
    

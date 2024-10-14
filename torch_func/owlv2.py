@@ -12,8 +12,8 @@ from typing import Optional, Tuple
 
 from transformers.modeling_attn_mask_utils import _create_4d_causal_attention_mask, _prepare_4d_attention_mask
 
-from .owlv2_weights import load_owlv2_weights, LayerWeights, TextTransformerWeights, VisionTransformerWeights, OWLv2Weights
-from .owlv2_config import OWLV2_B16, EncoderParams, ModelParams
+from owlv2_weights import load_owlv2_weights, LayerWeights, TextTransformerWeights, VisionTransformerWeights, OWLv2Weights
+from owlv2_config import OWLV2_B16, EncoderParams, ModelParams
 
 OPENAI_CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
 OPENAI_CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
@@ -140,6 +140,11 @@ def encode_vision(pixel_data: torch.Tensor, weights: VisionTransformerWeights, m
 
     return norm_x, h
     
+def text_obj_det(token_ids, attn_mask, pixel_values, weights: OWLv2Weights, model_params: ModelParams):
+    _, feature_map = encode_vision(pixel_values, weights=weights.vision_weights, model_params=model_params)
+    pooled_text, _ = encode_text(tokens=token_ids, weights=weights.text_weights, model_params=model_params, attn_mask=attn_mask)
+    print(feature_map.shape, pooled_text.shape)
+
 if __name__ == '__main__':
     from safetensors import safe_open
     state_dict = {}
@@ -156,7 +161,7 @@ if __name__ == '__main__':
     causal_mask = build_attn_mask(3, 4, 0)
     attn_mask = combine_masks(pad_mask, causal_mask)
 
-    inp = torch.rand(1,3601,768) 
+    """ inp = torch.rand(1,3601,768) 
     attention(inp, weights.vision_weights.layer_weights[0], OWLV2_B16.vision_encoder)
     inp = torch.rand(1,10,512) 
     attention(inp, weights.text_weights.layer_weights[0], OWLV2_B16.text_encoder)
@@ -168,7 +173,9 @@ if __name__ == '__main__':
     embs = encode_vision(torch.rand(1,3,960,960), weights=weights.vision_weights, model_params=OWLV2_B16)
     print(embs.shape)
     embs = F.linear(embs, weights.vision_proj)
-    print(embs.shape)
+    print(embs.shape) """
+    
+    text_obj_det(seq, attn_mask, torch.rand(1,3,960,960), weights, OWLV2_B16)
 
     """ with torch.no_grad():
         x = torch.ones(1, 12, dtype=torch.int64)
