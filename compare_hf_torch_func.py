@@ -184,7 +184,7 @@ def test_text_encoder_full(torch_model, weights: OWLv2Weights, model_params: Mod
     print(pt_y.shape,unpooled.shape, func_y.shape)
     print(f"Text encoder pooled match:", torch.allclose(func_y,pt_y, atol=1e-4))
     print(f"Text encoder unpooled match:", torch.allclose(unpooled_func,unpooled, atol=1e-4))
-    #print(pt_y, func_y)
+    
 def test_vision_encoder(hf_model, torch_model, device="cuda"):
     x = torch.randn(1, 196, 768).to(device)
     with torch.no_grad():

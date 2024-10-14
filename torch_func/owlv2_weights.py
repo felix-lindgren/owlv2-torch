@@ -54,13 +54,28 @@ class VisionTransformerWeights(NamedTuple):
   post_norm_b: torch.Tensor
   layer_weights: List[LayerWeights]
 
+class HeadLayerWeights(NamedTuple):
+   w1: torch.Tensor
+   w2: torch.Tensor
+   w3: torch.Tensor
+   w1_b: torch.Tensor
+   w2_b: torch.Tensor
+   w3_b: torch.Tensor
+
 class OWLv2Weights(NamedTuple):
   logit_scale: torch.Tensor
   text_proj: torch.Tensor 
   vision_proj: torch.Tensor
+  layer_norm: torch.Tensor
+  layer_norm_b: torch.Tensor
+
+
+  
 
   vision_weights: VisionTransformerWeights
   text_weights: TextTransformerWeights
+
+
   
 
 def load_encoder_weights(state_dict, encoder_name="vision_model", n_layers: int = 12):
