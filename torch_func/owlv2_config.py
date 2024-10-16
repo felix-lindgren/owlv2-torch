@@ -26,6 +26,7 @@ class ModelParams(NamedTuple):
   vocab_size: int
   image_size: int
   patch_size: int
+  num_patches_sqrt: int
   num_vision_pos: int
   
 
@@ -37,6 +38,7 @@ OWLV2_B16 = ModelParams(
   vocab_size=params["vocab_size"],
   image_size=params["image_size"],
   patch_size=params["patch_size"],
+  num_patches_sqrt=((params["image_size"] // params["patch_size"])),
   num_vision_pos=((params["image_size"] // params["patch_size"]) ** 2) + 1,
   
 )

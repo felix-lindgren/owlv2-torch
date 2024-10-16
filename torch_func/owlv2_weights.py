@@ -4,7 +4,7 @@ from typing import List, NamedTuple
 import torch
 import numpy as np
 
-import ml_dtypes
+
 from safetensors import safe_open
 
 from pathlib import Path
