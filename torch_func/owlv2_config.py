@@ -1,5 +1,10 @@
 from typing import NamedTuple
-
+import torch
+import torchvision.transforms.v2 as T
+import torchvision.transforms.v2.functional as TF
+import numpy as np
+OPENAI_CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
+OPENAI_CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
 
 params = {
   "text_dim": 512,
@@ -42,3 +47,21 @@ OWLV2_B16 = ModelParams(
   num_vision_pos=((params["image_size"] // params["patch_size"]) ** 2) + 1,
   
 )
+
+class SquarePad:
+	def __call__(self, image):
+		h, w = image.shape[-2:]
+		max_wh = np.max([w, h])
+		hp = int(max_wh - w)
+		vp = int(max_wh - h)
+		padding = (0, 0, hp, vp)
+		return TF.pad(image, padding, 0.5, 'constant')
+
+def get_transform(model_params):
+  return T.Compose([
+      T.ToImage(),
+      T.ToDtype(torch.float32,scale=True),
+      SquarePad(),
+      T.Resize((model_params.image_size,model_params.image_size), antialias=True),
+      T.Normalize(mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD),
+  ])

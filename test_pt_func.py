@@ -1,6 +1,6 @@
-from torch_func.owlv2 import text_obj_det, image_transform
+from torch_func.owlv2 import text_obj_det
 from torch_func.owlv2_weights import load_owlv2_weights
-from torch_func.owlv2_config import OWLV2_B16
+from torch_func.owlv2_config import OWLV2_B16, get_transform
 import torch
 import torch.nn as nn
 import utils
@@ -26,7 +26,7 @@ def test_pt():
             state_dict[k] = tens.to("cuda")
 
     weights = load_owlv2_weights(state_dict)
-
+    image_transform = get_transform(OWLV2_B16)
 
     tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32", clean_up_tokenization_spaces=True)
     #print(model)

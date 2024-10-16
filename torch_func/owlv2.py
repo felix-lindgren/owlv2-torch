@@ -19,30 +19,6 @@ OPENAI_CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
 OPENAI_CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
 DEFAULT_MASK_VALUE = -0.7 * float(torch.finfo(torch.float32).max)
 
-class QuickGELUActivation(nn.Module):
-    """
-    Applies GELU approximation that is fast but somewhat inaccurate. See: https://github.com/hendrycks/GELUs
-    """
-
-    def forward(self, input):
-        return input * torch.sigmoid(1.702 * input)
-class SquarePad:
-	def __call__(self, image):
-		h, w = image.shape[-2:]
-		max_wh = np.max([w, h])
-		hp = int(max_wh - w)
-		vp = int(max_wh - h)
-		padding = (0, 0, hp, vp)
-		return TF.pad(image, padding, 0.5, 'constant')
-
-image_transform = T.Compose([
-    T.ToImage(),
-    T.ToDtype(torch.float32,scale=True),
-    SquarePad(),
-    T.Resize((960,960), antialias=True),
-    T.Normalize(mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD),
-])
-
   
 
 def attention(x: torch.Tensor, layer_weights: LayerWeights, model_params, attn_mask = None):
