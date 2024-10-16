@@ -1,4 +1,4 @@
-from torch_func.owlv2 import text_obj_det
+from torch_func.owlv2 import text_obj_det, process_sequences
 from torch_func.owlv2_weights import load_owlv2_weights
 from torch_func.owlv2_config import OWLV2_B16, get_transform
 import torch
@@ -29,7 +29,7 @@ def test_pt():
     image_transform = get_transform(OWLV2_B16)
 
     tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32", clean_up_tokenization_spaces=True)
-    #print(model)
+    
 
     image = Image.open('img.jpg')
     image_inputs = image_transform(image).unsqueeze(0)
@@ -38,11 +38,9 @@ def test_pt():
     with torch.no_grad(), timer("model_run"):
         image_inputs = image_inputs.cuda()
         text_inputs = {k: v.cuda() for k, v in text_inputs.items()}
-        input_shape = text_inputs['input_ids'].size()
-        causal_attention_mask = _create_4d_causal_attention_mask(input_shape, torch.float32, "cuda")
-        attention_mask = _prepare_4d_attention_mask(text_inputs['attention_mask'], torch.float32)
-        attention_mask = attention_mask + causal_attention_mask
-        outputs = text_obj_det(text_inputs["input_ids"], attention_mask, image_inputs, weights, OWLV2_B16) 
+        padded_ids, _attn_maks = process_sequences(text_inputs["input_ids"].tolist())
+        padded_ids, _attn_maks = padded_ids.cuda(), _attn_maks.cuda()
+        outputs = text_obj_det(padded_ids, _attn_maks, image_inputs, weights, OWLV2_B16) 
     
     class dotdict(dict):
         """dot.notation access to dictionary attributes"""
