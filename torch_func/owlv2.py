@@ -146,59 +146,46 @@ def compute_box_bias(num_patches: int) -> torch.Tensor:
     
     return bias    
 
-def text_obj_det(token_ids, attn_mask, pixel_values, w: OWLv2Weights, model_params: ModelParams):
-    _, vision_full = encode_vision(pixel_values, weights=w.vision_weights, model_params=model_params)
-    text_features, _ = encode_text(tokens=token_ids, weights=w.text_weights, model_params=model_params, attn_mask=attn_mask)
+def text_obj_det(token_ids, attn_mask, pixel_values, w, model_params):
+    # Encode vision and text
+    _, vision_full = encode_vision(pixel_values, w.vision_weights, model_params)
+    text_features,_ = encode_text(token_ids, w.text_weights, model_params, attn_mask)
     
-    # Project text
+    # Project and normalize features
     text_features = F.linear(text_features, w.text_proj)
-
-    # Normalize text and image features
-    vision_full /= (torch.linalg.norm(vision_full, dim=-1, keepdim=True) + 1e-6)
-    text_features /= (torch.linalg.norm(text_features, dim=-1, keepdim=True) + 1e-6)
-
-    # Merge image embedding with class tokens
+    vision_full = F.normalize(vision_full, dim=-1, eps=1e-6)
+    text_features = F.normalize(text_features, dim=-1, eps=1e-6)
+    
+    # Process vision features
     feature_map = F.layer_norm(vision_full, (model_params.vision_encoder.dim,), weight=w.vision_weights.post_norm, bias=w.vision_weights.post_norm_b)
-    class_token_out = torch.broadcast_to(feature_map[:, :1, :], feature_map[:, :-1].shape)
-    feature_map = feature_map[:, 1:, :] * class_token_out
+    feature_map = feature_map[:, 1:, :] * torch.broadcast_to(feature_map[:, :1, :], feature_map[:, :-1].shape)
     feature_map = F.layer_norm(feature_map, (model_params.vision_encoder.dim,), weight=w.layer_norm, bias=w.layer_norm_b)
     
-    new_size = (
-        feature_map.shape[0],
-        model_params.num_patches_sqrt,
-        model_params.num_patches_sqrt,
-        feature_map.shape[-1],
-    )
-    feature_map = feature_map.reshape(new_size)
-
-    batch_size, num_patches, num_patches, hidden_dim = feature_map.shape
-    image_feats = torch.reshape(feature_map, (batch_size, num_patches * num_patches, hidden_dim))
-
-    # Reshape from [batch_size * max_text_queries, hidden_dim] -> [batch_size, max_text_queries, hidden_dim]
+    # Reshape feature map
+    batch_size = feature_map.shape[0]
+    new_size = (batch_size, model_params.num_patches_sqrt, model_params.num_patches_sqrt, feature_map.shape[-1])
+    image_feats = feature_map.reshape(new_size).reshape(batch_size, -1, feature_map.shape[-1])
+    
+    # Reshape text features
     max_text_queries = token_ids.shape[0] // batch_size
-    text_features = text_features.reshape(batch_size, max_text_queries, text_features.shape[-1])
-
-    # If first token is 0, then this is a padded query [batch_size, num_queries].
-    token_ids = token_ids.reshape(batch_size, max_text_queries, token_ids.shape[-1])
+    text_features = text_features.reshape(batch_size, max_text_queries, -1)
+    token_ids = token_ids.reshape(batch_size, max_text_queries, -1)
     query_mask = token_ids[..., 0] > 0
-
-    # Predict object classes [batch_size, num_patches, num_queries+1]
-    (pred_logits, class_embeds) = class_head(image_feats, text_features, query_mask, w.class_head, model_params)
-
-    # Predict objectness
-    objectness = F.gelu(F.linear(image_feats, w.objectness_head.w1,w.objectness_head.w1_b))
-    objectness = F.gelu(F.linear(objectness, w.objectness_head.w2,w.objectness_head.w2_b))
-    objectness_logits = F.linear(objectness, w.objectness_head.w3,w.objectness_head.w3_b)[..., 0]
-    # Predict object boxes
-    pred_boxes_temp = F.gelu(F.linear(image_feats, w.box_head.w1,w.box_head.w1_b))
-    pred_boxes_temp = F.gelu(F.linear(pred_boxes_temp, w.box_head.w2,w.box_head.w2_b))
-    pred_boxes = F.linear(pred_boxes_temp, w.box_head.w3,w.box_head.w3_b)
-    # Compute the location of each token on the grid and use it to compute a bias for the bbox prediction
-    box_bias = compute_box_bias(model_params.num_patches_sqrt)
-    box_bias = box_bias.to(feature_map.device)
-    pred_boxes += box_bias
-    pred_boxes = F.sigmoid(pred_boxes)
-
+    
+    # Predict classes, objectness, and boxes
+    pred_logits, _ = class_head(image_feats, text_features, query_mask, w.class_head, model_params)
+    
+    objectness = F.gelu(F.linear(image_feats, w.objectness_head.w1, w.objectness_head.w1_b))
+    objectness = F.gelu(F.linear(objectness, w.objectness_head.w2, w.objectness_head.w2_b))
+    objectness_logits = F.linear(objectness, w.objectness_head.w3, w.objectness_head.w3_b)[..., 0]
+    
+    pred_boxes = F.gelu(F.linear(image_feats, w.box_head.w1, w.box_head.w1_b))
+    pred_boxes = F.gelu(F.linear(pred_boxes, w.box_head.w2, w.box_head.w2_b))
+    pred_boxes = F.linear(pred_boxes, w.box_head.w3, w.box_head.w3_b)
+    
+    box_bias = compute_box_bias(model_params.num_patches_sqrt).to(image_feats.device)
+    pred_boxes = F.sigmoid(pred_boxes + box_bias)
+    
     return pred_logits, objectness_logits, pred_boxes
 
 if __name__ == '__main__':

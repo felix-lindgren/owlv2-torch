@@ -35,7 +35,7 @@ def test_pt():
     image_inputs = image_transform(image).unsqueeze(0)
     text_inputs = tokenizer(["a cat", "a scale", "a plastic bag"], return_tensors="pt", padding=True, truncation=True, )
 
-    with torch.no_grad(), timer("model_run"):
+    with torch.inference_mode(), timer("model_run"):
         image_inputs = image_inputs.cuda()
         text_inputs = {k: v.cuda() for k, v in text_inputs.items()}
         padded_ids, _attn_maks = process_sequences(text_inputs["input_ids"].tolist())
