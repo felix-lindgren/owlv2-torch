@@ -1,6 +1,4 @@
 import torch
-import numpy as np
-import utils
 from PIL import Image
 from OWLv2torch.hf_version.modeling_owlv2 import Owlv2ForObjectDetection
 from OWLv2torch.hf_version.processing_owlv2 import Owlv2Processor

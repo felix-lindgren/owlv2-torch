@@ -11,16 +11,15 @@ description = "A brief description of your OWLv2torch package"
 readme = "README.md"
 requires-python = ">=3.7"
 keywords = ["owl", "torch", "deep learning"]
-license = {text = "MIT"}
+license = {text = "None"}
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    ftfy
+    "ftfy",
+    "EzLogger @ git+https://github.com/felix-lindgren/Logging",
     # "torch>=1.8.0",
-    # Add other dependencies here
 ]
 dynamic = ["version"]
 

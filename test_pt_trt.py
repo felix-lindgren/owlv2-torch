@@ -1,14 +1,9 @@
 import torch
-import torch.nn as nn
 import utils
 from PIL import Image
-import numpy as np
-from transformers import CLIPTokenizer
 from OWLv2torch.hf_version.processing_owlv2 import Owlv2Processor
 from OWLv2torch import tokenize, OwlV2TRT
 from EzLogger import Timer
-from safetensors import safe_open
-from typing import Union, List
 
 timer = Timer()
 

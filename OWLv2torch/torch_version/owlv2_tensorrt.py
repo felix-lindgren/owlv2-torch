@@ -1,8 +1,5 @@
 import numpy as np
-import pycuda.driver as cuda
-#import pycuda.autoinit
 import tensorrt as trt
-import time
 import torch
 from PIL import Image
 from OWLv2torch.torch_version.owlv2 import OwlV2
@@ -11,10 +8,7 @@ timer = Timer()
 
 class TensorRTInference:
     def __init__(self, engine_path, cuda_device=0):
-        #cuda.init()
-        #device = cuda.Device(0)
-        #self.cuda_driver_context = device.make_context()
-        #self.cuda_driver_context.push()
+        
 
         self.device = cuda_device
         self.logger = trt.Logger(trt.Logger.ERROR)
