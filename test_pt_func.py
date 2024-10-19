@@ -2,14 +2,11 @@ from torch_func.owlv2 import text_obj_det, process_sequences
 from torch_func.owlv2_weights import load_owlv2_weights
 from torch_func.owlv2_config import OWLV2_B16, get_transform
 import torch
-import torch.nn as nn
 import utils
 from PIL import Image
 import numpy as np
 from transformers import CLIPTokenizer
-from transformers.modeling_attn_mask_utils import _create_4d_causal_attention_mask, _prepare_4d_attention_mask
-
-from hf_version.processing_owlv2 import Owlv2Processor
+from OWLv2torch.hf_version.processing_owlv2 import Owlv2Processor
 
 from EzLogger import Timer
 
@@ -34,13 +31,16 @@ def test_pt():
     image = Image.open('img.jpg')
     image_inputs = image_transform(image).unsqueeze(0)
     text_inputs = tokenizer(["a cat", "a scale", "a plastic bag"], return_tensors="pt", padding=True, truncation=True, )
+    image_inputs = image_inputs.cuda()
+    text_inputs = {k: v.cuda() for k, v in text_inputs.items()}
+    padded_ids, _attn_maks = process_sequences(text_inputs["input_ids"].tolist())
+    padded_ids, _attn_maks = padded_ids.cuda(), _attn_maks.cuda()
 
-    with torch.inference_mode(), timer("model_run"):
-        image_inputs = image_inputs.cuda()
-        text_inputs = {k: v.cuda() for k, v in text_inputs.items()}
-        padded_ids, _attn_maks = process_sequences(text_inputs["input_ids"].tolist())
-        padded_ids, _attn_maks = padded_ids.cuda(), _attn_maks.cuda()
-        outputs = text_obj_det(padded_ids, _attn_maks, image_inputs, weights, OWLV2_B16) 
+    with torch.inference_mode():
+        outputs = text_obj_det(padded_ids, _attn_maks, image_inputs, weights, OWLV2_B16) # warmup
+    for i in range(5):
+        with torch.inference_mode(), timer("model_run"):
+            outputs = text_obj_det(padded_ids, _attn_maks, image_inputs, weights, OWLV2_B16) 
     
     class dotdict(dict):
         """dot.notation access to dictionary attributes"""
@@ -60,7 +60,7 @@ def test_pt():
         box = [round(i, 2) for i in box.tolist()]
         print(f"Detected with confidence {round(score.item(), 3)} at location {box}")
         draw_img = utils.draw_bbox(draw_img, box)
-    utils.show_image(draw_img)
+    #utils.show_image(draw_img)
 
 
 if __name__ == '__main__':

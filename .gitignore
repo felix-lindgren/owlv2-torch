@@ -1,2 +1,5 @@
 *.safetensors
 __pycache__
+*.onnx
+*.engine
+*.png

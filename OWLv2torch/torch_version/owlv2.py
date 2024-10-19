@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import numpy as np
+from safetensors import safe_open
 
 import torchvision.transforms.v2 as T
 import torchvision.transforms.v2.functional as TF
@@ -332,6 +333,16 @@ class OwlV2(nn.Module):
             T.Normalize(mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD),
         ])
 
+    def load_model(self, model_path):
+        state_dict = {}
+        with safe_open(model_path, framework="pt") as f:
+            for k in f.keys():
+                tens = f.get_tensor(k)
+                k = k.replace("owlv2.","").replace(".embeddings","")
+                k = k.replace("mlp.fc1","mlp.0").replace("mlp.fc2","mlp.2")
+                state_dict[k] = tens
+
+        self.load_state_dict(state_dict, strict=True)
     
     def preprocess_image(self, image):
         if isinstance(image, str):
@@ -350,7 +361,7 @@ class OwlV2(nn.Module):
         return vision_features, vision_pooled, vision_full
     
     def get_text_features(self, token_ids, attention_mask, normalize=True):
-        y = self.text_model(token_ids, attention_mask)
+        y, _ = self.text_model(token_ids, attention_mask)
         y = self.text_projection(y)
         y = y / (torch.linalg.norm(y, dim=-1, keepdim=True) + 1e-6)
         return y

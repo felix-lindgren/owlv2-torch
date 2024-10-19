@@ -1,19 +1,13 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-
-import numpy as np
-
-import torchvision.transforms.v2 as T
-import torchvision.transforms.v2.functional as TF
-from PIL import Image
 
 from typing import Optional, Tuple
 
-from transformers.modeling_attn_mask_utils import _create_4d_causal_attention_mask, _prepare_4d_attention_mask
+from OWLv2torch.torch_func.owlv2_weights import load_owlv2_weights, LayerWeights, TextTransformerWeights, VisionTransformerWeights, OWLv2Weights, HeadLayerWeights
+from OWLv2torch.torch_func.owlv2_config import OWLV2_B16, EncoderParams, ModelParams
 
-from .owlv2_weights import load_owlv2_weights, LayerWeights, TextTransformerWeights, VisionTransformerWeights, OWLv2Weights, HeadLayerWeights
-from .owlv2_config import OWLV2_B16, EncoderParams, ModelParams
+from EzLogger import Timer
+timer = Timer()
 
 OPENAI_CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
 OPENAI_CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
@@ -80,11 +74,11 @@ def xfrm(h, weights, model_params, attn_mask=None):
         h = residual + feed_forward(h, weights.layer_weights[i])
     return h 
 
+@timer("encode_text", gpu=True)
 def encode_text(tokens, weights: TextTransformerWeights, model_params: ModelParams, attn_mask):
-    seq_length = tokens.shape[-1] if tokens is not None else tokens.shape[-2]
     h = weights.tok_embeddings[tokens]
-    pos_ids = torch.arange(16).expand((1, -1))
-    pos_embs = weights.pos_embeddings[pos_ids[:,:seq_length]]
+    pos_ids = torch.arange(16, device=h.device).expand((1, -1))
+    pos_embs = weights.pos_embeddings[pos_ids[:,:tokens.shape[-1]]]
     h = h + pos_embs
 
     h = xfrm(h, weights=weights, model_params=model_params.text_encoder, attn_mask=attn_mask)
@@ -93,6 +87,7 @@ def encode_text(tokens, weights: TextTransformerWeights, model_params: ModelPara
     pooled_output = norm_x[torch.arange(norm_x.shape[0], device=norm_x.device),tokens.to(torch.int).argmax(dim=-1).to(norm_x.device),    ]
     return pooled_output, h
 
+@timer("encode_vision", gpu=True)
 def encode_vision(pixel_data: torch.Tensor, weights: VisionTransformerWeights, model_params: ModelParams):
     batch_size = pixel_data.shape[0]
     patch_embeds = F.conv2d(pixel_data, weights.patch_embeddings, stride=model_params.patch_size)
@@ -148,8 +143,9 @@ def compute_box_bias(num_patches: int) -> torch.Tensor:
 
 def text_obj_det(token_ids, attn_mask, pixel_values, w, model_params):
     # Encode vision and text
-    _, vision_full = encode_vision(pixel_values, w.vision_weights, model_params)
-    text_features,_ = encode_text(token_ids, w.text_weights, model_params, attn_mask)
+    with timer("encode", gpu=True):
+        _, vision_full = encode_vision(pixel_values, w.vision_weights, model_params)
+        text_features,_ = encode_text(token_ids, w.text_weights, model_params, attn_mask)
     
     # Project and normalize features
     text_features = F.linear(text_features, w.text_proj)
@@ -173,18 +169,19 @@ def text_obj_det(token_ids, attn_mask, pixel_values, w, model_params):
     query_mask = token_ids[..., 0] > 0
     
     # Predict classes, objectness, and boxes
-    pred_logits, _ = class_head(image_feats, text_features, query_mask, w.class_head, model_params)
-    
-    objectness = F.gelu(F.linear(image_feats, w.objectness_head.w1, w.objectness_head.w1_b))
-    objectness = F.gelu(F.linear(objectness, w.objectness_head.w2, w.objectness_head.w2_b))
-    objectness_logits = F.linear(objectness, w.objectness_head.w3, w.objectness_head.w3_b)[..., 0]
-    
-    pred_boxes = F.gelu(F.linear(image_feats, w.box_head.w1, w.box_head.w1_b))
-    pred_boxes = F.gelu(F.linear(pred_boxes, w.box_head.w2, w.box_head.w2_b))
-    pred_boxes = F.linear(pred_boxes, w.box_head.w3, w.box_head.w3_b)
-    
-    box_bias = compute_box_bias(model_params.num_patches_sqrt).to(image_feats.device)
-    pred_boxes = F.sigmoid(pred_boxes + box_bias)
+    with timer("heads", gpu=True):
+        pred_logits, _ = class_head(image_feats, text_features, query_mask, w.class_head, model_params)
+        
+        objectness = F.gelu(F.linear(image_feats, w.objectness_head.w1, w.objectness_head.w1_b))
+        objectness = F.gelu(F.linear(objectness, w.objectness_head.w2, w.objectness_head.w2_b))
+        objectness_logits = F.linear(objectness, w.objectness_head.w3, w.objectness_head.w3_b)[..., 0]
+        
+        pred_boxes = F.gelu(F.linear(image_feats, w.box_head.w1, w.box_head.w1_b))
+        pred_boxes = F.gelu(F.linear(pred_boxes, w.box_head.w2, w.box_head.w2_b))
+        pred_boxes = F.linear(pred_boxes, w.box_head.w3, w.box_head.w3_b)
+        
+        box_bias = compute_box_bias(model_params.num_patches_sqrt).to(image_feats.device)
+        pred_boxes = F.sigmoid(pred_boxes + box_bias)
     
     return pred_logits, objectness_logits, pred_boxes
 

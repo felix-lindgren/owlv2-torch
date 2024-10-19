@@ -3,14 +3,14 @@ import torch.nn.functional as F
 import numpy as np
 import utils
 from PIL import Image
-from hf_version.modeling_owlv2 import Owlv2ForObjectDetection
-from hf_version.processing_owlv2 import Owlv2Processor
+from OWLv2torch.hf_version.modeling_owlv2 import Owlv2ForObjectDetection
+from OWLv2torch.hf_version.processing_owlv2 import Owlv2Processor
 from transformers.modeling_attn_mask_utils import _create_4d_causal_attention_mask, _prepare_4d_attention_mask
 
-from torch_version.owlv2 import OwlV2
-from torch_func.owlv2 import encode_text, encode_vision, attention, feed_forward, create_mask, build_attn_mask, combine_masks, pad_sequences
-from torch_func.owlv2_config import OWLV2_B16, ModelParams
-from torch_func.owlv2_weights import load_owlv2_weights, OWLv2Weights
+from OWLv2torch.torch_version.owlv2 import OwlV2
+from OWLv2torch.torch_func.owlv2 import encode_text, encode_vision, attention, feed_forward, create_mask, build_attn_mask, combine_masks, pad_sequences
+from OWLv2torch.torch_func.owlv2_config import OWLV2_B16, ModelParams
+from OWLv2torch.torch_func.owlv2_weights import load_owlv2_weights, OWLv2Weights
 from safetensors import safe_open
 
 
