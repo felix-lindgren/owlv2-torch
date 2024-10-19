@@ -11,8 +11,6 @@ from PIL import Image
 
 from typing import Optional, Tuple
 
-from transformers.modeling_attn_mask_utils import _create_4d_causal_attention_mask, _prepare_4d_attention_mask
-
 OPENAI_CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
 OPENAI_CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
 
@@ -33,22 +31,32 @@ class SquarePad:
 		padding = (0, 0, hp, vp)
 		return TF.pad(image, padding, 0.5, 'constant')
 
-""" def _create_4d_causal_attention_mask(
-    input_shape,
-    dtype: torch.dtype,
-    device: torch.device,
-    past_key_values_length: int = 0,
-    sliding_window: Optional[int] = None,
-) -> Optional[torch.Tensor]:
+def process_sequences(sequences: list[list[int]], start_pos: int = 0, default_mask_value: float = float('-inf')) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size = len(sequences)
+    max_len = max(len(seq) for seq in sequences)
     
-    attn_mask_converter = AttentionMaskConverter(is_causal=True, sliding_window=sliding_window)
-
-    key_value_length = past_key_values_length + input_shape[-1]
-    attention_mask = attn_mask_converter.to_causal_4d(
-        input_shape[0], input_shape[-1], key_value_length, dtype=dtype, device=device
-    )
-
-    return attention_mask """
+    # Pad sequences and create padding mask
+    padded_seqs = torch.zeros((batch_size, max_len), dtype=torch.long)
+    padding_mask = torch.ones((batch_size, max_len), dtype=torch.bool)
+    
+    for i, seq in enumerate(sequences):
+        seq_len = len(seq)
+        padded_seqs[i, :seq_len] = torch.tensor(seq)
+        padding_mask[i, :seq_len] = False
+    
+    # Build attention mask
+    if max_len > 1:
+        attn_mask = torch.triu(torch.full((max_len, max_len), default_mask_value), diagonal=1)
+        attn_mask = torch.hstack([torch.zeros((max_len, start_pos)), attn_mask]).float()
+        attn_mask = attn_mask.unsqueeze(0).expand(batch_size, 1, max_len, max_len)
+    else:
+        attn_mask = torch.zeros((batch_size, 1, max_len, max_len))
+    
+    # Combine masks
+    combined_mask = attn_mask.clone()
+    combined_mask.masked_fill_(padding_mask.unsqueeze(1).unsqueeze(2), default_mask_value)
+    
+    return padded_seqs, combined_mask
 
 class Attention(nn.Module): 
     def __init__(self, hidden_size, num_heads, dropout):
@@ -210,14 +218,9 @@ class TextTower(nn.Module):
         position_embeddings = self.position_embedding(position_ids)
         hidden = inputs_embeds + position_embeddings
 
-        
-        # attn masks
-        input_shape = input_ids.size()
-        causal_attention_mask = _create_4d_causal_attention_mask(input_shape, hidden.dtype, hidden.device)
-        attention_mask = _prepare_4d_attention_mask(attention_mask, hidden.dtype)
-        attention_mask = attention_mask + causal_attention_mask
-
-        
+        input_ids, attention_mask = process_sequences(sequences=input_ids.tolist())
+        input_ids = input_ids.to(hidden.device)
+        attention_mask = attention_mask.to(hidden.device)
 
         # Encoder
         encoder_outputs = self.encoder(hidden, attention_mask)

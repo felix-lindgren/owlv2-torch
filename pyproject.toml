@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=45", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "OWLv2torch"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"},
+]
+description = "A brief description of your OWLv2torch package"
+readme = "README.md"
+requires-python = ">=3.7"
+keywords = ["owl", "torch", "deep learning"]
+license = {text = "MIT"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    ftfy
+    # "torch>=1.8.0",
+    # Add other dependencies here
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov",
+    # Add other development dependencies here
+]
+
+[tool.setuptools_scm]
+write_to = "OWLv2torch/_version.py"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["OWLv2torch*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+addopts = "--cov=OWLv2torch"
+testpaths = [
+    "tests",
+]

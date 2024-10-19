@@ -5,7 +5,7 @@ import tensorrt as trt
 import time
 import torch
 from PIL import Image
-from owlv2 import OwlV2
+from OWLv2torch.torch_version.owlv2 import OwlV2
 from EzLogger import Timer
 timer = Timer()
 

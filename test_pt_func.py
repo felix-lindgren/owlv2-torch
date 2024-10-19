@@ -1,12 +1,11 @@
-from torch_func.owlv2 import text_obj_det, process_sequences
-from torch_func.owlv2_weights import load_owlv2_weights
-from torch_func.owlv2_config import OWLV2_B16, get_transform
+from OWLv2torch.torch_func.owlv2 import text_obj_det, process_sequences
+from OWLv2torch.torch_func.owlv2_weights import load_owlv2_weights
+from OWLv2torch.torch_func.owlv2_config import OWLV2_B16, get_transform
+from OWLv2torch.hf_version.processing_owlv2 import Owlv2Processor
 import torch
 import utils
 from PIL import Image
-import numpy as np
-from transformers import CLIPTokenizer
-from OWLv2torch.hf_version.processing_owlv2 import Owlv2Processor
+from OWLv2torch import tokenize
 
 from EzLogger import Timer
 
@@ -25,15 +24,18 @@ def test_pt():
     weights = load_owlv2_weights(state_dict)
     image_transform = get_transform(OWLV2_B16)
 
-    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32", clean_up_tokenization_spaces=True)
+    text_inputs = tokenize(["a cat", "a scale", "a plastic bag"], context_length=16, truncate=True)
+    attention_mask = text_inputs == 0
     
 
     image = Image.open('img.jpg')
     image_inputs = image_transform(image).unsqueeze(0)
-    text_inputs = tokenizer(["a cat", "a scale", "a plastic bag"], return_tensors="pt", padding=True, truncation=True, )
+
     image_inputs = image_inputs.cuda()
-    text_inputs = {k: v.cuda() for k, v in text_inputs.items()}
-    padded_ids, _attn_maks = process_sequences(text_inputs["input_ids"].tolist())
+    text_inputs = text_inputs.cuda()
+    attention_mask = attention_mask.cuda()
+
+    padded_ids, _attn_maks = process_sequences(text_inputs.tolist())
     padded_ids, _attn_maks = padded_ids.cuda(), _attn_maks.cuda()
 
     with torch.inference_mode():

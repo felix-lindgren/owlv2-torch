@@ -1,4 +1,4 @@
-from OWLv2torch.torch_version.owlv2 import OwlV2
+from OWLv2torch import OwlV2, tokenize
 import torch
 import torch.nn as nn
 import utils
@@ -28,12 +28,14 @@ def test_pt():
 
     image = Image.open('img.jpg')
     image_inputs = model.preprocess_image(image)
-    text_inputs = tokenizer(["a cat", "a scale", "a plastic bag"], return_tensors="pt", padding=True, truncation=True)
+    text_inputs = tokenize(["a cat", "a scale", "a plastic bag"], context_length=16, truncate=True)
+    attention_mask = text_inputs == 0
 
     with torch.no_grad():
         image_inputs = image_inputs.cuda()
-        text_inputs = {k: v.cuda() for k, v in text_inputs.items()}
-        outputs = model.forward_object_detection(image_inputs, text_inputs["input_ids"], text_inputs["attention_mask"]) 
+        text_inputs = text_inputs.cuda()
+        attention_mask = attention_mask.cuda()
+        outputs = model.forward_object_detection(image_inputs, text_inputs, attention_mask) 
     
     class dotdict(dict):
         """dot.notation access to dictionary attributes"""

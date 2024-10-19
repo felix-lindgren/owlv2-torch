@@ -1,4 +1,3 @@
-from OWLv2torch.torch_version.owlv2_tensorrt import OwlV2TRT
 import torch
 import torch.nn as nn
 import utils
@@ -6,30 +5,31 @@ from PIL import Image
 import numpy as np
 from transformers import CLIPTokenizer
 from OWLv2torch.hf_version.processing_owlv2 import Owlv2Processor
+from OWLv2torch import tokenize, OwlV2TRT
 from EzLogger import Timer
 from safetensors import safe_open
+from typing import Union, List
+
 timer = Timer()
 
 def test_pt():
     model = OwlV2TRT("owlv2_vis.engine")
     model.load_model("weights/model.safetensors")
-
-
-    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
     model.eval()
     model.cuda()
-    #print(model)
 
     image = Image.open('img.jpg')
     image_inputs = model.preprocess_image(image)
-    text_inputs = tokenizer(["a cat", "a scale", "a plastic bag"], return_tensors="pt", padding=True, truncation=True)
+    text_inputs = tokenize(["a cat", "a scale", "a plastic bag"], context_length=16, truncate=True)
+    attention_mask = text_inputs == 0
 
     with torch.no_grad():
         image_inputs = image_inputs.cuda()
-        text_inputs = {k: v.cuda() for k, v in text_inputs.items()}
+        text_inputs = text_inputs.cuda()
+        attention_mask = attention_mask.cuda()
         for i in range(5):
             with timer("inf"):
-                outputs = model.forward_object_detection(image_inputs, text_inputs["input_ids"], text_inputs["attention_mask"]) 
+                outputs = model.forward_object_detection(image_inputs, text_inputs, attention_mask) 
     
     class dotdict(dict):
         """dot.notation access to dictionary attributes"""
