@@ -336,6 +336,15 @@ class OwlV2(nn.Module):
             T.Normalize(mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD),
         ])
 
+        self.image_transform_unnormed = T.Compose([
+            T.ToImage(),
+            T.ToDtype(torch.float32,scale=True),
+            SquarePad(),
+            T.Resize((self.image_size, self.image_size), antialias=True),
+        ])
+
+        self.owlv2_img_normalize = T.Normalize(mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD)
+
     def load_model(self, model_path):
         state_dict = {}
         with safe_open(model_path, framework="pt") as f:
