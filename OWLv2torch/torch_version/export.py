@@ -25,10 +25,9 @@ torch.onnx.export(vision_model,               # model being run
                   dummy_input,         # model input (or a tuple for multiple inputs)
                   "owlv2_vis.onnx",   # where to save the model
                   export_params=True,        # store the trained parameter weights inside the model file
-                  input_names = ['input'],   # the model's input names
-                  output_names = ['output'], # the model's output names
-                  dynamic_axes={'input' : {0 : 'batch_size'},    # variable length axes
-                                'output' : {0 : 'batch_size'}})
+                  input_names = ['image'],   # the model's input names
+                  output_names = ['cls_emb', 'full_output'], # the model's output names
+                  )
 
 
 onnx_model = onnx.load("owlv2_vis.onnx")
