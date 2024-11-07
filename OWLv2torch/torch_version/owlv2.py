@@ -9,6 +9,8 @@ import torchvision.transforms.v2 as T
 import torchvision.transforms.v2.functional as TF
 from PIL import Image
 
+from OWLv2torch.utils.hf_hub_utils import find_safetensors_in_cache
+
 from typing import Optional, Tuple
 
 OPENAI_CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
@@ -347,7 +349,10 @@ class OwlV2(nn.Module):
 
     def load_model(self, model_path):
         state_dict = {}
-        with safe_open(model_path, framework="pt") as f:
+
+        cache_path = find_safetensors_in_cache(model_path)
+        assert len(cache_path) == 1, "More than one safetensor file in model path"
+        with safe_open(cache_path[0], framework="pt") as f:
             for k in f.keys():
                 tens = f.get_tensor(k)
                 k = k.replace("owlv2.","").replace(".embeddings","")

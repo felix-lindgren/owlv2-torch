@@ -14,7 +14,10 @@ def test_pt():
     model.cuda()
 
     image = Image.open('img.jpg')
+    image = image.resize((960,960))
     image_inputs = model.preprocess_image(image)
+    utils.show_image(image_inputs)
+    print(image_inputs.shape)
     text_inputs = tokenize(["a cat", "a scale", "a plastic bag"], context_length=16, truncate=True)
     attention_mask = text_inputs == 0
 
@@ -39,7 +42,7 @@ def test_pt():
     i = 0  # Retrieve predictions for the first image for the corresponding text queries
     boxes, scores, labels = results[i]["boxes"], results[i]["scores"], results[i]["labels"]
 
-    draw_img = utils.load_image('img.jpg')
+    draw_img = image_inputs.cpu()# utils.load_image('img.jpg')
     for box, score, label in zip(boxes, scores, labels):
         box = [round(i, 2) for i in box.tolist()]
         print(f"Detected with confidence {round(score.item(), 3)} at location {box}")

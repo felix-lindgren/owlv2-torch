@@ -4,6 +4,7 @@ from torch2trt import TRTModule
 import torch
 from PIL import Image
 from pathlib import Path
+from safetensors import safe_open
 from OWLv2torch.torch_version.owlv2 import OwlV2
 from EzLogger import Timer
 timer = Timer()
@@ -12,15 +13,21 @@ class OwlV2TRT(OwlV2):
 
     def __init__(self, engine_path):
         super().__init__()
-        if Path(engine_path).exists():
-            self.trt =  TRTModule(engine_path, ["image"], output_names=["cls_emb", "full_output"])
+        self.engine_path = engine_path
+        
+
+    def load_model(self, model_path):
+        super().load_model(model_path)
+
+        if Path(self.engine_path).exists():
+            self.trt = TRTModule(self.engine_path, ["image"], output_names=["cls_emb", "full_output"])
         else:
             self.trt = None
 
     @timer("trt_infrence")
     def trt_inference(self, pixel_data: torch.Tensor):
         device = pixel_data.device
-        output_data = self.trt.infer(pixel_data)
+        output_data = self.trt(pixel_data)
         pooled_output, full_vision = output_data
         pooled_output = pooled_output.reshape((1,-1))
         full_vision = full_vision.reshape((1,self.vision_model.num_positions,self.vision_dim))
@@ -46,6 +53,7 @@ if __name__ == "__main__":
     inputs = img_array.transpose(2, 0, 1)  # (3, 224, 224)
     
     model = OwlV2TRT(engine_path)
+    model.load_model("weights/model.safetensors")
     model.eval(),model.cuda()
     print(inputs.shape, inputs.dtype)
     im_pt = torch.from_numpy(inputs).unsqueeze(0).cuda()
