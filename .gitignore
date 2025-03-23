@@ -4,3 +4,4 @@ __pycache__
 *.engine
 *.png
 *.egg-info
+build/

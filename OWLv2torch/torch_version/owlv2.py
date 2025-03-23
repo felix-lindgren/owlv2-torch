@@ -15,7 +15,34 @@ from typing import Optional, Tuple
 
 OPENAI_CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
 OPENAI_CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
+DEFAULT_MASK_VALUE = -0.7 * float(torch.finfo(torch.float32).max)
 
+def process_sequences(sequences: list[list[int]], start_pos: int = 0, default_mask_value: float = float(DEFAULT_MASK_VALUE)) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size = len(sequences)
+    max_len = max(len(seq) for seq in sequences)
+    
+    # Pad sequences and create padding mask
+    padded_seqs = torch.zeros((batch_size, max_len), dtype=torch.long)
+    padding_mask = torch.ones((batch_size, max_len), dtype=torch.bool)
+    for i, seq in enumerate(sequences):
+        seq_len = len(seq)
+        seq_len = sum([x != 0 for x in seq])
+        padded_seqs[i, :seq_len] = torch.tensor(seq[:seq_len])
+        padding_mask[i, :seq_len] = False
+    
+    # Build attention mask
+    if max_len > 1:
+        attn_mask = torch.triu(torch.full((max_len, max_len), default_mask_value), diagonal=1)
+        attn_mask = torch.hstack([torch.zeros((max_len, start_pos)), attn_mask]).float()
+        attn_mask = attn_mask.unsqueeze(0).expand(batch_size, 1, max_len, max_len)
+    else:
+        attn_mask = torch.zeros((batch_size, 1, max_len, max_len))
+    
+    # Combine masks
+    combined_mask = attn_mask.clone()
+    combined_mask.masked_fill_(padding_mask.unsqueeze(1).unsqueeze(2), default_mask_value)
+    
+    return padded_seqs, combined_mask
 class QuickGELUActivation(nn.Module):
     """
     Applies GELU approximation that is fast but somewhat inaccurate. See: https://github.com/hendrycks/GELUs
@@ -33,32 +60,6 @@ class SquarePad:
 		padding = (0, 0, hp, vp)
 		return TF.pad(image, padding, 0.5, 'constant')
 
-def process_sequences(sequences: list[list[int]], start_pos: int = 0, default_mask_value: float = float('-inf')) -> tuple[torch.Tensor, torch.Tensor]:
-    batch_size = len(sequences)
-    max_len = max(len(seq) for seq in sequences)
-    
-    # Pad sequences and create padding mask
-    padded_seqs = torch.zeros((batch_size, max_len), dtype=torch.long)
-    padding_mask = torch.ones((batch_size, max_len), dtype=torch.bool)
-    
-    for i, seq in enumerate(sequences):
-        seq_len = len(seq)
-        padded_seqs[i, :seq_len] = torch.tensor(seq)
-        padding_mask[i, :seq_len] = False
-    
-    # Build attention mask
-    if max_len > 1:
-        attn_mask = torch.triu(torch.full((max_len, max_len), default_mask_value), diagonal=1)
-        attn_mask = torch.hstack([torch.zeros((max_len, start_pos)), attn_mask]).float()
-        attn_mask = attn_mask.unsqueeze(0).expand(batch_size, 1, max_len, max_len)
-    else:
-        attn_mask = torch.zeros((batch_size, 1, max_len, max_len))
-    
-    # Combine masks
-    combined_mask = attn_mask.clone()
-    combined_mask.masked_fill_(padding_mask.unsqueeze(1).unsqueeze(2), default_mask_value)
-    
-    return padded_seqs, combined_mask
 
 class Attention(nn.Module): 
     def __init__(self, hidden_size, num_heads, dropout):
@@ -114,13 +115,13 @@ class EncoderLayer(nn.Module):
         super().__init__()
 
         self.self_attn = Attention(hidden_size, num_heads, dropout)
-        self.layer_norm1 = nn.LayerNorm(hidden_size)
+        self.layer_norm1 = nn.LayerNorm(hidden_size, eps=1e-5)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_size, mlp_dim),
             QuickGELUActivation(),
             nn.Linear(mlp_dim, hidden_size),
         )
-        self.layer_norm2 = nn.LayerNorm(hidden_size)
+        self.layer_norm2 = nn.LayerNorm(hidden_size, eps=1e-5)
 
 
     def forward(self, x, mask=None):
@@ -153,15 +154,15 @@ class Encoder(nn.Module):
         return x
 
 class VisionTower(nn.Module):
-    def __init__(self, hidden_size, patch_size, image_size):
+    def __init__(self, hidden_size, patch_size, image_size, num_layers, num_heads, mlp_dim):
         super().__init__()
         
         self.class_embedding = nn.Parameter(torch.randn(hidden_size))
         self.patch_embedding = nn.Conv2d(
             in_channels=3,
             out_channels=hidden_size,
-            kernel_size=16,
-            stride=16,
+            kernel_size=patch_size,
+            stride=patch_size,
             bias=False,
         )
         self.num_patches = (image_size // patch_size) ** 2
@@ -170,11 +171,11 @@ class VisionTower(nn.Module):
         self.register_buffer("position_ids", torch.arange(self.num_positions).expand((1, -1)), persistent=False)
 
         # layer norm
-        self.pre_layernorm = nn.LayerNorm(hidden_size)
-        self.post_layernorm = nn.LayerNorm(hidden_size)
+        self.pre_layernorm = nn.LayerNorm(hidden_size,eps=1e-5)
+        self.post_layernorm = nn.LayerNorm(hidden_size,eps=1e-5)
 
         # Encoder
-        self.encoder = Encoder(hidden_size, num_layers=12, num_heads=12, mlp_dim=3072, dropout=0.0)
+        self.encoder = Encoder(hidden_size, num_layers=num_layers, num_heads=num_heads, mlp_dim=mlp_dim, dropout=0.0)
 
 
     def forward(self, x):
@@ -185,7 +186,6 @@ class VisionTower(nn.Module):
         class_embeds = self.class_embedding.expand(batch_size, 1, -1)
         embeddings = torch.cat([class_embeds, patch_embeds], dim=1)
         embeddings = embeddings + self.position_embedding(self.position_ids)
-        
         embeddings = self.pre_layernorm(embeddings)
         
         x = self.encoder(embeddings, None) # no mask for vision transformer
@@ -193,9 +193,8 @@ class VisionTower(nn.Module):
         pooled_output = self.post_layernorm(pooled_output)
 
         return pooled_output, x
-    
 class TextTower(nn.Module):
-    def __init__(self, hidden_size, num_positions, vocab_size):
+    def __init__(self, hidden_size, num_positions, vocab_size, num_layers, num_heads, mlp_dim):
         super().__init__()
         
         # Embeddings
@@ -208,7 +207,7 @@ class TextTower(nn.Module):
         # layer norm
         self.final_layer_norm = nn.LayerNorm(hidden_size)
         # Encoder
-        self.encoder = Encoder(hidden_size, num_layers=12, num_heads=8, mlp_dim=2048, dropout=0.0)
+        self.encoder = Encoder(hidden_size, num_layers=num_layers, num_heads=num_heads, mlp_dim=mlp_dim, dropout=0.0)
 
 
     def forward(self, input_ids, attention_mask=None):
@@ -219,15 +218,14 @@ class TextTower(nn.Module):
         inputs_embeds = self.token_embedding(input_ids)
         position_embeddings = self.position_embedding(position_ids)
         hidden = inputs_embeds + position_embeddings
-
         input_ids, attention_mask = process_sequences(sequences=input_ids.tolist())
         input_ids = input_ids.to(hidden.device)
         attention_mask = attention_mask.to(hidden.device)
 
         # Encoder
+        
         encoder_outputs = self.encoder(hidden, attention_mask)
         last_hidden_state = self.final_layer_norm(encoder_outputs)
-
         # take features from the end of tokens embedding (end of token is the highest number in each sequence)
         # casting to torch.int for onnx compatibility: argmax doesn't support int64 inputs with opset 14
         pooled_output = last_hidden_state[
@@ -286,25 +284,53 @@ class ClassPredictionHead(nn.Module):
 
         # Get class predictions
         pred_logits = torch.einsum("...pd,...qd->...pq", image_class_embeds, query_embeds)
-
+        
         # Apply a learnable shift and scale to logits
-        logit_shift = self.logit_shift(image_embeds)
+        logit_shift = self.logit_shift(image_embeds) 
         logit_scale = self.logit_scale(image_embeds)
         logit_scale = self.elu(logit_scale) + 1
         pred_logits = (pred_logits + logit_shift) * logit_scale
 
         if query_mask is not None:
+            print("querymask")
             if query_mask.ndim > 1:
                 query_mask = torch.unsqueeze(query_mask, dim=-2)
 
             pred_logits = torch.where(query_mask == 0, torch.finfo(pred_logits.dtype).min, pred_logits)
             pred_logits = pred_logits.to(torch.float32)
-
         return (pred_logits, image_class_embeds)
 
 class OwlV2(nn.Module):
-    def __init__(self, project_dim=512, vision_dim=768, text_dim=512, image_size=960, patch_size=16):
+    def __init__(self, model_type="base"):
         super().__init__()
+
+        if model_type == "base":
+            project_dim=512
+            vision_dim=768 
+            text_dim=512
+            image_size=960
+            patch_size=16
+            logit_scale = 2.6592
+            mlp_dim = 3072
+            num_layers = 12
+            num_heads = 12
+
+            text_num_heads = 8
+            text_mlp_dim = 2048
+            
+        else:
+            project_dim=768
+            vision_dim=1024
+            text_dim=768
+            image_size=1008
+            patch_size=14
+            logit_scale = 2.6592
+            mlp_dim = 4096
+            num_layers = 24
+            num_heads = 16
+            text_num_heads = 12
+            text_mlp_dim = 3072
+            
         
         self.projected_dim = project_dim
         self.vision_dim = vision_dim
@@ -313,14 +339,14 @@ class OwlV2(nn.Module):
         self.image_size = image_size
         self.patch_size = patch_size
 
-        self.vision_model = VisionTower(hidden_size=self.vision_dim, patch_size=self.patch_size, image_size=image_size)
-        self.text_model = TextTower(hidden_size=512, vocab_size=49408, num_positions=16)
+        self.vision_model = VisionTower(hidden_size=self.vision_dim, patch_size=self.patch_size, image_size=image_size, num_layers=num_layers, num_heads=num_heads, mlp_dim=mlp_dim)
+        self.text_model = TextTower(hidden_size=self.projected_dim, vocab_size=49408, num_positions=16, num_layers=num_layers, num_heads=text_num_heads, mlp_dim=text_mlp_dim)
 
         self.visual_projection = nn.Linear(self.vision_dim, self.projected_dim, bias=False)
-        self.text_projection = nn.Linear(512, self.projected_dim, bias=False)
+        self.text_projection = nn.Linear(self.text_dim, self.projected_dim, bias=False)
 
-        self.logit_scale = nn.Parameter(torch.tensor(1.0))
-        self.layer_norm = nn.LayerNorm(self.vision_dim)
+        self.logit_scale = nn.Parameter(torch.tensor(logit_scale))
+        self.layer_norm = nn.LayerNorm(self.vision_dim, eps=1e-5)
 
 
         self.class_head = ClassPredictionHead(self.text_dim, self.vision_dim)
@@ -329,12 +355,12 @@ class OwlV2(nn.Module):
 
         self.sqrt_num_patches = self.image_size // self.patch_size
         self.box_bias = self.compute_box_bias(self.sqrt_num_patches)
-
         self.image_transform = T.Compose([
             T.ToImage(),
-            T.ToDtype(torch.float32,scale=True),
+            #T.ToDtype(torch.float32,scale=False),
+            T.Lambda(lambda x: x*0.00392156862745098),
             SquarePad(),
-            T.Resize((self.image_size, self.image_size), antialias=True),
+            T.Resize((self.image_size, self.image_size), antialias=False),
             T.Normalize(mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD),
         ])
 
@@ -349,8 +375,9 @@ class OwlV2(nn.Module):
 
     def load_model(self, model_path):
         state_dict = {}
-
+        print(model_path)
         cache_path = find_safetensors_in_cache(model_path)
+        print(cache_path)
         assert len(cache_path) == 1, "More than one safetensor file in model path"
         with safe_open(cache_path[0], framework="pt") as f:
             for k in f.keys():
@@ -416,12 +443,15 @@ class OwlV2(nn.Module):
 
         logits_per_image, logits_per_text, vision_features, text_features, vision_full, text_features_raw = self.forward(pixel_values, token_ids, attention_mask)
 
+        print(vision_full.shape)
+        print(vision_full)
         feature_map = self.vision_model.post_layernorm(vision_full)
         class_token_out = torch.broadcast_to(feature_map[:, :1, :], feature_map[:, :-1].shape)
 
         # Merge image embedding with class tokens
         feature_map = feature_map[:, 1:, :] * class_token_out
         feature_map = self.layer_norm(feature_map)
+        print(class_token_out)
         
         new_size = (
             feature_map.shape[0],
@@ -493,7 +523,38 @@ class OwlV2(nn.Module):
         box_bias = torch.cat([box_coord_bias, box_size_bias], dim=-1)
         return box_bias
 
+
+    def postprocess_boxes(self, boxes, image_size, compensate_padding=True):
+        if isinstance(image_size, (list, tuple)):
+            image_height = torch.tensor([i[0] for i in image_size])
+            image_width = torch.tensor([i[1] for i in image_size])
+        elif isinstance(image_size, torch.Tensor):
+            image_height, image_width = image_size.unbind(1)
+        else:
+            raise ValueError("`target_sizes` must be a list, tuple or torch.Tensor")
+        
+        center_x, center_y, width, height = boxes.unbind(-1)
+        boxes = torch.stack(
+            # top left x, top left y, bottom right x, bottom right y
+            [(center_x - 0.5 * width), (center_y - 0.5 * height), (center_x + 0.5 * width), (center_y + 0.5 * height)],
+            dim=-1,
+        )
     
+        if compensate_padding:
+            if image_height > image_width:
+                clip_factor = image_width/image_height
+                boxes[:,:,(0,2)] = torch.clamp(boxes[:,:,(0,2)], 0, float(clip_factor))
+                boxes[:,:,(0,2)] = boxes[:,:,(0,2)] / boxes[:,:,(0,2)].max() 
+            else:
+                clip_factor = image_height/image_width
+                boxes[:,:,(1,3)] = torch.clamp(boxes[:,:,(1,3)], 0, clip_factor)
+                boxes[:,:,(0,2)] = boxes[:,:,(0,2)] / boxes[:,:,(0,2)].max()
+        scale_factor = torch.stack([image_width, image_height, image_width, image_height], dim=1)
+        scale_factor = scale_factor.unsqueeze(1).to(boxes.device)
+        boxes = boxes * scale_factor
+
+        return boxes
+
 
     
 if __name__ == '__main__':

@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 
 from OWLv2torch.torch_func.owlv2_weights import load_owlv2_weights, LayerWeights, TextTransformerWeights, VisionTransformerWeights, OWLv2Weights, HeadLayerWeights
 from OWLv2torch.torch_func.owlv2_config import OWLV2_B16, EncoderParams, ModelParams
-
+import matplotlib.pyplot as plt
 from EzLogger import Timer
 timer = Timer()
 
@@ -22,7 +22,7 @@ def process_sequences(sequences: list[list[int]], start_pos: int = 0, default_ma
     padding_mask = torch.ones((batch_size, max_len), dtype=torch.bool)
     
     for i, seq in enumerate(sequences):
-        seq_len = len(seq)
+        seq_len = (seq != 0).sum()
         padded_seqs[i, :seq_len] = torch.tensor(seq)
         padding_mask[i, :seq_len] = False
     
@@ -35,6 +35,7 @@ def process_sequences(sequences: list[list[int]], start_pos: int = 0, default_ma
         attn_mask = torch.zeros((batch_size, 1, max_len, max_len))
     
     # Combine masks
+    
     combined_mask = attn_mask.clone()
     combined_mask.masked_fill_(padding_mask.unsqueeze(1).unsqueeze(2), default_mask_value)
     

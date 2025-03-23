@@ -1,11 +1,13 @@
 import numpy as np
-import tensorrt as trt
-from torch2trt import TRTModule
 import torch
 from PIL import Image
 from pathlib import Path
 from safetensors import safe_open
 from OWLv2torch.torch_version.owlv2 import OwlV2
+if torch.cuda.is_available():    
+    from torch2trt import TRTModule
+import logging
+
 from EzLogger import Timer
 timer = Timer()
 
@@ -19,7 +21,7 @@ class OwlV2TRT(OwlV2):
     def load_model(self, model_path):
         super().load_model(model_path)
 
-        if Path(self.engine_path).exists():
+        if Path(self.engine_path).exists() and torch.cuda.is_available():
             self.trt = TRTModule(self.engine_path, ["image"], output_names=["cls_emb", "full_output"])
         else:
             self.trt = None

@@ -12,16 +12,15 @@ timer = Timer()
 def test_hf():
     model = Owlv2ForObjectDetection.from_pretrained("google/owlv2-base-patch16-ensemble")
     model = model.eval()
-    model.cuda()
     processor = Owlv2Processor.from_pretrained("google/owlv2-base-patch16-ensemble")
 
     image = Image.open('img.jpg')
     inputs = processor(images=[image], text=["a cat", "a scale", "a plastic bag"], return_tensors="pt") 
-    inputs = {k: v.cuda() for k, v in inputs.items()}
+    inputs = {k: v for k, v in inputs.items()}
     outputs = model(**inputs) # Warmup
     for i in range(5):
         with torch.no_grad(), timer("model_run"):
-            inputs = {k: v.cuda() for k, v in inputs.items()}
+            inputs = {k: v for k, v in inputs.items()}
             outputs = model(**inputs)
     target_sizes = torch.Tensor([image.size[::-1]])
     results = processor.post_process_object_detection(outputs=outputs, target_sizes=target_sizes, threshold=0.1)
@@ -33,7 +32,7 @@ def test_hf():
         box = [round(i, 2) for i in box.tolist()]
         print(f"Detected with confidence {round(score.item(), 3)} at location {box}")
         draw_img = utils.draw_bbox(draw_img, box)
-    #utils.show_image(draw_img)
+    utils.show_image(draw_img)
 
 
 if __name__ == '__main__':

@@ -16,12 +16,12 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
 ]
+version = "0.1"
 dependencies = [
     "ftfy",
     "EzLogger @ git+https://github.com/felix-lindgren/Logging",
     # "torch>=1.8.0",
 ]
-dynamic = ["version"]
 
 [project.optional-dependencies]
 dev = [

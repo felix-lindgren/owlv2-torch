@@ -307,6 +307,7 @@ class Owlv2ImageProcessor(BaseImageProcessor):
         cval = 0
         order = 1
         if anti_aliasing:
+            print("AA")
             if anti_aliasing_sigma is None:
                 anti_aliasing_sigma = np.maximum(0, (factors - 1) / 2)
             else:
@@ -322,6 +323,7 @@ class Owlv2ImageProcessor(BaseImageProcessor):
             filtered = image
 
         zoom_factors = [1 / f for f in factors]
+        print("zoomfactor", zoom_factors)
         out = ndi.zoom(filtered, zoom_factors, order=order, mode=ndi_mode, cval=cval, grid_mode=True)
 
         image = _clip_warp_output(image, out)
@@ -433,16 +435,20 @@ class Owlv2ImageProcessor(BaseImageProcessor):
             # We assume that all images have the same channel dimension format.
             input_data_format = infer_channel_dimension_format(images[0])
 
+        print("HF")
         if do_rescale:
+            print("rescale")
             images = [
                 self.rescale(image=image, scale=rescale_factor, input_data_format=input_data_format)
                 for image in images
             ]
 
         if do_pad:
+            print("PAD")
             images = [self.pad(image=image, input_data_format=input_data_format) for image in images]
 
         if do_resize:
+            print("Resize")
             images = [
                 self.resize(
                     image=image,
@@ -453,6 +459,7 @@ class Owlv2ImageProcessor(BaseImageProcessor):
             ]
 
         if do_normalize:
+            print("Normalize")
             images = [
                 self.normalize(image=image, mean=image_mean, std=image_std, input_data_format=input_data_format)
                 for image in images

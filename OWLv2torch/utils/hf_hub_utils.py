@@ -19,6 +19,7 @@ def find_safetensors_in_cache(model_id: str) -> list[Path]:
     # Convert model_id to cache-friendly format
     # HF stores files in nested directories based on the hash of the model ID
     try:
+        print(model_id)
         cached_file = try_to_load_from_cache(
             model_id,
             "model.safetensors",
@@ -28,10 +29,9 @@ def find_safetensors_in_cache(model_id: str) -> list[Path]:
             return [Path(cached_file)]
     except Exception:
         pass
-    
+    print("Failed first try")
     # If the above method fails, try manual search
     model_path = Path(cache_dir) / ("models--" + model_id.replace("/", "--"))
-    print(model_path)
     if not model_path.exists():
         return []
     

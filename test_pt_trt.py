@@ -9,9 +9,8 @@ timer = Timer()
 
 def test_pt():
     model = OwlV2TRT("owlv2_vis.engine")
-    model.load_model("weights/model.safetensors")
+    model.load_model("google/owlv2-base-patch16-ensemble")
     model.eval()
-    model.cuda()
 
     image = Image.open('img.jpg')
     image = image.resize((960,960))
@@ -22,10 +21,10 @@ def test_pt():
     attention_mask = text_inputs == 0
 
     with torch.no_grad():
-        image_inputs = image_inputs.cuda()
-        text_inputs = text_inputs.cuda()
-        attention_mask = attention_mask.cuda()
-        for i in range(5):
+        #image_inputs = image_inputs.cuda()
+        #text_inputs = text_inputs.cuda()
+        #attention_mask = attention_mask.cuda()
+        for i in range(1):
             with timer("inf"):
                 outputs = model.forward_object_detection(image_inputs, text_inputs, attention_mask) 
     

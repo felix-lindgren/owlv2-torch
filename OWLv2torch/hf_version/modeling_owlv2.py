@@ -767,7 +767,7 @@ class Owlv2Encoder(nn.Module):
             last_hidden_state=hidden_states, hidden_states=encoder_states, attentions=all_attentions
         )
 
-
+import matplotlib.pyplot as plt
 # Copied from transformers.models.owlvit.modeling_owlvit.OwlViTTextTransformer with OWLVIT->OWLV2,OwlViT->Owlv2
 class Owlv2TextTransformer(nn.Module):
     def __init__(self, config: Owlv2TextConfig):
@@ -812,6 +812,7 @@ class Owlv2TextTransformer(nn.Module):
         if attention_mask is not None:
             # [num_samples, seq_len] -> [num_samples, 1, tgt_seq_len, src_seq_len]
             attention_mask = _prepare_4d_attention_mask(attention_mask, hidden_states.dtype)
+     
         encoder_outputs = self.encoder(
             inputs_embeds=hidden_states,
             attention_mask=attention_mask,
@@ -1277,7 +1278,6 @@ class Owlv2ClassPredictionHead(nn.Module):
 
             pred_logits = torch.where(query_mask == 0, torch.finfo(pred_logits.dtype).min, pred_logits)
             pred_logits = pred_logits.to(torch.float32)
-
         return (pred_logits, image_class_embeds)
 
 
@@ -1419,7 +1419,6 @@ class Owlv2ForObjectDetection(Owlv2PreTrainedModel):
 
         # Resize class token
         class_token_out = torch.broadcast_to(image_embeds[:, :1, :], image_embeds[:, :-1].shape)
-
         # Merge image embedding with class tokens
         image_embeds = image_embeds[:, 1:, :] * class_token_out
         image_embeds = self.layer_norm(image_embeds)
