@@ -36,18 +36,15 @@ def test_pt():
     processor = Owlv2Processor.from_pretrained("google/owlv2-base-patch16-ensemble")
     target_sizes = torch.Tensor([image.size[::-1]])
     boxes = model.postprocess_boxes(outputs.pred_boxes, target_sizes)
-    print(boxes)
     probs = torch.max(outputs.logits, dim=-1)
     scores = torch.sigmoid(probs.values)
     labels = probs.indices
 
-    print(outputs['pred_boxes'].min(), outputs['pred_boxes'].max(dim=1))
     #results = processor.post_process_object_detection(outputs=outputs, target_sizes=target_sizes, threshold=0.1)
     #i = 0  # Retrieve predictions for the first image for the corresponding text queries
     #boxes, scores, labels = results[i]["boxes"], results[i]["scores"], results[i]["labels"]
 
     draw_img = utils.load_image('img.jpg')
-    print(boxes.shape, scores.shape, labels.shape)
     for j in range(boxes.shape[0]):
         for box, score, label in zip(boxes[j], scores[j], labels[j]):
             

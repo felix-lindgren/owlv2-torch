@@ -292,7 +292,6 @@ class ClassPredictionHead(nn.Module):
         pred_logits = (pred_logits + logit_shift) * logit_scale
 
         if query_mask is not None:
-            print("querymask")
             if query_mask.ndim > 1:
                 query_mask = torch.unsqueeze(query_mask, dim=-2)
 
@@ -443,15 +442,12 @@ class OwlV2(nn.Module):
 
         logits_per_image, logits_per_text, vision_features, text_features, vision_full, text_features_raw = self.forward(pixel_values, token_ids, attention_mask)
 
-        print(vision_full.shape)
-        print(vision_full)
         feature_map = self.vision_model.post_layernorm(vision_full)
         class_token_out = torch.broadcast_to(feature_map[:, :1, :], feature_map[:, :-1].shape)
 
         # Merge image embedding with class tokens
         feature_map = feature_map[:, 1:, :] * class_token_out
         feature_map = self.layer_norm(feature_map)
-        print(class_token_out)
         
         new_size = (
             feature_map.shape[0],
