@@ -4,12 +4,12 @@ import torch.nn as nn
 import utils
 from PIL import Image
 import numpy as np
-from transformers import CLIPTokenizer
 from OWLv2torch.hf_version.processing_owlv2 import Owlv2Processor
+import matplotlib
+matplotlib.use('Qt5Agg')
 
 def test_pt():
-    model = OwlV2()
-    model.load_model("google/owlv2-base-patch16-ensemble")
+    model = OwlV2("base")
     model.eval()
 
     image = Image.open('img.jpg')
@@ -47,8 +47,7 @@ def test_pt():
     draw_img = utils.load_image('img.jpg')
     for j in range(boxes.shape[0]):
         for box, score, label in zip(boxes[j], scores[j], labels[j]):
-            
-            if score < 0.15: continue
+            if score < 0.1: continue
             box = [round(i, 2) for i in box.tolist()]
             print(f"Detected with confidence {round(score.item(), 3)} at location {box}")
             draw_img = utils.draw_bbox(draw_img, box)

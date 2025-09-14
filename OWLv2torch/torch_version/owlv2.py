@@ -1,3 +1,4 @@
+from huggingface_hub.file_download import hf_hub_download
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,12 +11,13 @@ import torchvision.transforms.v2.functional as TF
 from PIL import Image
 
 from OWLv2torch.utils.hf_hub_utils import find_safetensors_in_cache
+from OWLv2torch.torch_version.prototypes import VisualPrototypeBank
 
 from typing import Optional, Tuple
 
-OPENAI_CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
-OPENAI_CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
-DEFAULT_MASK_VALUE = -0.7 * float(torch.finfo(torch.float32).max)
+OPENAI_CLIP_MEAN: list[float] = [0.48145466, 0.4578275, 0.40821073]
+OPENAI_CLIP_STD: list[float] = [0.26862954, 0.26130258, 0.27577711]
+DEFAULT_MASK_VALUE: float = -0.7 * float(torch.finfo(torch.float32).max)
 
 def process_sequences(sequences: list[list[int]], start_pos: int = 0, default_mask_value: float = float(DEFAULT_MASK_VALUE)) -> tuple[torch.Tensor, torch.Tensor]:
     batch_size = len(sequences)
@@ -304,6 +306,7 @@ class OwlV2(nn.Module):
         super().__init__()
 
         if model_type == "base":
+            self.model_string = "google/owlv2-base-patch16-ensemble"
             project_dim=512
             vision_dim=768 
             text_dim=512
@@ -312,12 +315,14 @@ class OwlV2(nn.Module):
             logit_scale = 2.6592
             mlp_dim = 3072
             num_layers = 12
+            num_text_layers = 12
             num_heads = 12
 
             text_num_heads = 8
             text_mlp_dim = 2048
             
         else:
+            self.model_string = "google/owlv2-large-patch14-ensemble"
             project_dim=768
             vision_dim=1024
             text_dim=768
@@ -326,6 +331,7 @@ class OwlV2(nn.Module):
             logit_scale = 2.6592
             mlp_dim = 4096
             num_layers = 24
+            num_text_layers = 12
             num_heads = 16
             text_num_heads = 12
             text_mlp_dim = 3072
@@ -339,7 +345,7 @@ class OwlV2(nn.Module):
         self.patch_size = patch_size
 
         self.vision_model = VisionTower(hidden_size=self.vision_dim, patch_size=self.patch_size, image_size=image_size, num_layers=num_layers, num_heads=num_heads, mlp_dim=mlp_dim)
-        self.text_model = TextTower(hidden_size=self.projected_dim, vocab_size=49408, num_positions=16, num_layers=num_layers, num_heads=text_num_heads, mlp_dim=text_mlp_dim)
+        self.text_model = TextTower(hidden_size=self.projected_dim, vocab_size=49408, num_positions=16, num_layers=num_text_layers, num_heads=text_num_heads, mlp_dim=text_mlp_dim)
 
         self.visual_projection = nn.Linear(self.vision_dim, self.projected_dim, bias=False)
         self.text_projection = nn.Linear(self.text_dim, self.projected_dim, bias=False)
@@ -371,13 +377,17 @@ class OwlV2(nn.Module):
         ])
 
         self.owlv2_img_normalize = T.Normalize(mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD)
+        
+        self._load_model(self.model_string)
 
-    def load_model(self, model_path):
+    def _load_model(self, model_path):
         state_dict = {}
-        print(model_path)
         cache_path = find_safetensors_in_cache(model_path)
-        print(cache_path)
-        assert len(cache_path) == 1, "More than one safetensor file in model path"
+
+        if len(cache_path) != 1:
+            import huggingface_hub
+            hf_hub_download(repo_id=model_path, filename="model.safetensors")
+            cache_path = find_safetensors_in_cache(model_path)
         with safe_open(cache_path[0], framework="pt") as f:
             for k in f.keys():
                 tens = f.get_tensor(k)
@@ -537,19 +547,93 @@ class OwlV2(nn.Module):
         )
     
         if compensate_padding:
-            if image_height > image_width:
-                clip_factor = image_width/image_height
-                boxes[:,:,(0,2)] = torch.clamp(boxes[:,:,(0,2)], 0, float(clip_factor))
-                boxes[:,:,(0,2)] = boxes[:,:,(0,2)] / boxes[:,:,(0,2)].max() 
-            else:
-                clip_factor = image_height/image_width
-                boxes[:,:,(1,3)] = torch.clamp(boxes[:,:,(1,3)], 0, clip_factor)
-                boxes[:,:,(0,2)] = boxes[:,:,(0,2)] / boxes[:,:,(0,2)].max()
+            hl = image_height > image_width   # height-larger
+            wl = image_width  > image_height  # width-larger
+            eps = torch.finfo(boxes.dtype).eps
+
+            # Case: height > width -> x coords ([0,2]) were compressed by (w/h)
+            if hl.any():
+                clip_factor = (image_width[hl] / image_height[hl]).to(boxes.dtype).view(-1, 1, 1).clamp_min(eps)
+                # clamp to theoretical max then undo scaling
+                boxes[hl, :, 0:4:2] = torch.clamp(boxes[hl, :, 0:4:2], torch.tensor(0), clip_factor)
+                boxes[hl, :, 0:4:2] = boxes[hl, :, 0:4:2] / clip_factor
+
+            # Case: width > height -> y coords ([1,3]) were compressed by (h/w)
+            if wl.any():
+                clip_factor = (image_height[wl] / image_width[wl]).to(boxes.dtype).view(-1, 1, 1).clamp_min(eps)
+                boxes[wl, :, 1:4:2] = torch.clamp(boxes[wl, :, 1:4:2], torch.tensor(0), clip_factor)
+                boxes[wl, :, 1:4:2] = boxes[wl, :, 1:4:2] / clip_factor        
         scale_factor = torch.stack([image_width, image_height, image_width, image_height], dim=1)
         scale_factor = scale_factor.unsqueeze(1).to(boxes.device)
         boxes = boxes * scale_factor
 
         return boxes
+
+    def attach_prototype_bank(self, proto_bank: "VisualPrototypeBank"):
+        self.prototype_bank = proto_bank
+        return self
+
+    @torch.no_grad()
+    def _image_grid_features(self, pixel_values):
+        """
+        Produces:
+        image_feats: [B, P*P, vision_dim]  (same as your forward_object_detection pre-class_head)
+        feature_map: [B, P, P, vision_dim]
+        """
+        # Almost identical to the first part of forward_object_detection
+        _, _, vision_full = self.get_vision_features(pixel_values)  # pooled not needed
+        feature_map = self.vision_model.post_layernorm(vision_full)       # [B, 1+P*P, Dv]
+        class_token_out = torch.broadcast_to(feature_map[:, :1, :], feature_map[:, :-1].shape)
+        feature_map = feature_map[:, 1:, :] * class_token_out
+        feature_map = self.layer_norm(feature_map)
+
+        P = self.sqrt_num_patches
+        feature_map = feature_map.reshape(feature_map.shape[0], P, P, feature_map.shape[-1])
+        image_feats = feature_map.view(feature_map.shape[0], P * P, feature_map.shape[-1])
+        return image_feats, feature_map
+
+    def forward_proto_detection(self, pixel_values):
+        """
+        Returns:
+        proto_logits:  [B, P*P, C*K] similarity to *prototypes*
+        class_logits:  [B, P*P, C]   aggregated per class (logsumexp)
+        objectness:    [B, P*P]
+        pred_boxes:    [B, P*P, 4]   (cx,cy,w,h) in [0,1]
+        extras:        (feature_map, class_embeds)
+        """
+        assert hasattr(self, "prototype_bank"), "Call attach_prototype_bank() first."
+        B = pixel_values.shape[0]
+
+        image_feats, feature_map = self._image_grid_features(pixel_values)
+
+        # [B, C*K, D_text] — these replace 'text_features'
+        proto_embeds = self.prototype_bank.expand_for_batch(B)
+        query_mask = None  # or torch.ones(B, proto_embeds.shape[1], dtype=torch.bool, device=image_feats.device)
+
+        # Class logits over *prototypes*
+        proto_logits, class_embeds = self.class_head(image_feats, proto_embeds, query_mask)
+        # Aggregate to get per-class logits
+        class_logits = self.prototype_bank.aggregate_logits(proto_logits, reduce="logsumexp")
+
+        # Objectness & boxes unchanged
+        objectness_logits = self.objectness_head(image_feats)[..., 0]
+        pred_boxes = self.box_head(image_feats)
+        pred_boxes = torch.sigmoid(pred_boxes + self.box_bias.to(image_feats.device))
+
+        return proto_logits, class_logits, objectness_logits, pred_boxes, (feature_map, class_embeds)
+
+
+class PrototypeDetector(nn.Module):
+    def __init__(self, owl: OwlV2, bank: VisualPrototypeBank):
+        super().__init__()
+        self.owl = owl.attach_prototype_bank(bank)
+        # freeze everything except prototype bank (and maybe logit_scale)
+        for p in self.owl.parameters(): p.requires_grad_(False)
+        for p in self.owl.prototype_bank.parameters(): p.requires_grad_(True)
+        # optionally: self.owl.logit_scale.requires_grad_(True)
+
+    def forward(self, pixel_values):
+        return self.owl.forward_proto_detection(pixel_values)
 
 
     
