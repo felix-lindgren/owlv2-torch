@@ -630,7 +630,7 @@ class PrototypeDetector(nn.Module):
         # freeze everything except prototype bank (and maybe logit_scale)
         for p in self.owl.parameters(): p.requires_grad_(False)
         for p in self.owl.prototype_bank.parameters(): p.requires_grad_(True)
-        # optionally: self.owl.logit_scale.requires_grad_(True)
+        self.owl.logit_scale.requires_grad_(True)
 
     def forward(self, pixel_values):
         return self.owl.forward_proto_detection(pixel_values)

@@ -24,6 +24,32 @@ def sigmoid_focal_loss(inputs, targets, alpha: float = 0.25, gamma: float = 2.0,
     else:
         return loss
 
+def normalized_wasserstein_distance(pred_boxes, target_boxes, C, reduction='mean', use_uniform_var=False, eps=1e-9):
+    """
+    pred_boxes, target_boxes: [N,4] in cxcywh (same units as C; typically pixels)
+    C: dataset-level constant (e.g., mean object side length in pixels)
+    use_uniform_var: if True, use 1/12 instead of 1/4 for the size term
+    """
+    # Δ terms (no need to convert to xyxy)
+    dcx = pred_boxes[:, 0] - target_boxes[:, 0]
+    dcy = pred_boxes[:, 1] - target_boxes[:, 1]
+    dw  = pred_boxes[:, 2] - target_boxes[:, 2]
+    dh  = pred_boxes[:, 3] - target_boxes[:, 3]
+
+    k = (1.0/12.0) if use_uniform_var else (1.0/4.0)
+    W2_sq = dcx*dcx + dcy*dcy + k*(dw*dw + dh*dh)
+
+    # exponential normalization to [0,1]
+    C2 = (C*C) + eps
+    sim = torch.exp(- W2_sq / (2.0*C2))
+
+    loss = 1.0 - sim
+    if reduction == 'mean':
+        return loss.mean()
+    elif reduction == 'sum':
+        return loss.sum()
+    return loss
+
 def box_cxcywh_to_xyxy(b):
     cx, cy, w, h = b.unbind(-1)
     x1 = cx - 0.5 * w
@@ -32,12 +58,21 @@ def box_cxcywh_to_xyxy(b):
     y2 = cy + 0.5 * h
     return torch.stack([x1, y1, x2, y2], dim=-1)
 
-def hungarian_match(class_logits, pred_boxes, targets, lambda_cls=1.0, lambda_l1=5.0, lambda_giou=2.0):
+def _nwd_W2_sq(a, b, k=0.25):
+    # a,b: [Q,4] and [M,4] in cxcywh (normalized 0..1)
+    # returns [Q,M] of W2^2 = dcenter^2 + k*(dw^2+dh^2)
+    dcx = a[:, 0][:, None] - b[:, 0][None, :]
+    dcy = a[:, 1][:, None] - b[:, 1][None, :]
+    dw  = a[:, 2][:, None] - b[:, 2][None, :]
+    dh  = a[:, 3][:, None] - b[:, 3][None, :]
+    return dcx*dcx + dcy*dcy + k*(dw*dw + dh*dh)
+
+def hungarian_match(class_logits, pred_boxes, targets,
+                    lambda_l1=0.0, lambda_giou=0.0,
+                    lambda_nwd=1.0, k_size_term=0.25):
     """
-    class_logits: [B, Q, C]
-    pred_boxes:   [B, Q, 4] (cxcywh in [0,1])
-    targets: list of dicts per image: {"boxes": [M,4] (cxcywh in [0,1]), "labels": [M]}
-    returns: list of (idx_pred, idx_gt) for each batch item
+    One-to-one Hungarian, geometry-driven.
+    class_logits unused by default (since you're only training the class embedding).
     """
     try:
         from scipy.optimize import linear_sum_assignment
@@ -45,53 +80,58 @@ def hungarian_match(class_logits, pred_boxes, targets, lambda_cls=1.0, lambda_l1
         linear_sum_assignment = None
 
     out = []
-    B, Q, C = class_logits.shape
+    B, Q, _ = class_logits.shape
     for b in range(B):
-        boxes = pred_boxes[b]                             # [Q,4]
-        cls = class_logits[b]                             # [Q,C]
+        boxes = pred_boxes[b]                      # [Q,4] cxcywh in [0,1]
         tgt = targets[b]
         if len(tgt["boxes"]) == 0:
-            out.append((torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)))
+            out.append((torch.empty(0, dtype=torch.long),
+                        torch.empty(0, dtype=torch.long)))
             continue
-        tboxes = tgt["boxes"].to(boxes.device)            # [M,4] cxcywh
-        tlabels = tgt["labels"].to(cls.device).long()     # [M]
+
+        tboxes = tgt["boxes"].to(boxes.device)     # [M,4]
         M = tboxes.shape[0]
 
         with torch.no_grad():
-            # classification cost: -log_softmax over classes
-            cls_cost = -F.log_softmax(cls, dim=-1)[:, tlabels]   # [Q,M]
+            # Geometry costs
+            cost = 0.0
+            if lambda_nwd > 0:
+                nwd = _nwd_W2_sq(boxes, tboxes, k=k_size_term)  # [Q,M]
+                cost = cost + lambda_nwd * nwd
 
-            # bbox costs
-            b1 = boxes
-            b2 = tboxes
-            l1_cost = torch.cdist(b1, b2, p=1)                    # [Q,M]
+            if lambda_l1 > 0:
+                cost = cost + lambda_l1 * torch.cdist(boxes, tboxes, p=1)  # [Q,M]
 
-            giou = generalized_box_iou(box_cxcywh_to_xyxy(b1), box_cxcywh_to_xyxy(b2))  # [Q,M]
-            giou_cost = 1 - giou
+            if lambda_giou > 0:
+                giou = generalized_box_iou(
+                    box_cxcywh_to_xyxy(boxes), box_cxcywh_to_xyxy(tboxes)
+                )  # [Q,M]
+                cost = cost + lambda_giou * (1.0 - giou)
 
-            cost = lambda_cls*cls_cost + lambda_l1*l1_cost + lambda_giou*giou_cost
             cost = cost.cpu()
 
             if linear_sum_assignment is not None:
-                row_ind, col_ind = linear_sum_assignment(cost)
-                idx_pred = torch.as_tensor(row_ind, dtype=torch.long)
-                idx_gt = torch.as_tensor(col_ind, dtype=torch.long)
+                row, col = linear_sum_assignment(cost)
+                idx_pred = torch.as_tensor(row, dtype=torch.long)
+                idx_gt   = torch.as_tensor(col, dtype=torch.long)
             else:
-                # Greedy fallback
+                # simple greedy fallback
+                QN, MN = cost.shape
                 idx_pred, idx_gt = [], []
-                used_p = set()
-                used_g = set()
-                for _ in range(min(Q, M)):
-                    q, g = divmod(cost.argmin().item(), M)
+                used_p, used_g = set(), set()
+                for _ in range(min(QN, MN)):
+                    qg = cost.argmin().item()
+                    q, g = divmod(qg, MN)
                     while q in used_p or g in used_g:
-                        cost[q, g] = math.inf
-                        q, g = divmod(cost.argmin().item(), M)
+                        cost[q, g] = float('inf')
+                        qg = cost.argmin().item()
+                        q, g = divmod(qg, MN)
                     idx_pred.append(q); idx_gt.append(g)
-                    cost[q, :] = math.inf
-                    cost[:, g] = math.inf
+                    cost[q, :] = float('inf')
+                    cost[:, g] = float('inf')
                     used_p.add(q); used_g.add(g)
                 idx_pred = torch.tensor(idx_pred, dtype=torch.long)
-                idx_gt = torch.tensor(idx_gt, dtype=torch.long)
+                idx_gt   = torch.tensor(idx_gt, dtype=torch.long)
 
         out.append((idx_pred.to(boxes.device), idx_gt.to(boxes.device)))
     return out
@@ -113,14 +153,13 @@ def build_proto_targets(proto_bank: VisualPrototypeBank, labels: torch.Tensor) -
 
 def compute_losses(outputs, targets, bank: VisualPrototypeBank,
                    lambda_cls=1.0, lambda_l1=5.0, lambda_giou=2.0,
-                   use_objectness=True):
+                   use_objectness=True, use_nwd=True,):
     proto_logits, class_logits, objectness_logits, pred_boxes, _ = outputs
     B, Q, C = class_logits.shape
     losses = {}
 
     # Hungarian
-    indices = hungarian_match(class_logits, pred_boxes, targets,
-                              lambda_cls=lambda_cls, lambda_l1=lambda_l1, lambda_giou=lambda_giou)
+    indices = hungarian_match(class_logits, pred_boxes, targets)
 
     # Classification (prototype-level, focal BCE)
     cls_losses = []
@@ -153,9 +192,14 @@ def compute_losses(outputs, targets, bank: VisualPrototypeBank,
 
         # Boxes: L1 + GIoU
         l1_losses.append(F.l1_loss(pb, gt_boxes, reduction="mean"))
-        giou = generalized_box_iou(box_cxcywh_to_xyxy(pb), box_cxcywh_to_xyxy(gt_boxes))
-        giou_losses.append(1.0 - giou.diag().mean())  # matched pairs on diagonal
-
+        if use_nwd:
+            # Use NWD for small objects
+            nwd_loss = normalized_wasserstein_distance(pb, gt_boxes, C=0.01171875, reduction="mean")
+            giou_losses.append(nwd_loss)
+        else:
+            # Original GIoU
+            giou = generalized_box_iou(box_cxcywh_to_xyxy(pb), box_cxcywh_to_xyxy(gt_boxes))
+            giou_losses.append(1.0 - giou.diag().mean())
         # Objectness (optional): positives at matched indices, negatives otherwise
         if use_objectness:
             obj_t = torch.zeros_like(ob)

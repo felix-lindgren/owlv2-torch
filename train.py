@@ -109,8 +109,8 @@ def coco_eval(model, val_loader, device, num_classes=None, debug: bool = False, 
         for batch in pbar:
             pixel_values = batch["images"].to(device)  # [B, C, H, W], normalized with CLIP stats
             batch_targets = batch["targets"]
-
-            outputs = model(pixel_values)
+            with torch.autocast(device):
+                outputs = model(pixel_values)
             logits, pred_boxes = outputs[1], outputs[3]
 
             # Assuming square 1024x1024 after your preprocessing
@@ -238,11 +238,11 @@ def main():
         "device": "cuda",
         "C": 1,
         "K": 4,
-        "model_type": "base",
+        "model_type": "large",
         "learning_rate": 1e-4,
         "weight_decay": 0.0,
         "batch_size": 16,
-        "num_epochs": 3,
+        "num_epochs": 5,
         "confidence_threshold": 0.05,
         "train_dataset_path": "/home/fellin/repos/rnd/dataset-utils/out_ships_1024_train_val/annotations.json",
         "train_images_path": "/home/fellin/repos/rnd/dataset-utils/out_ships_1024_train_val",
@@ -315,7 +315,8 @@ def main():
             pbar = tqdm(train_loader, desc=f"Training Epoch {epoch + 1}")
             for batch_idx, batch in enumerate(pbar):
                 pixel_values = batch["images"].to(device)
-                outputs = det(pixel_values)
+                with torch.autocast(device):
+                    outputs = det(pixel_values)
                 losses = compute_losses(outputs, batch["targets"], bank)
                 
                 opt.zero_grad()
@@ -371,17 +372,17 @@ def main():
                 
                 # Save best model
                 model_path = f"best_model_epoch_{epoch}"
-                torch.save({
+                """ torch.save({
                     'epoch': epoch,
                     'model_state_dict': det.state_dict(),
                     'optimizer_state_dict': opt.state_dict(),
                     'best_map': best_map,
                     'config': config
-                }, f"{model_path}.pth")
+                }, f"{model_path}.pth") """
                 
                 # Log model to MLFlow
-                mlflow.pytorch.log_model(det, "best_model")
-                mlflow.log_artifact(f"{model_path}.pth")
+                #mlflow.pytorch.log_model(det, "best_model")
+                #mlflow.log_artifact(f"{model_path}.pth")
                 
                 print(f"New best model saved with mAP: {best_map:.4f}")
         
