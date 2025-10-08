@@ -9,7 +9,7 @@ authors = [
 ]
 description = "A brief description of your OWLv2torch package"
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.10"
 keywords = ["owl", "torch", "deep learning"]
 license = {text = "None"}
 classifiers = [
