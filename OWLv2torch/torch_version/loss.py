@@ -1,6 +1,4 @@
 import torch
-import math
-from typing import List, Dict
 import torch.nn.functional as F
 from torchvision.ops import generalized_box_iou
 from OWLv2torch.torch_version.prototypes import VisualPrototypeBank

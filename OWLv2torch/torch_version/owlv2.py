@@ -53,13 +53,13 @@ class QuickGELUActivation(nn.Module):
         return input * torch.sigmoid(1.702 * input)
 
 class SquarePad:
-	def __call__(self, image):
-		h, w = image.shape[-2:]
-		max_wh = np.max([w, h])
-		hp = int(max_wh - w)
-		vp = int(max_wh - h)
-		padding = (0, 0, hp, vp)
-		return TF.pad(image, padding, 0.5, 'constant')
+    def __call__(self, image):
+        h, w = image.shape[-2:]
+        max_wh = np.max([w, h])
+        hp = int(max_wh - w)
+        vp = int(max_wh - h)
+        padding = (0, 0, hp, vp)
+        return TF.pad(image, padding, 0.5, 'constant')
 
 
 class Attention(nn.Module): 
@@ -384,7 +384,6 @@ class OwlV2(nn.Module):
         cache_path = find_safetensors_in_cache(model_path)
 
         if len(cache_path) != 1:
-            import huggingface_hub
             hf_hub_download(repo_id=model_path, filename="model.safetensors")
             cache_path = find_safetensors_in_cache(model_path)
         with safe_open(cache_path[0], framework="pt") as f:
