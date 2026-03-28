@@ -1,7 +1,6 @@
 import os
 from pathlib import Path
 from huggingface_hub import try_to_load_from_cache
-import glob
 
 def find_safetensors_in_cache(model_id: str) -> list[Path]:
     """

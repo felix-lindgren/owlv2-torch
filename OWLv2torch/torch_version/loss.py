@@ -178,7 +178,7 @@ def compute_losses(outputs, targets, bank: VisualPrototypeBank,
         # Gather matched predictions
         pb = pred_boxes[b][idx_q]          # [M,4] cxcywh
         cb = class_logits[b][idx_q]        # [M,C]
-        pl: Unknown = proto_logits[b][idx_q]        # [M, C*K]
+        pl = proto_logits[b][idx_q]        # [M, C*K]
         ob = objectness_logits[b]
 
         gt_boxes = targets[b]["boxes"].to(pb.device)      # [M,4]
