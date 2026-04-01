@@ -27,8 +27,7 @@ def process_sequences(sequences: list[list[int]], start_pos: int = 0, default_ma
     padded_seqs = torch.zeros((batch_size, max_len), dtype=torch.long)
     padding_mask = torch.ones((batch_size, max_len), dtype=torch.bool)
     for i, seq in enumerate(sequences):
-        seq_len = len(seq)
-        seq_len = sum([x != 0 for x in seq])
+        seq_len = sum(x != 0 for x in seq)
         padded_seqs[i, :seq_len] = torch.tensor(seq[:seq_len])
         padding_mask[i, :seq_len] = False
     
@@ -54,13 +53,13 @@ class QuickGELUActivation(nn.Module):
         return input * torch.sigmoid(1.702 * input)
 
 class SquarePad:
-	def __call__(self, image):
-		h, w = image.shape[-2:]
-		max_wh = np.max([w, h])
-		hp = int(max_wh - w)
-		vp = int(max_wh - h)
-		padding = (0, 0, hp, vp)
-		return TF.pad(image, padding, 0.5, 'constant')
+    def __call__(self, image):
+        h, w = image.shape[-2:]
+        max_wh = np.max([w, h])
+        hp = int(max_wh - w)
+        vp = int(max_wh - h)
+        padding = (0, 0, hp, vp)
+        return TF.pad(image, padding, 0.5, 'constant')
 
 
 class Attention(nn.Module): 
@@ -215,7 +214,7 @@ class TextTower(nn.Module):
     def forward(self, input_ids, attention_mask=None):
 
         # Embeddings
-        seq_length = input_ids.shape[-1] if input_ids is not None else inputs_embeds.shape[-2]
+        seq_length = input_ids.shape[-1]
         position_ids = self.position_ids[:, :seq_length]
         inputs_embeds = self.token_embedding(input_ids)
         position_embeddings = self.position_embedding(position_ids)
@@ -385,7 +384,6 @@ class OwlV2(nn.Module):
         cache_path = find_safetensors_in_cache(model_path)
 
         if len(cache_path) != 1:
-            import huggingface_hub
             hf_hub_download(repo_id=model_path, filename="model.safetensors")
             cache_path = find_safetensors_in_cache(model_path)
         with safe_open(cache_path[0], framework="pt") as f:
@@ -491,7 +489,7 @@ class OwlV2(nn.Module):
         # Compute the location of each token on the grid and use it to compute a bias for the bbox prediction
         box_bias = self.box_bias.to(feature_map.device)
         pred_boxes += box_bias
-        pred_boxes = F.sigmoid(pred_boxes)
+        pred_boxes = torch.sigmoid(pred_boxes)
 
         return pred_logits, objectness_logits, pred_boxes, class_embeds, (feature_map, text_features)
 

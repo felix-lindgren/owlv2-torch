@@ -1,6 +1,4 @@
 import torch
-import math
-from typing import List, Dict
 import torch.nn.functional as F
 from torchvision.ops import generalized_box_iou
 from OWLv2torch.torch_version.prototypes import VisualPrototypeBank
@@ -178,7 +176,7 @@ def compute_losses(outputs, targets, bank: VisualPrototypeBank,
         # Gather matched predictions
         pb = pred_boxes[b][idx_q]          # [M,4] cxcywh
         cb = class_logits[b][idx_q]        # [M,C]
-        pl: Unknown = proto_logits[b][idx_q]        # [M, C*K]
+        pl = proto_logits[b][idx_q]        # [M, C*K]
         ob = objectness_logits[b]
 
         gt_boxes = targets[b]["boxes"].to(pb.device)      # [M,4]
