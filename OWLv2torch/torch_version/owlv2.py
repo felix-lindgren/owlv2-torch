@@ -12,6 +12,7 @@ from PIL import Image
 from scipy import ndimage as ndi
 
 from OWLv2torch.utils.hf_hub_utils import find_safetensors_in_cache
+from OWLv2torch.utils.query_batching import normalize_detection_queries
 from OWLv2torch.torch_version.prototypes import VisualPrototypeBank
 
 from typing import Optional, Tuple
@@ -475,6 +476,10 @@ class OwlV2(nn.Module):
 
     
     def forward_object_detection(self, pixel_values, token_ids, attention_mask):
+        batch_size = pixel_values.shape[0]
+        token_ids, attention_mask, max_text_queries = normalize_detection_queries(
+            token_ids, attention_mask, batch_size
+        )
 
         logits_per_image, logits_per_text, vision_features, text_features, vision_full, text_features_raw = self.forward(pixel_values, token_ids, attention_mask)
 
@@ -497,7 +502,6 @@ class OwlV2(nn.Module):
         image_feats = torch.reshape(feature_map, (batch_size, num_patches * num_patches, hidden_dim))
 
         # Reshape from [batch_size * max_text_queries, hidden_dim] -> [batch_size, max_text_queries, hidden_dim]
-        max_text_queries = token_ids.shape[0] // batch_size
         text_features = text_features.reshape(batch_size, max_text_queries, text_features.shape[-1])
 
         # If first token is 0, then this is a padded query [batch_size, num_queries].

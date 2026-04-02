@@ -3,6 +3,7 @@ import torch.nn.functional as F
 
 from typing import Optional, Tuple
 
+from OWLv2torch.utils.query_batching import normalize_detection_queries
 from OWLv2torch.torch_func.owlv2_weights import load_owlv2_weights, LayerWeights, TextTransformerWeights, VisionTransformerWeights, OWLv2Weights, HeadLayerWeights
 from OWLv2torch.torch_func.owlv2_config import OWLV2_B16, EncoderParams, ModelParams
 import matplotlib.pyplot as plt
@@ -143,6 +144,9 @@ def compute_box_bias(num_patches: int) -> torch.Tensor:
     return bias    
 
 def text_obj_det(token_ids, attn_mask, pixel_values, w, model_params):
+    batch_size = pixel_values.shape[0]
+    token_ids, attn_mask, max_text_queries = normalize_detection_queries(token_ids, attn_mask, batch_size)
+
     # Encode vision and text
     with timer("encode", gpu=True):
         _, vision_full = encode_vision(pixel_values, w.vision_weights, model_params)
@@ -162,9 +166,8 @@ def text_obj_det(token_ids, attn_mask, pixel_values, w, model_params):
     batch_size = feature_map.shape[0]
     new_size = (batch_size, model_params.num_patches_sqrt, model_params.num_patches_sqrt, feature_map.shape[-1])
     image_feats = feature_map.reshape(new_size).reshape(batch_size, -1, feature_map.shape[-1])
-    
+
     # Reshape text features
-    max_text_queries = token_ids.shape[0] // batch_size
     text_features = text_features.reshape(batch_size, max_text_queries, -1)
     token_ids = token_ids.reshape(batch_size, max_text_queries, -1)
     query_mask = token_ids[..., 0] > 0
