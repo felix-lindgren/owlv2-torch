@@ -6,7 +6,7 @@ from PIL import Image
 import numpy as np
 from OWLv2torch.hf_version.processing_owlv2 import Owlv2Processor
 import matplotlib
-matplotlib.use('Qt5Agg')
+
 
 def test_pt():
     model = OwlV2("base")
@@ -16,9 +16,12 @@ def test_pt():
     image_inputs = model.preprocess_image(image)
     text_inputs = tokenize(["a cat", "a scale", "a plastic bag"], context_length=16, truncate=True)
     attention_mask = text_inputs == 0
-    processor = Owlv2Processor.from_pretrained("google/owlv2-base-patch16-ensemble")
-    inputs = processor(images=[image], text=["a cat", "a scale", "a plastic bag"], return_tensors="pt") 
-    image_inputs = inputs['pixel_values']
+    #processor = Owlv2Processor.from_pretrained("google/owlv2-base-patch16-ensemble")
+    #inputs = processor(images=[image], text=["a cat", "a scale", "a plastic bag"], return_tensors="pt") 
+    #image_inputs = inputs['pixel_values']
+
+
+
 
     with torch.no_grad():
         image_inputs = image_inputs

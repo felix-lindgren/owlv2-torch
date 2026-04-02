@@ -9,6 +9,7 @@ from safetensors import safe_open
 import torchvision.transforms.v2 as T
 import torchvision.transforms.v2.functional as TF
 from PIL import Image
+from scipy import ndimage as ndi
 
 from OWLv2torch.utils.hf_hub_utils import find_safetensors_in_cache
 from OWLv2torch.torch_version.prototypes import VisualPrototypeBank
@@ -60,6 +61,26 @@ class SquarePad:
         vp = int(max_wh - h)
         padding = (0, 0, hp, vp)
         return TF.pad(image, padding, 0.5, 'constant')
+
+
+class ScipyResize:
+    """Resize using scipy to match HuggingFace OWLv2 preprocessing exactly."""
+    def __init__(self, size):
+        self.size = size
+
+    def __call__(self, image):
+        # image is a torch tensor (C, H, W) in float
+        arr = image.permute(1, 2, 0).numpy()  # (H, W, C)
+        input_shape = arr.shape
+        output_shape = (self.size, self.size, arr.shape[2])
+        factors = np.divide(input_shape, output_shape)
+        # Gaussian anti-aliasing (matches HF default)
+        anti_aliasing_sigma = np.maximum(0, (factors - 1) / 2)
+        filtered = ndi.gaussian_filter(arr, anti_aliasing_sigma, cval=0, mode="mirror")
+        zoom_factors = [1 / f for f in factors]
+        out = ndi.zoom(filtered, zoom_factors, order=1, mode="mirror", cval=0, grid_mode=True)
+        out = np.clip(out, arr.min(), arr.max())
+        return torch.from_numpy(out).permute(2, 0, 1)  # back to (C, H, W)
 
 
 class Attention(nn.Module): 
@@ -359,12 +380,18 @@ class OwlV2(nn.Module):
 
         self.sqrt_num_patches = self.image_size // self.patch_size
         self.box_bias = self.compute_box_bias(self.sqrt_num_patches)
-        self.image_transform = T.Compose([
+        self.image_transform_fast = T.Compose([
             T.ToImage(),
-            #T.ToDtype(torch.float32,scale=False),
             T.Lambda(lambda x: x*0.00392156862745098),
             SquarePad(),
-            T.Resize((self.image_size, self.image_size), antialias=False),
+            T.Resize((self.image_size, self.image_size), antialias=True),
+            T.Normalize(mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD),
+        ])
+        self.image_transform_accurate = T.Compose([
+            T.ToImage(),
+            T.Lambda(lambda x: x*0.00392156862745098),
+            SquarePad(),
+            ScipyResize(self.image_size),
             T.Normalize(mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD),
         ])
 
@@ -395,11 +422,12 @@ class OwlV2(nn.Module):
 
         self.load_state_dict(state_dict, strict=True)
     
-    def preprocess_image(self, image):
+    def preprocess_image(self, image, fast=False):
         if isinstance(image, str):
             image = Image.open(image)
-        
-        pixel_values = self.image_transform(image)
+
+        transform = self.image_transform_fast if fast else self.image_transform_accurate
+        pixel_values = transform(image)
         pixel_values = pixel_values.unsqueeze(0)
 
         return pixel_values
