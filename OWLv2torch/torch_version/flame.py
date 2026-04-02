@@ -95,9 +95,12 @@ class FlamePipeline:
         self.scaler: Optional[StandardScaler] = None
         self.pca: Optional[PCA] = None
         self.refiner = None
+        self._refiner_scaler: Optional[StandardScaler] = None
         self._candidate_indices: list[int] = []
         self._train_embeddings: Optional[np.ndarray] = None
         self._train_labels: Optional[np.ndarray] = None
+        self._detection_proposals: list[FlameProposal] = []
+        self._detection_augmented_embeddings: Optional[np.ndarray] = None
 
     @torch.no_grad()
     def generate_proposals(
@@ -305,12 +308,67 @@ class FlamePipeline:
             labels: True = positive (correct detection), False = negative (false positive)
         """
         augmented = self._build_augmented_embeddings()
-        self._train_embeddings = augmented[candidate_indices]
-        self._train_labels = np.array(labels, dtype=np.int32)
+        self._append_training_samples(augmented[candidate_indices], labels)
+        self._print_training_label_stats(len(labels), prefix="Labeled")
 
-        n_pos = self._train_labels.sum()
-        n_neg = len(self._train_labels) - n_pos
-        print(f"[FLAME] Labeled {len(labels)} candidates: {n_pos} positive, {n_neg} negative")
+    def _append_training_samples(self, embeddings: np.ndarray, labels: list[bool] | np.ndarray):
+        """Append new labeled samples to the accumulated training set."""
+        labels_array = np.asarray(labels, dtype=np.int32)
+        embeddings = np.asarray(embeddings)
+
+        if len(labels_array) != len(embeddings):
+            raise ValueError("embeddings and labels must have the same length")
+
+        if len(labels_array) == 0:
+            return
+
+        if self._train_embeddings is None or self._train_labels is None:
+            self._train_embeddings = embeddings.copy()
+            self._train_labels = labels_array.copy()
+            return
+
+        self._train_embeddings = np.concatenate([self._train_embeddings, embeddings], axis=0)
+        self._train_labels = np.concatenate([self._train_labels, labels_array], axis=0)
+
+    def _print_training_label_stats(self, num_added: int, prefix: str):
+        """Log training label counts after new labels are appended."""
+        if self._train_labels is None:
+            print(f"[FLAME] {prefix} 0 candidates")
+            return
+
+        n_pos = int(self._train_labels.sum())
+        n_neg = int(len(self._train_labels) - n_pos)
+        print(
+            f"[FLAME] {prefix} {num_added} candidates: "
+            f"{n_pos} positive, {n_neg} negative total"
+        )
+
+    def add_feedback_labels(self, detection_indices: list[int], labels: list[bool]):
+        """
+        Append labels for detections returned by the most recent detect() call.
+
+        Args:
+            detection_indices: indices into the flattened detections from the most
+                recent detect() call, as returned in each result's
+                'detection_indices' field.
+            labels: True = positive (correct detection), False = negative (false positive)
+        """
+        if self._detection_augmented_embeddings is None:
+            raise RuntimeError("No detection feedback available. Call detect() first.")
+
+        if len(detection_indices) != len(labels):
+            raise ValueError("detection_indices and labels must have the same length")
+
+        if len(detection_indices) == 0:
+            return
+
+        max_index = len(self._detection_augmented_embeddings) - 1
+        if min(detection_indices) < 0 or max(detection_indices) > max_index:
+            raise IndexError("detection index out of range for the most recent detect() call")
+
+        feedback_embeddings = self._detection_augmented_embeddings[detection_indices]
+        self._append_training_samples(feedback_embeddings, labels)
+        self._print_training_label_stats(len(labels), prefix="Added feedback labels for")
 
     def train_refiner(self):
         """
@@ -379,6 +437,8 @@ class FlamePipeline:
                 'boxes': np.ndarray [N, 4] xyxy
                 'scores': np.ndarray [N]
                 'refiner_scores': np.ndarray [N]  (probability from refiner)
+                'proposal_indices': np.ndarray [N] (indices into detect() proposals)
+                'detection_indices': np.ndarray [N] (indices for add_feedback_labels())
         """
         if self.refiner is None:
             raise RuntimeError("Refiner not trained. Call train_refiner() first.")
@@ -394,16 +454,38 @@ class FlamePipeline:
         # Classify
         refiner_probs = self.refiner.predict_proba(X_scaled)[:, 1]  # P(positive)
 
+        self._detection_proposals = []
+        self._detection_augmented_embeddings = []
+
         # Group results by image
         num_images = len(images)
-        results = [{"boxes": [], "scores": [], "refiner_scores": []} for _ in range(num_images)]
+        results = [
+            {
+                "boxes": [],
+                "scores": [],
+                "refiner_scores": [],
+                "proposal_indices": [],
+                "detection_indices": [],
+            }
+            for _ in range(num_images)
+        ]
 
         for i, (proposal, prob) in enumerate(zip(proposals, refiner_probs)):
             if prob >= self.config.classifier_threshold:
                 r = results[proposal.image_idx]
+                detection_idx = len(self._detection_proposals)
                 r["boxes"].append(proposal.box)
                 r["scores"].append(proposal.score)
                 r["refiner_scores"].append(prob)
+                r["proposal_indices"].append(i)
+                r["detection_indices"].append(detection_idx)
+                self._detection_proposals.append(proposal)
+                self._detection_augmented_embeddings.append(augmented[i])
+
+        if self._detection_augmented_embeddings:
+            self._detection_augmented_embeddings = np.stack(self._detection_augmented_embeddings)
+        else:
+            self._detection_augmented_embeddings = None
 
         # Convert to arrays
         for r in results:
@@ -411,10 +493,14 @@ class FlamePipeline:
                 r["boxes"] = np.stack(r["boxes"])
                 r["scores"] = np.array(r["scores"])
                 r["refiner_scores"] = np.array(r["refiner_scores"])
+                r["proposal_indices"] = np.array(r["proposal_indices"], dtype=np.int32)
+                r["detection_indices"] = np.array(r["detection_indices"], dtype=np.int32)
             else:
                 r["boxes"] = np.zeros((0, 4))
                 r["scores"] = np.zeros(0)
                 r["refiner_scores"] = np.zeros(0)
+                r["proposal_indices"] = np.zeros(0, dtype=np.int32)
+                r["detection_indices"] = np.zeros(0, dtype=np.int32)
 
         # Restore original proposals
         self.proposals = old_proposals
@@ -431,9 +517,11 @@ class FlamePipeline:
         state = {
             "config": self.config,
             "refiner": self.refiner,
-            "refiner_scaler": self._refiner_scaler if hasattr(self, '_refiner_scaler') else None,
+            "refiner_scaler": self._refiner_scaler,
             "scaler": self.scaler,
             "pca": self.pca,
+            "train_embeddings": self._train_embeddings,
+            "train_labels": self._train_labels,
         }
         with open(path, "wb") as f:
             pickle.dump(state, f)
@@ -449,4 +537,8 @@ class FlamePipeline:
         self._refiner_scaler = state["refiner_scaler"]
         self.scaler = state["scaler"]
         self.pca = state["pca"]
+        self._train_embeddings = state.get("train_embeddings")
+        self._train_labels = state.get("train_labels")
+        self._detection_proposals = []
+        self._detection_augmented_embeddings = None
         print(f"[FLAME] Loaded refiner from {path}")
