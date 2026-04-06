@@ -378,6 +378,7 @@ class OwlV2(nn.Module):
         self.class_head = ClassPredictionHead(self.text_dim, self.vision_dim)
         self.box_head = BoxPredictionHead(self.vision_dim)
         self.objectness_head = BoxPredictionHead(self.vision_dim, out_dim=1)
+        self.angle_head = None  # initialized via enable_obb()
 
         self.sqrt_num_patches = self.image_size // self.patch_size
         self.box_bias = self.compute_box_bias(self.sqrt_num_patches)
@@ -406,6 +407,16 @@ class OwlV2(nn.Module):
         self.owlv2_img_normalize = T.Normalize(mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD)
         
         self._load_model(self.model_string)
+
+    def enable_obb(self):
+        """Initialize the angle prediction head for oriented bounding boxes.
+
+        Predicts (sin 2θ, cos 2θ) per patch.  The factor-of-2 maps the
+        π-periodic rectangle orientation to a full circle so that
+        standard regression losses work without discontinuities.
+        """
+        self.angle_head = BoxPredictionHead(self.vision_dim, out_dim=2)
+        return self
 
     def _load_model(self, model_path):
         state_dict = {}
@@ -523,7 +534,12 @@ class OwlV2(nn.Module):
         pred_boxes += box_bias
         pred_boxes = torch.sigmoid(pred_boxes)
 
-        return pred_logits, objectness_logits, pred_boxes, class_embeds, (feature_map, text_features)
+        # Predict rotation angle (sin 2θ, cos 2θ) when OBB is enabled
+        pred_angles = None
+        if self.angle_head is not None:
+            pred_angles = F.normalize(self.angle_head(image_feats), dim=-1)
+
+        return pred_logits, objectness_logits, pred_boxes, pred_angles, class_embeds, (feature_map, text_features)
 
     @staticmethod
     def normalize_grid_corner_coordinates(num_patches: int) -> torch.Tensor:
@@ -599,6 +615,16 @@ class OwlV2(nn.Module):
 
         return boxes
 
+    def postprocess_angles(self, pred_angles):
+        """Convert (sin 2θ, cos 2θ) predictions to angle in radians.
+
+        Returns:
+            theta: [B, N] angles in (-π/2, π/2] radians, or None.
+        """
+        if pred_angles is None:
+            return None
+        return torch.atan2(pred_angles[..., 0], pred_angles[..., 1]) / 2.0
+
     def attach_prototype_bank(self, proto_bank: "VisualPrototypeBank"):
         self.prototype_bank = proto_bank
         return self
@@ -650,7 +676,12 @@ class OwlV2(nn.Module):
         pred_boxes = self.box_head(image_feats)
         pred_boxes = torch.sigmoid(pred_boxes + self.box_bias.to(image_feats.device))
 
-        return proto_logits, class_logits, objectness_logits, pred_boxes, (feature_map, class_embeds)
+        # Predict rotation angle when OBB is enabled
+        pred_angles = None
+        if self.angle_head is not None:
+            pred_angles = F.normalize(self.angle_head(image_feats), dim=-1)
+
+        return proto_logits, class_logits, objectness_logits, pred_boxes, pred_angles, (feature_map, class_embeds)
 
 
 class PrototypeDetector(nn.Module):
@@ -661,6 +692,44 @@ class PrototypeDetector(nn.Module):
         for p in self.owl.parameters(): p.requires_grad_(False)
         for p in self.owl.prototype_bank.parameters(): p.requires_grad_(True)
         self.owl.logit_scale.requires_grad_(True)
+
+    def forward(self, pixel_values):
+        return self.owl.forward_proto_detection(pixel_values)
+
+
+class OBBDetector(nn.Module):
+    """Wrapper for oriented bounding-box training with a 2-phase schedule.
+
+    Phase 1 – only the angle head (and prototype bank) are trained while
+              the rest of the network stays frozen.
+    Phase 2 – the box head is unfrozen and jointly fine-tuned together
+              with the angle head and prototype bank.
+    """
+
+    def __init__(self, owl: OwlV2, bank: VisualPrototypeBank, phase: int = 1):
+        super().__init__()
+        self.owl = owl.enable_obb().attach_prototype_bank(bank)
+        self.set_phase(phase)
+
+    def set_phase(self, phase: int):
+        self.phase = phase
+        # Freeze everything first
+        for p in self.owl.parameters():
+            p.requires_grad_(False)
+
+        # Prototype bank + logit scale always trainable
+        for p in self.owl.prototype_bank.parameters():
+            p.requires_grad_(True)
+        self.owl.logit_scale.requires_grad_(True)
+
+        # Angle head always trainable
+        for p in self.owl.angle_head.parameters():
+            p.requires_grad_(True)
+
+        if phase >= 2:
+            # Unfreeze box head for joint fine-tuning
+            for p in self.owl.box_head.parameters():
+                p.requires_grad_(True)
 
     def forward(self, pixel_values):
         return self.owl.forward_proto_detection(pixel_values)
