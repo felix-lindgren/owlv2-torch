@@ -22,6 +22,20 @@ def sigmoid_focal_loss(inputs, targets, alpha: float = 0.25, gamma: float = 2.0,
     else:
         return loss
 
+def angle_sincos_loss(pred_sincos, target_angles, reduction='mean'):
+    """Smooth-L1 loss on the (sin 2θ, cos 2θ) representation.
+
+    Args:
+        pred_sincos: [N, 2] predicted unit vectors (sin 2θ, cos 2θ).
+        target_angles: [N] ground-truth angles in radians.
+    """
+    target_sincos = torch.stack([
+        torch.sin(2 * target_angles),
+        torch.cos(2 * target_angles),
+    ], dim=-1)
+    return F.smooth_l1_loss(pred_sincos, target_sincos, reduction=reduction)
+
+
 def normalized_wasserstein_distance(pred_boxes, target_boxes, C, reduction='mean', use_uniform_var=False, eps=1e-9):
     """
     pred_boxes, target_boxes: [N,4] in cxcywh (same units as C; typically pixels)
@@ -151,9 +165,11 @@ def build_proto_targets(proto_bank: VisualPrototypeBank, labels: torch.Tensor) -
 
 def compute_losses(outputs, targets, bank: VisualPrototypeBank,
                    lambda_cls=1.0, lambda_l1=5.0, lambda_giou=2.0,
-                   use_objectness=True, use_nwd=True,):
-    proto_logits, class_logits, objectness_logits, pred_boxes, _ = outputs
+                   lambda_angle=1.0,
+                   use_objectness=True, use_nwd=True):
+    proto_logits, class_logits, objectness_logits, pred_boxes, pred_angles, _ = outputs
     B, Q, C = class_logits.shape
+    has_angles = pred_angles is not None and any("angles" in t for t in targets)
     losses = {}
 
     # Hungarian
@@ -164,6 +180,7 @@ def compute_losses(outputs, targets, bank: VisualPrototypeBank,
     l1_losses = []
     giou_losses = []
     obj_losses = []
+    ang_losses = []
 
     for b in range(B):
         idx_q, idx_g = indices[b]
@@ -198,6 +215,14 @@ def compute_losses(outputs, targets, bank: VisualPrototypeBank,
             # Original GIoU
             giou = generalized_box_iou(box_cxcywh_to_xyxy(pb), box_cxcywh_to_xyxy(gt_boxes))
             giou_losses.append(1.0 - giou.diag().mean())
+
+        # Angle loss (OBB)
+        if has_angles and "angles" in targets[b]:
+            gt_angles = targets[b]["angles"].to(pred_angles.device)
+            matched_angles = pred_angles[b][idx_q]  # [M, 2]
+            matched_gt_angles = gt_angles[idx_g]     # [M]
+            ang_losses.append(angle_sincos_loss(matched_angles, matched_gt_angles))
+
         # Objectness (optional): positives at matched indices, negatives otherwise
         if use_objectness:
             obj_t = torch.zeros_like(ob)
@@ -208,8 +233,11 @@ def compute_losses(outputs, targets, bank: VisualPrototypeBank,
     L_l1  = torch.stack(l1_losses).mean() if l1_losses else torch.tensor(0.0, device=pred_boxes.device)
     L_g   = torch.stack(giou_losses).mean() if giou_losses else torch.tensor(0.0, device=pred_boxes.device)
     L_obj = torch.stack(obj_losses).mean() if obj_losses else torch.tensor(0.0, device=pred_boxes.device)
+    L_ang = torch.stack(ang_losses).mean() if ang_losses else torch.tensor(0.0, device=pred_boxes.device)
 
-    loss = lambda_cls*L_cls + lambda_l1*L_l1 + lambda_giou*L_g + (0.5*L_obj if use_objectness else 0.0)
+    loss = (lambda_cls * L_cls + lambda_l1 * L_l1 + lambda_giou * L_g
+            + (0.5 * L_obj if use_objectness else 0.0)
+            + (lambda_angle * L_ang if has_angles else 0.0))
 
-    losses.update(dict(loss=loss, L_cls=L_cls, L_l1=L_l1, L_giou=L_g, L_obj=L_obj))
+    losses.update(dict(loss=loss, L_cls=L_cls, L_l1=L_l1, L_giou=L_g, L_obj=L_obj, L_angle=L_ang))
     return losses

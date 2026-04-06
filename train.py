@@ -111,7 +111,7 @@ def coco_eval(model, val_loader, device, num_classes=None, debug: bool = False, 
             batch_targets = batch["targets"]
             with torch.autocast(device):
                 outputs = model(pixel_values)
-            logits, pred_boxes = outputs[1], outputs[3]
+            logits, pred_boxes = outputs[1], outputs[3]  # class_logits, pred_boxes
 
             # Assuming square 1024x1024 after your preprocessing
             batch_size = pixel_values.shape[0]
