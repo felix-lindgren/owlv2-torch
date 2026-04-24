@@ -4,29 +4,26 @@ import torch.nn as nn
 import utils
 from PIL import Image
 import numpy as np
-from OWLv2torch.hf_version.processing_owlv2 import Owlv2Processor
 import matplotlib
 
-
+device = "cuda" if torch.cuda.is_available() else "cpu"
 def test_pt():
-    model = OwlV2("base")
+    model = OwlV2("large")
     model.eval()
+    model.to(device)
 
     image = Image.open('img.jpg')
     image_inputs = model.preprocess_image(image)
     text_inputs = tokenize(["a cat", "a scale", "a plastic bag"], context_length=16, truncate=True)
     attention_mask = text_inputs == 0
-    #processor = Owlv2Processor.from_pretrained("google/owlv2-base-patch16-ensemble")
+    #processor = Owlv2Processor.from_pretrained("google/owlv2-large-patch14-ensemble")
     #inputs = processor(images=[image], text=["a cat", "a scale", "a plastic bag"], return_tensors="pt") 
     #image_inputs = inputs['pixel_values']
 
-
-
-
     with torch.no_grad():
-        image_inputs = image_inputs
-        text_inputs = text_inputs
-        attention_mask = attention_mask
+        image_inputs = image_inputs.to(device)
+        text_inputs = text_inputs.to(device)
+        attention_mask = attention_mask.to(device)
         outputs = model.forward_object_detection(image_inputs, text_inputs, attention_mask) 
     
     class dotdict(dict):
@@ -36,7 +33,7 @@ def test_pt():
         __delattr__ = dict.__delitem__
     outputs = {"logits": outputs[0], "pred_boxes": outputs[2]}
     outputs = dotdict(outputs)
-    processor = Owlv2Processor.from_pretrained("google/owlv2-base-patch16-ensemble")
+    #processor = Owlv2Processor.from_pretrained("google/owlv2-large-patch14-ensemble")
     target_sizes = torch.Tensor([image.size[::-1]])
     boxes = model.postprocess_boxes(outputs.pred_boxes, target_sizes)
     probs = torch.max(outputs.logits, dim=-1)

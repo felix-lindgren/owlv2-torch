@@ -41,6 +41,21 @@ dev = [
     "pytest>=6.0",
     "pytest-cov",
 ]
+trt = [
+    "tensorrt>=10.0.0",
+    "onnx>=1.15.0",
+    "onnxsim>=0.4.36",
+]
+
+# Use NVIDIA's PyPI index for TensorRT wheels. ``explicit = true`` restricts it
+# to packages that explicitly opt in below, so normal PyPI deps are unaffected.
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com/"
+explicit = true
+
+[tool.uv.sources]
+tensorrt = { index = "nvidia" }
 
 [tool.setuptools_scm]
 write_to = "OWLv2torch/_version.py"

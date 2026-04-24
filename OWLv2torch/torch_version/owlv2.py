@@ -19,33 +19,46 @@ from typing import Optional, Tuple
 
 OPENAI_CLIP_MEAN: list[float] = [0.48145466, 0.4578275, 0.40821073]
 OPENAI_CLIP_STD: list[float] = [0.26862954, 0.26130258, 0.27577711]
-DEFAULT_MASK_VALUE: float = -0.7 * float(torch.finfo(torch.float32).max)
 
-def process_sequences(sequences: list[list[int]], start_pos: int = 0, default_mask_value: float = float(DEFAULT_MASK_VALUE)) -> tuple[torch.Tensor, torch.Tensor]:
-    batch_size = len(sequences)
-    max_len = max(len(seq) for seq in sequences)
-    
-    # Pad sequences and create padding mask
-    padded_seqs = torch.zeros((batch_size, max_len), dtype=torch.long)
-    padding_mask = torch.ones((batch_size, max_len), dtype=torch.bool)
-    for i, seq in enumerate(sequences):
-        seq_len = sum(x != 0 for x in seq)
-        padded_seqs[i, :seq_len] = torch.tensor(seq[:seq_len])
-        padding_mask[i, :seq_len] = False
-    
-    # Build attention mask
-    if max_len > 1:
-        attn_mask = torch.triu(torch.full((max_len, max_len), default_mask_value), diagonal=1)
-        attn_mask = torch.hstack([torch.zeros((max_len, start_pos)), attn_mask]).float()
-        attn_mask = attn_mask.unsqueeze(0).expand(batch_size, 1, max_len, max_len)
-    else:
-        attn_mask = torch.zeros((batch_size, 1, max_len, max_len))
-    
-    # Combine masks
-    combined_mask = attn_mask.clone()
-    combined_mask.masked_fill_(padding_mask.unsqueeze(1).unsqueeze(2), default_mask_value)
-    
-    return padded_seqs, combined_mask
+
+def build_causal_padding_mask(
+    input_ids: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Build a combined causal + padding additive attention mask on-device.
+
+    Padding positions are always derived from ``input_ids == 0`` (the CLIP
+    tokenizer uses pad id 0). This matches the behavior of the previous
+    ``process_sequences`` implementation, which silently ignored any
+    ``attention_mask`` passed in — some existing callers pass an inverted
+    mask (True where padded), so we deliberately don't trust the argument.
+    It's accepted for API compatibility only.
+
+    Args:
+        input_ids: [B, L] token ids.
+        attention_mask: accepted for API compatibility; ignored.
+        dtype: dtype of the returned additive mask.
+
+    Returns:
+        [B, 1, L, L] additive mask (0 where attended, large negative where masked).
+    """
+    del attention_mask  # intentionally ignored — see docstring.
+    B, L = input_ids.shape
+    device = input_ids.device
+    mask_value = torch.finfo(dtype).min
+
+    # Causal mask: upper triangle (excluding diagonal) is masked.
+    causal = torch.triu(
+        torch.full((L, L), mask_value, dtype=dtype, device=device),
+        diagonal=1,
+    )
+    causal = causal.unsqueeze(0).unsqueeze(0).expand(B, 1, L, L)
+
+    # Padding: CLIP tokenizer uses id 0 for pad.
+    pad_positions = input_ids == 0  # [B, L], True where padded
+    combined = causal.masked_fill(pad_positions.view(B, 1, 1, L), mask_value)
+    return combined
 class QuickGELUActivation(nn.Module):
     """
     Applies GELU approximation that is fast but somewhat inaccurate. See: https://github.com/hendrycks/GELUs
@@ -234,26 +247,28 @@ class TextTower(nn.Module):
 
 
     def forward(self, input_ids, attention_mask=None):
-
         # Embeddings
         seq_length = input_ids.shape[-1]
         position_ids = self.position_ids[:, :seq_length]
         inputs_embeds = self.token_embedding(input_ids)
         position_embeddings = self.position_embedding(position_ids)
         hidden = inputs_embeds + position_embeddings
-        input_ids, attention_mask = process_sequences(sequences=input_ids.tolist())
-        input_ids = input_ids.to(hidden.device)
-        attention_mask = attention_mask.to(hidden.device)
+
+        # Build combined causal + padding attention mask on-device (no CPU sync).
+        combined_mask = build_causal_padding_mask(
+            input_ids, attention_mask=attention_mask, dtype=hidden.dtype
+        )
 
         # Encoder
-        
-        encoder_outputs = self.encoder(hidden, attention_mask)
+        encoder_outputs = self.encoder(hidden, combined_mask)
         last_hidden_state = self.final_layer_norm(encoder_outputs)
-        # take features from the end of tokens embedding (end of token is the highest number in each sequence)
-        # casting to torch.int for onnx compatibility: argmax doesn't support int64 inputs with opset 14
+        # Take features from the end-of-text token (the highest-valued token id
+        # in each sequence under CLIP's tokenizer).
+        # Casting to torch.int for onnx compatibility: argmax doesn't support
+        # int64 inputs with opset 14.
         pooled_output = last_hidden_state[
             torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device),
-            input_ids.to(torch.int).argmax(dim=-1).to(last_hidden_state.device),
+            input_ids.to(torch.int).argmax(dim=-1),
         ]
 
         return pooled_output, encoder_outputs
@@ -318,8 +333,9 @@ class ClassPredictionHead(nn.Module):
             if query_mask.ndim > 1:
                 query_mask = torch.unsqueeze(query_mask, dim=-2)
 
-            pred_logits = torch.where(query_mask == 0, torch.finfo(pred_logits.dtype).min, pred_logits)
-            pred_logits = pred_logits.to(torch.float32)
+            pred_logits = torch.where(
+                query_mask == 0, torch.finfo(pred_logits.dtype).min, pred_logits
+            )
         return (pred_logits, image_class_embeds)
 
 class OwlV2(nn.Module):
@@ -366,7 +382,7 @@ class OwlV2(nn.Module):
         self.patch_size = patch_size
 
         self.vision_model = VisionTower(hidden_size=self.vision_dim, patch_size=self.patch_size, image_size=image_size, num_layers=num_layers, num_heads=num_heads, mlp_dim=mlp_dim)
-        self.text_model = TextTower(hidden_size=self.projected_dim, vocab_size=49408, num_positions=16, num_layers=num_text_layers, num_heads=text_num_heads, mlp_dim=text_mlp_dim)
+        self.text_model = TextTower(hidden_size=self.text_dim, vocab_size=49408, num_positions=16, num_layers=num_text_layers, num_heads=text_num_heads, mlp_dim=text_mlp_dim)
 
         self.visual_projection = nn.Linear(self.vision_dim, self.projected_dim, bias=False)
         self.text_projection = nn.Linear(self.text_dim, self.projected_dim, bias=False)
@@ -380,7 +396,11 @@ class OwlV2(nn.Module):
         self.objectness_head = BoxPredictionHead(self.vision_dim, out_dim=1)
 
         self.sqrt_num_patches = self.image_size // self.patch_size
-        self.box_bias = self.compute_box_bias(self.sqrt_num_patches)
+        # Register as a buffer so it follows .to(device)/.cuda() without
+        # re-materialising on every forward.
+        self.register_buffer(
+            "box_bias", self.compute_box_bias(self.sqrt_num_patches), persistent=False
+        )
         self.image_transform_fast = T.Compose([
             T.ToImage(),
             T.Lambda(lambda x: x*0.00392156862745098),
@@ -390,7 +410,7 @@ class OwlV2(nn.Module):
         ])
         self.image_transform_accurate = T.Compose([
             T.ToImage(),
-            T.Lambda(lambda x: x*0.00392156862745098),
+            T.ToDtype(torch.float32, scale=True),
             SquarePad(),
             ScipyResize(self.image_size),
             T.Normalize(mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD),
@@ -411,9 +431,18 @@ class OwlV2(nn.Module):
         state_dict = {}
         cache_path = find_safetensors_in_cache(model_path)
 
-        if len(cache_path) != 1:
+        if len(cache_path) == 0:
             hf_hub_download(repo_id=model_path, filename="model.safetensors")
             cache_path = find_safetensors_in_cache(model_path)
+        if len(cache_path) == 0:
+            raise FileNotFoundError(
+                f"Could not locate safetensors weights for {model_path} after download."
+            )
+        if len(cache_path) > 1:
+            raise RuntimeError(
+                f"Ambiguous cache: found {len(cache_path)} safetensors candidates for "
+                f"{model_path}: {cache_path}"
+            )
         with safe_open(cache_path[0], framework="pt") as f:
             for k in f.keys():
                 tens = f.get_tensor(k)
@@ -437,13 +466,17 @@ class OwlV2(nn.Module):
     def get_vision_features(self, pixel_values, normalize=True):
         vision_pooled, vision_full = self.vision_model(pixel_values)
         vision_features = self.visual_projection(vision_pooled)
-        vision_features = vision_features / (torch.linalg.norm(vision_features, dim=-1, keepdim=True) + 1e-6)
+        if normalize:
+            vision_features = vision_features / (
+                torch.linalg.norm(vision_features, dim=-1, keepdim=True) + 1e-6
+            )
         return vision_features, vision_pooled, vision_full
-    
+
     def get_text_features(self, token_ids, attention_mask, normalize=True):
         y, _ = self.text_model(token_ids, attention_mask)
         y = self.text_projection(y)
-        y = y / (torch.linalg.norm(y, dim=-1, keepdim=True) + 1e-6)
+        if normalize:
+            y = y / (torch.linalg.norm(y, dim=-1, keepdim=True) + 1e-6)
         return y
 
     def forward(self, pixel_values, token_ids, attention_mask):
@@ -454,34 +487,14 @@ class OwlV2(nn.Module):
         logits_per_text = torch.matmul(vision_features, text_features.t()) * logit_scale
         logits_per_image = logits_per_text.t()
 
-        return logits_per_image, logits_per_text, vision_features, text_features, vision_full, text_features
-    
-    def new_forward_object_detection(self, pixel_values, token_ids, attention_mask):
+        return logits_per_image, logits_per_text, vision_features, text_features, vision_full
 
-        # Get vision feature map and reshape to PxP
-
-        # Get vision cls token
-
-        # Merge image embedding with cls token
-
-        # Get pooled text features
-
-        # Predict object classes
-
-        # Predict objectness
-
-        # Predict object boxes
-        pass
-
-
-    
     def forward_object_detection(self, pixel_values, token_ids, attention_mask):
-        batch_size = pixel_values.shape[0]
-        token_ids, attention_mask, max_text_queries = normalize_detection_queries(
-            token_ids, attention_mask, batch_size
-        )
-
-        logits_per_image, logits_per_text, vision_features, text_features, vision_full, text_features_raw = self.forward(pixel_values, token_ids, attention_mask)
+        # Detection only needs the vision hidden states and the projected text
+        # features. Avoid the CLIP-style logit matmuls from ``forward`` that
+        # would otherwise be discarded.
+        _, _, vision_full = self.get_vision_features(pixel_values, normalize=False)
+        text_features = self.get_text_features(token_ids, attention_mask)
 
         feature_map = self.vision_model.post_layernorm(vision_full)
         class_token_out = torch.broadcast_to(feature_map[:, :1, :], feature_map[:, :-1].shape)
@@ -489,7 +502,7 @@ class OwlV2(nn.Module):
         # Merge image embedding with class tokens
         feature_map = feature_map[:, 1:, :] * class_token_out
         feature_map = self.layer_norm(feature_map)
-        
+
         new_size = (
             feature_map.shape[0],
             self.sqrt_num_patches,
@@ -512,16 +525,13 @@ class OwlV2(nn.Module):
         (pred_logits, class_embeds) = self.class_head(image_feats, text_features, query_mask)
 
         # Predict objectness
-        #objectness_logits = self.objectness_predictor(image_feats)
         objectness_logits = self.objectness_head(image_feats)
         objectness_logits = objectness_logits[..., 0]
 
-        # Predict object boxes
+        # Predict object boxes. Use functional add (not +=) so autograd is
+        # happy during training.
         pred_boxes = self.box_head(image_feats)
-        # Compute the location of each token on the grid and use it to compute a bias for the bbox prediction
-        box_bias = self.box_bias.to(feature_map.device)
-        pred_boxes += box_bias
-        pred_boxes = torch.sigmoid(pred_boxes)
+        pred_boxes = torch.sigmoid(pred_boxes + self.box_bias)
 
         return pred_logits, objectness_logits, pred_boxes, class_embeds, (feature_map, text_features)
 
@@ -583,16 +593,27 @@ class OwlV2(nn.Module):
 
             # Case: height > width -> x coords ([0,2]) were compressed by (w/h)
             if hl.any():
-                clip_factor = (image_width[hl] / image_height[hl]).to(boxes.dtype).view(-1, 1, 1).clamp_min(eps)
+                clip_factor = (
+                    (image_width[hl] / image_height[hl])
+                    .to(device=boxes.device, dtype=boxes.dtype)
+                    .view(-1, 1, 1)
+                    .clamp_min(eps)
+                )
                 # clamp to theoretical max then undo scaling
-                boxes[hl, :, 0:4:2] = torch.clamp(boxes[hl, :, 0:4:2], torch.tensor(0), clip_factor)
+                boxes[hl, :, 0:4:2] = torch.clamp(boxes[hl, :, 0:4:2], torch.tensor(0.0, device=boxes.device), clip_factor)
                 boxes[hl, :, 0:4:2] = boxes[hl, :, 0:4:2] / clip_factor
 
             # Case: width > height -> y coords ([1,3]) were compressed by (h/w)
             if wl.any():
-                clip_factor = (image_height[wl] / image_width[wl]).to(boxes.dtype).view(-1, 1, 1).clamp_min(eps)
-                boxes[wl, :, 1:4:2] = torch.clamp(boxes[wl, :, 1:4:2], torch.tensor(0), clip_factor)
-                boxes[wl, :, 1:4:2] = boxes[wl, :, 1:4:2] / clip_factor        
+                clip_factor = (
+                    (image_height[wl] / image_width[wl])
+                    .to(device=boxes.device, dtype=boxes.dtype)
+                    .view(-1, 1, 1)
+                    .clamp_min(eps)
+                )
+                boxes[wl, :, 1:4:2] = torch.clamp(boxes[wl, :, 1:4:2], torch.tensor(0.0, device=boxes.device), clip_factor)
+                boxes[wl, :, 1:4:2] = boxes[wl, :, 1:4:2] / clip_factor
+
         scale_factor = torch.stack([image_width, image_height, image_width, image_height], dim=1)
         scale_factor = scale_factor.unsqueeze(1).to(boxes.device)
         boxes = boxes * scale_factor
@@ -648,7 +669,7 @@ class OwlV2(nn.Module):
         # Objectness & boxes unchanged
         objectness_logits = self.objectness_head(image_feats)[..., 0]
         pred_boxes = self.box_head(image_feats)
-        pred_boxes = torch.sigmoid(pred_boxes + self.box_bias.to(image_feats.device))
+        pred_boxes = torch.sigmoid(pred_boxes + self.box_bias)
 
         return proto_logits, class_logits, objectness_logits, pred_boxes, (feature_map, class_embeds)
 
@@ -668,31 +689,16 @@ class PrototypeDetector(nn.Module):
 
     
 if __name__ == '__main__':
-    from safetensors import safe_open
-    state_dict = {}
-    with safe_open("weights/model.safetensors", framework="pt") as f:
-        for k in f.keys():
-            tens = f.get_tensor(k)
-            k = k.replace("owlv2.","").replace(".embeddings","")
-            k = k.replace("mlp.fc1","mlp.0").replace("mlp.fc2","mlp.2")
-            state_dict[k] = tens
     model = OwlV2()
     model = model.eval()
     model.cuda()
-    model.load_state_dict(state_dict, strict=True)
     with torch.no_grad():
-        x = torch.randn(1, 3, 960,960)
-        token_id, attn_mask = torch.randint(0, 49408, (1, 16)), torch.ones(1, 16)
-        x = x.cuda()
-        token_id = token_id.cuda()
-        attn_mask = attn_mask.cuda()
-        pred_logits, _, pred_boxes, _ = model.forward_object_detection(x, token_id, attn_mask)
-        print("pred_logits",pred_logits.shape)
-        print("pred_boxes",pred_boxes.shape)
-
-    """ with torch.no_grad():
-        x = torch.ones(1, 12, dtype=torch.int64)
-        y = model.text_model.forward(x)
-        #y = model.text_model.encoder.layers[0].forward(x)
-        print("y",y.shape)
-        #print(x-y) """
+        x = torch.randn(1, 3, 960, 960, device="cuda")
+        token_id = torch.randint(0, 49408, (1, 16), device="cuda")
+        attn_mask = torch.ones(1, 16, device="cuda")
+        pred_logits, objectness_logits, pred_boxes, class_embeds, _ = (
+            model.forward_object_detection(x, token_id, attn_mask)
+        )
+        print("pred_logits", pred_logits.shape)
+        print("objectness_logits", objectness_logits.shape)
+        print("pred_boxes", pred_boxes.shape)
