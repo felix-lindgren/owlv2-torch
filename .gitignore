@@ -8,3 +8,4 @@ build/
 mlruns/
 *.pth
 data/
+eval_samples/

@@ -415,6 +415,7 @@ class OwlV2(nn.Module):
             ScipyResize(self.image_size),
             T.Normalize(mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD),
         ])
+        self.image_transform = self.image_transform_accurate
 
         self.image_transform_unnormed = T.Compose([
             T.ToImage(),
@@ -516,23 +517,7 @@ class OwlV2(nn.Module):
         _, _, vision_full = self.get_vision_features(pixel_values, normalize=False)
         text_features = self.get_text_features(token_ids, attention_mask)
 
-        feature_map = self.vision_model.post_layernorm(vision_full)
-        class_token_out = torch.broadcast_to(feature_map[:, :1, :], feature_map[:, :-1].shape)
-
-        # Merge image embedding with class tokens
-        feature_map = feature_map[:, 1:, :] * class_token_out
-        feature_map = self.layer_norm(feature_map)
-
-        new_size = (
-            feature_map.shape[0],
-            self.sqrt_num_patches,
-            self.sqrt_num_patches,
-            feature_map.shape[-1],
-        )
-        feature_map = feature_map.reshape(new_size)
-
-        batch_size, num_patches, num_patches, hidden_dim = feature_map.shape
-        image_feats = torch.reshape(feature_map, (batch_size, num_patches * num_patches, hidden_dim))
+        image_feats, feature_map = self._detection_image_features_from_vision(vision_full)
 
         # Reshape from [batch_size * max_text_queries, hidden_dim] -> [batch_size, max_text_queries, hidden_dim]
         text_features = text_features.reshape(batch_size, max_text_queries, text_features.shape[-1])
@@ -644,17 +629,10 @@ class OwlV2(nn.Module):
         self.prototype_bank = proto_bank
         return self
 
-    @torch.no_grad()
-    def _image_grid_features(self, pixel_values):
-        """
-        Produces:
-        image_feats: [B, P*P, vision_dim]  (same as your forward_object_detection pre-class_head)
-        feature_map: [B, P, P, vision_dim]
-        """
-        # Almost identical to the first part of forward_object_detection
-        _, _, vision_full = self.get_vision_features(pixel_values)  # pooled not needed
-        feature_map = self.vision_model.post_layernorm(vision_full)       # [B, 1+P*P, Dv]
+    def _detection_image_features_from_vision(self, vision_full):
+        feature_map = self.vision_model.post_layernorm(vision_full)
         class_token_out = torch.broadcast_to(feature_map[:, :1, :], feature_map[:, :-1].shape)
+
         feature_map = feature_map[:, 1:, :] * class_token_out
         feature_map = self.layer_norm(feature_map)
 
@@ -663,7 +641,21 @@ class OwlV2(nn.Module):
         image_feats = feature_map.view(feature_map.shape[0], P * P, feature_map.shape[-1])
         return image_feats, feature_map
 
-    def forward_proto_detection(self, pixel_values):
+    def _image_grid_features(self, pixel_values):
+        """
+        Produces:
+        image_feats: [B, P*P, vision_dim]  (same as your forward_object_detection pre-class_head)
+        feature_map: [B, P, P, vision_dim]
+        """
+        _, _, vision_full = self.get_vision_features(pixel_values, normalize=False)
+        return self._detection_image_features_from_vision(vision_full)
+
+    def forward_proto_detection(
+        self,
+        pixel_values,
+        prototype_bank: Optional["VisualPrototypeBank"] = None,
+        box_delta: Optional[torch.Tensor] = None,
+    ):
         """
         Returns:
         proto_logits:  [B, P*P, C*K] similarity to *prototypes*
@@ -672,39 +664,70 @@ class OwlV2(nn.Module):
         pred_boxes:    [B, P*P, 4]   (cx,cy,w,h) in [0,1]
         extras:        (feature_map, class_embeds)
         """
-        assert hasattr(self, "prototype_bank"), "Call attach_prototype_bank() first."
+        prototype_bank = prototype_bank if prototype_bank is not None else getattr(self, "prototype_bank", None)
+        if prototype_bank is None:
+            raise RuntimeError("Pass prototype_bank or call attach_prototype_bank() first.")
         B = pixel_values.shape[0]
 
-        image_feats, feature_map = self._image_grid_features(pixel_values)
+        with torch.no_grad():
+            image_feats, feature_map = self._image_grid_features(pixel_values)
 
         # [B, C*K, D_text] — these replace 'text_features'
-        proto_embeds = self.prototype_bank.expand_for_batch(B)
+        proto_embeds = prototype_bank.expand_for_batch(B)
         query_mask = None  # or torch.ones(B, proto_embeds.shape[1], dtype=torch.bool, device=image_feats.device)
 
         # Class logits over *prototypes*
         proto_logits, class_embeds = self.class_head(image_feats, proto_embeds, query_mask)
         # Aggregate to get per-class logits
-        class_logits = self.prototype_bank.aggregate_logits(proto_logits, reduce="logsumexp")
+        class_logits = prototype_bank.aggregate_logits(proto_logits, reduce="logsumexp")
 
         # Objectness & boxes unchanged
         objectness_logits = self.objectness_head(image_feats)[..., 0]
         pred_boxes = self.box_head(image_feats)
+        if box_delta is not None:
+            pred_boxes = pred_boxes + box_delta.view(1, 1, 4)
         pred_boxes = torch.sigmoid(pred_boxes + self.box_bias)
 
         return proto_logits, class_logits, objectness_logits, pred_boxes, (feature_map, class_embeds)
 
 
 class PrototypeDetector(nn.Module):
-    def __init__(self, owl: OwlV2, bank: VisualPrototypeBank):
+    def __init__(
+        self,
+        owl: OwlV2,
+        bank: VisualPrototypeBank,
+        box_tuning_mode: str = "none",
+        train_objectness_head: bool = False,
+    ):
         super().__init__()
-        self.owl = owl.attach_prototype_bank(bank)
-        # freeze everything except prototype bank (and maybe logit_scale)
-        for p in self.owl.parameters(): p.requires_grad_(False)
-        for p in self.owl.prototype_bank.parameters(): p.requires_grad_(True)
-        self.owl.logit_scale.requires_grad_(True)
+        if box_tuning_mode not in {"none", "bias", "last_layer", "full_head"}:
+            raise ValueError(
+                "box_tuning_mode must be one of: none, bias, last_layer, full_head"
+            )
+        self.owl = owl
+        self.bank = bank
+        self.box_tuning_mode = box_tuning_mode
+        self.box_delta = nn.Parameter(torch.zeros(4)) if box_tuning_mode == "bias" else None
+
+        for p in self.owl.parameters():
+            p.requires_grad_(False)
+        for p in self.bank.parameters():
+            p.requires_grad_(True)
+        if box_tuning_mode == "last_layer":
+            for p in self.owl.box_head.dense2.parameters():
+                p.requires_grad_(True)
+        elif box_tuning_mode == "full_head":
+            for p in self.owl.box_head.parameters():
+                p.requires_grad_(True)
+        if train_objectness_head:
+            for p in self.owl.objectness_head.parameters():
+                p.requires_grad_(True)
+
+    def trainable_parameters(self):
+        return (p for p in self.parameters() if p.requires_grad)
 
     def forward(self, pixel_values):
-        return self.owl.forward_proto_detection(pixel_values)
+        return self.owl.forward_proto_detection(pixel_values, self.bank, self.box_delta)
 
 
     

@@ -142,16 +142,63 @@ def build_proto_targets(proto_bank: VisualPrototypeBank, labels: torch.Tensor) -
     C, K = proto_bank.num_classes, proto_bank.K
     P = C * K
     Y = torch.zeros((labels.shape[0], P), device=labels.device)
+    if labels.numel() and ((labels < 0).any() or (labels >= C).any()):
+        raise ValueError(
+            f"Prototype labels must be zero-based class indices in [0, {C}); "
+            f"got labels {labels.detach().cpu().tolist()}"
+        )
     for i, c in enumerate(labels.tolist()):
         start = c * K
         Y[i, start:start+K] = 1.0
     return Y  # [M, P]
 
 
+def _hard_negative_indices(
+    proto_logits: torch.Tensor,
+    matched_indices: torch.Tensor,
+    num_positives: int,
+    negative_ratio: int,
+    max_negatives: int,
+) -> torch.Tensor:
+    """Select unmatched patch indices with the highest prototype scores."""
+    Q = proto_logits.shape[0]
+    device = proto_logits.device
+
+    neg_mask = torch.ones(Q, dtype=torch.bool, device=device)
+    if matched_indices.numel():
+        neg_mask[matched_indices] = False
+    neg_indices = torch.nonzero(neg_mask, as_tuple=False).squeeze(1)
+    if neg_indices.numel() == 0:
+        return neg_indices
+
+    if num_positives > 0 and negative_ratio > 0:
+        limit = num_positives * negative_ratio
+    else:
+        limit = max_negatives
+    if max_negatives > 0:
+        limit = min(limit, max_negatives)
+    limit = min(limit, neg_indices.numel())
+    if limit <= 0:
+        return neg_indices[:0]
+
+    scores = proto_logits[neg_indices].detach().max(dim=-1).values
+    hard_order = torch.topk(scores, k=limit).indices
+    return neg_indices[hard_order]
+
 
 def compute_losses(outputs, targets, bank: VisualPrototypeBank,
                    lambda_cls=1.0, lambda_l1=5.0, lambda_giou=2.0,
-                   use_objectness=True, use_nwd=True,):
+                   use_objectness=True, use_nwd=True,
+                   include_geometry_loss=False,
+                   include_objectness_loss=False,
+                   negative_ratio=5,
+                   max_negatives_per_image=512,
+                   negative_loss_weight=1.0):
+    """
+    Prototype training defaults to optimizing only the prototype classification
+    term. Box and objectness heads are frozen in ``PrototypeDetector``, so their
+    losses are returned as diagnostics unless explicitly included.
+    """
     proto_logits, class_logits, objectness_logits, pred_boxes, _ = outputs
     B, Q, C = class_logits.shape
     losses = {}
@@ -160,7 +207,8 @@ def compute_losses(outputs, targets, bank: VisualPrototypeBank,
     indices = hungarian_match(class_logits, pred_boxes, targets)
 
     # Classification (prototype-level, focal BCE)
-    cls_losses = []
+    cls_pos_losses = []
+    cls_neg_losses = []
     l1_losses = []
     giou_losses = []
     obj_losses = []
@@ -168,6 +216,24 @@ def compute_losses(outputs, targets, bank: VisualPrototypeBank,
     for b in range(B):
         idx_q, idx_g = indices[b]
         if len(idx_q) == 0:
+            idx_neg = _hard_negative_indices(
+                proto_logits[b],
+                idx_q,
+                num_positives=0,
+                negative_ratio=negative_ratio,
+                max_negatives=max_negatives_per_image,
+            )
+            if idx_neg.numel():
+                y_neg = torch.zeros_like(proto_logits[b][idx_neg])
+                cls_neg_losses.append(
+                    sigmoid_focal_loss(
+                        proto_logits[b][idx_neg],
+                        y_neg,
+                        alpha=0.25,
+                        gamma=2.0,
+                        reduction="mean",
+                    )
+                )
             if use_objectness:
                 obj_target = torch.zeros_like(objectness_logits[b])
                 obj_losses.append(F.binary_cross_entropy_with_logits(objectness_logits[b], obj_target))
@@ -186,7 +252,26 @@ def compute_losses(outputs, targets, bank: VisualPrototypeBank,
         Y_proto = build_proto_targets(bank, gt_labels)    # [M, C*K]
 
         # Focal BCE over prototypes (positives are *all K* for the GT class)
-        cls_losses.append(sigmoid_focal_loss(pl, Y_proto, alpha=0.25, gamma=2.0, reduction="mean"))
+        cls_pos_losses.append(sigmoid_focal_loss(pl, Y_proto, alpha=0.25, gamma=2.0, reduction="mean"))
+
+        idx_neg = _hard_negative_indices(
+            proto_logits[b],
+            idx_q,
+            num_positives=len(idx_q),
+            negative_ratio=negative_ratio,
+            max_negatives=max_negatives_per_image,
+        )
+        if idx_neg.numel():
+            y_neg = torch.zeros_like(proto_logits[b][idx_neg])
+            cls_neg_losses.append(
+                sigmoid_focal_loss(
+                    proto_logits[b][idx_neg],
+                    y_neg,
+                    alpha=0.25,
+                    gamma=2.0,
+                    reduction="mean",
+                )
+            )
 
         # Boxes: L1 + GIoU
         l1_losses.append(F.l1_loss(pb, gt_boxes, reduction="mean"))
@@ -204,12 +289,26 @@ def compute_losses(outputs, targets, bank: VisualPrototypeBank,
             obj_t[idx_q] = 1.0
             obj_losses.append(F.binary_cross_entropy_with_logits(ob, obj_t))
 
-    L_cls = torch.stack(cls_losses).mean() if cls_losses else torch.tensor(0.0, device=pred_boxes.device)
+    L_cls_pos = torch.stack(cls_pos_losses).mean() if cls_pos_losses else torch.tensor(0.0, device=pred_boxes.device)
+    L_cls_neg = torch.stack(cls_neg_losses).mean() if cls_neg_losses else torch.tensor(0.0, device=pred_boxes.device)
+    L_cls = L_cls_pos + negative_loss_weight * L_cls_neg
     L_l1  = torch.stack(l1_losses).mean() if l1_losses else torch.tensor(0.0, device=pred_boxes.device)
     L_g   = torch.stack(giou_losses).mean() if giou_losses else torch.tensor(0.0, device=pred_boxes.device)
     L_obj = torch.stack(obj_losses).mean() if obj_losses else torch.tensor(0.0, device=pred_boxes.device)
 
-    loss = lambda_cls*L_cls + lambda_l1*L_l1 + lambda_giou*L_g + (0.5*L_obj if use_objectness else 0.0)
+    loss = lambda_cls * L_cls
+    if include_geometry_loss:
+        loss = loss + lambda_l1 * L_l1 + lambda_giou * L_g
+    if include_objectness_loss and use_objectness:
+        loss = loss + 0.5 * L_obj
 
-    losses.update(dict(loss=loss, L_cls=L_cls, L_l1=L_l1, L_giou=L_g, L_obj=L_obj))
+    losses.update(dict(
+        loss=loss,
+        L_cls=L_cls,
+        L_cls_pos=L_cls_pos,
+        L_cls_neg=L_cls_neg,
+        L_l1=L_l1,
+        L_giou=L_g,
+        L_obj=L_obj,
+    ))
     return losses

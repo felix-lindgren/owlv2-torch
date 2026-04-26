@@ -72,8 +72,8 @@ model = OwlV2("large")
 bank = VisualPrototypeBank(num_classes=1, prototypes_per_class=4, dim=model.text_dim)
 detector = PrototypeDetector(model, bank).to("cuda")
 
-# Only the prototype embeddings and logit_scale are trainable
-optimizer = torch.optim.AdamW(bank.parameters(), lr=1e-4)
+# Only the prototype embeddings are trainable
+optimizer = torch.optim.AdamW(detector.trainable_parameters(), lr=1e-4)
 
 # In your training loop:
 outputs = detector(pixel_values)

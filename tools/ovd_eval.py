@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import os
+import json
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import torch
@@ -48,6 +50,43 @@ def class_name_to_query(name: str) -> str:
     return f"a satellite photo of a {cleaned}"
 
 
+def normalize_class_name(name: str) -> str:
+    return name.strip().lower().replace("-", " ").replace("_", " ")
+
+
+def class_name_key(name: str) -> str:
+    return "".join(ch for ch in normalize_class_name(name) if ch.isalnum())
+
+
+def filter_coco_gt_to_class_names(coco_gt_dict: dict, class_names: list[str]) -> dict:
+    target_name_to_id = {
+        class_name_key(name): idx
+        for idx, name in enumerate(class_names)
+    }
+    old_to_new = {}
+    for category in coco_gt_dict["categories"]:
+        key = class_name_key(category["name"])
+        if key in target_name_to_id:
+            old_to_new[int(category["id"])] = target_name_to_id[key]
+
+    annotations = []
+    for ann in coco_gt_dict["annotations"]:
+        old_category_id = int(ann["category_id"])
+        if old_category_id not in old_to_new:
+            continue
+        remapped = dict(ann)
+        remapped["category_id"] = old_to_new[old_category_id]
+        annotations.append(remapped)
+
+    return {
+        "info": coco_gt_dict.get("info", {}),
+        "licenses": coco_gt_dict.get("licenses", []),
+        "images": coco_gt_dict["images"],
+        "annotations": annotations,
+        "categories": [{"id": idx, "name": name} for idx, name in enumerate(class_names)],
+    }
+
+
 def detect(
     model: OwlV2,
     pixel_values: torch.Tensor,
@@ -73,6 +112,57 @@ def detect(
     objectness_logits = model.objectness_head(image_feats)[..., 0]
     pred_boxes = torch.sigmoid(model.box_head(image_feats) + model.box_bias)
     return pred_logits, objectness_logits, pred_boxes
+
+
+class CocoFileDetectionDataset(Dataset):
+    def __init__(
+        self,
+        ann_file: str | Path,
+        image_root: str | Path,
+        limit: Optional[int] = None,
+    ):
+        self.ann_file = Path(ann_file)
+        self.image_root = Path(image_root)
+        with open(self.ann_file, "r") as f:
+            coco = json.load(f)
+
+        categories = sorted(coco.get("categories", []), key=lambda c: int(c["id"]))
+        self.class_names = [str(c["name"]) for c in categories]
+        self.coco_gt = {
+            "info": coco.get("info", {}),
+            "licenses": coco.get("licenses", []),
+            "images": list(coco.get("images", [])),
+            "annotations": list(coco.get("annotations", [])),
+            "categories": list(coco.get("categories", [])),
+        }
+
+        images = list(self.coco_gt["images"])
+        if limit is not None:
+            images = images[:limit]
+            image_ids = {int(img["id"]) for img in images}
+            self.coco_gt["images"] = images
+            self.coco_gt["annotations"] = [
+                ann for ann in self.coco_gt["annotations"]
+                if int(ann["image_id"]) in image_ids
+            ]
+        self.images = images
+
+    def __len__(self) -> int:
+        return len(self.images)
+
+    def __getitem__(self, idx: int) -> dict:
+        image_info = self.images[idx]
+        path = self.image_root / image_info["file_name"]
+        image = Image.open(path).convert("RGB")
+        return {
+            "image": image,
+            "image_id": int(image_info["id"]),
+            "target_size": (image.height, image.width),
+            "offset": (0.0, 0.0),
+        }
+
+    def build_coco_gt(self) -> dict:
+        return self.coco_gt
 
 
 class DiorDetectionDataset(Dataset):
@@ -331,6 +421,71 @@ def run_owlv2_inference(
     queries = [class_name_to_query(c) for c in class_names]
     text_inputs = tokenize(queries, context_length=16, truncate=True).to(device)
     attention_mask = (text_inputs == 0).to(device)
+    return run_detection_inference(
+        model=model,
+        dataset=dataset,
+        device=device,
+        score_threshold=score_threshold,
+        top_k=top_k,
+        batch_size=batch_size,
+        fast_preprocess=fast_preprocess,
+        use_autocast=use_autocast,
+        num_workers=num_workers,
+        desc=desc,
+        predict_fn=lambda m, pixels: detect(m, pixels, text_inputs, attention_mask),
+        postprocess_model=model,
+    )
+
+
+def run_prototype_inference(
+    model,
+    dataset: Dataset,
+    device: str,
+    score_threshold: float,
+    top_k: Optional[int],
+    batch_size: int,
+    fast_preprocess: bool,
+    use_autocast: bool,
+    num_workers: int,
+    desc: str,
+) -> list[dict]:
+    def _predict(m, pixels):
+        outputs = m(pixels)
+        return outputs[1], outputs[2], outputs[3]
+
+    return run_detection_inference(
+        model=model,
+        dataset=dataset,
+        device=device,
+        score_threshold=score_threshold,
+        top_k=top_k,
+        batch_size=batch_size,
+        fast_preprocess=fast_preprocess,
+        use_autocast=use_autocast,
+        num_workers=num_workers,
+        desc=desc,
+        predict_fn=_predict,
+        postprocess_model=model.owl,
+        preprocess_model=model.owl,
+    )
+
+
+def run_detection_inference(
+    model,
+    dataset: Dataset,
+    device: str,
+    score_threshold: float,
+    top_k: Optional[int],
+    batch_size: int,
+    fast_preprocess: bool,
+    use_autocast: bool,
+    num_workers: int,
+    desc: str,
+    predict_fn: Callable,
+    postprocess_model,
+    preprocess_model=None,
+) -> list[dict]:
+    preprocess_model = preprocess_model or model
 
     loader_kwargs = {
         "batch_size": batch_size,
@@ -353,7 +508,7 @@ def run_owlv2_inference(
         image_ids = batch["image_ids"]
         offsets = batch["offsets"]
         target_sizes = torch.tensor(batch["target_sizes"], dtype=torch.float32, device=device)
-        pixel_values = model.preprocess_image(images, fast=fast_preprocess).to(device)
+        pixel_values = preprocess_model.preprocess_image(images, fast=fast_preprocess).to(device)
 
         with torch.inference_mode():
             with torch.autocast(
@@ -361,10 +516,8 @@ def run_owlv2_inference(
                 dtype=torch.float16,
                 enabled=autocast_enabled,
             ):
-                pred_logits, objectness_logits, pred_boxes = detect(
-                    model, pixel_values, text_inputs, attention_mask
-                )
-                boxes_xyxy_batch = model.postprocess_boxes(pred_boxes.float(), target_sizes)
+                pred_logits, objectness_logits, pred_boxes = predict_fn(model, pixel_values)
+                boxes_xyxy_batch = postprocess_model.postprocess_boxes(pred_boxes.float(), target_sizes)
 
         pred_logits = pred_logits.float()
         objectness_logits = objectness_logits.float()
@@ -411,13 +564,17 @@ def coco_eval_with_custom_sizes(
     detections: list[dict],
     class_names: list[str],
     title: str,
-) -> None:
+) -> dict[str, float]:
     from faster_coco_eval import COCO, COCOeval_faster
 
+    if not coco_gt_dict["annotations"]:
+        print(f"\n=== {title}: COCO mAP ===")
+        print("No matching GT annotations — skipping COCO eval.")
+        return {}
     coco_gt = COCO(coco_gt_dict)
     if not detections:
         print("No detections produced — skipping COCO eval.")
-        return
+        return {}
     coco_dt = coco_gt.loadRes(detections)
 
     cocoeval = COCOeval_faster(coco_gt, coco_dt, iouType="bbox")
@@ -441,12 +598,19 @@ def coco_eval_with_custom_sizes(
 
     print(f"\n=== {title}: COCO mAP ===")
     print(f"{'metric':<28s} {'IoU':<14s} {'value':>8s}")
+    metrics = {}
     for area_idx, (lbl, _) in enumerate(AREA_RANGES):
         ap_all = _mean(precision[:, :, :, area_idx, last_md_idx])
+        if lbl == "all":
+            metrics["map"] = ap_all
+        elif lbl in {"small", "medium", "large"}:
+            metrics[f"map_{lbl}"] = ap_all
         print(f"  AP   area={lbl:<10s}    @[0.50:0.95]   {ap_all:>8.4f}")
         if lbl == "all":
             ap_50 = _mean(precision[iou50_idx, :, :, area_idx, last_md_idx])
             ap_75 = _mean(precision[iou75_idx, :, :, area_idx, last_md_idx])
+            metrics["map_50"] = ap_50
+            metrics["map_75"] = ap_75
             print(f"  AP   area={lbl:<10s}    @0.50          {ap_50:>8.4f}")
             print(f"  AP   area={lbl:<10s}    @0.75          {ap_75:>8.4f}")
 
@@ -460,6 +624,7 @@ def coco_eval_with_custom_sizes(
     for k, name in enumerate(class_names):
         per_cls = _mean(precision[:, :, k, all_idx, last_md_idx])
         print(f"  {name:30s} {per_cls:.4f}")
+    return metrics
 
 
 def save_detections(path: str, detections: list[dict]) -> None:
@@ -468,3 +633,93 @@ def save_detections(path: str, detections: list[dict]) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w") as f:
         json.dump(detections, f)
+
+
+def build_eval_dataset(args):
+    if args.dataset == "coco":
+        if args.ann_file is None or args.image_root is None:
+            raise ValueError("--ann-file and --image-root are required for --dataset coco")
+        dataset = CocoFileDetectionDataset(
+            ann_file=args.ann_file,
+            image_root=args.image_root,
+            limit=args.limit,
+        )
+        title = args.title or Path(args.ann_file).stem
+    elif args.dataset == "dior":
+        dataset = DiorDetectionDataset(split=args.split, limit=args.limit)
+        title = args.title or f"DIOR {args.split}"
+    elif args.dataset == "dota":
+        dataset = DotaDetectionDataset(
+            data_root=args.data_root,
+            limit=args.limit,
+            tile_size=args.tile_size,
+            tile_overlap=args.tile_overlap,
+            include_difficult=args.include_difficult,
+        )
+        title = args.title or "DOTAv1.5"
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
+    return dataset, title
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Evaluate OWLv2 on COCO, DIOR, or DOTA.")
+    parser.add_argument("--dataset", choices=["coco", "dior", "dota"], required=True)
+    parser.add_argument("--model-size", default="large", choices=["base", "large"])
+    parser.add_argument("--ann-file", type=Path, default=None, help="COCO annotation JSON.")
+    parser.add_argument("--image-root", type=Path, default=None, help="COCO image root.")
+    parser.add_argument("--split", default="test", help="DIOR split.")
+    parser.add_argument("--data-root", type=Path, default=Path("data/dotav1_5"))
+    parser.add_argument("--tile-size", type=int, default=0)
+    parser.add_argument("--tile-overlap", type=int, default=200)
+    parser.add_argument("--include-difficult", action="store_true")
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--score-threshold", type=float, default=0.0)
+    parser.add_argument("--top-k", type=int, default=300)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--fast-preprocess", action="store_true")
+    parser.add_argument("--no-autocast", dest="autocast", action="store_false")
+    parser.set_defaults(autocast=True)
+    parser.add_argument("--save-detections", default=None)
+    parser.add_argument("--title", default=None)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    args = parser.parse_args()
+
+    if args.batch_size is None:
+        args.batch_size = 32 if args.model_size == "base" else 8
+
+    dataset, title = build_eval_dataset(args)
+    print(f"Loaded {args.dataset}: {len(dataset)} samples/crops")
+    print(f"Classes ({len(dataset.class_names)}): {dataset.class_names}")
+
+    print(f"Loading OwlV2 ({args.model_size}) on {args.device}...")
+    model = OwlV2(args.model_size).eval().to(args.device)
+    detections = run_owlv2_inference(
+        model,
+        dataset,
+        dataset.class_names,
+        device=args.device,
+        score_threshold=args.score_threshold,
+        top_k=args.top_k,
+        batch_size=args.batch_size,
+        fast_preprocess=args.fast_preprocess,
+        use_autocast=args.autocast,
+        num_workers=args.num_workers,
+        desc=f"{title} inference",
+    )
+
+    if args.save_detections:
+        save_detections(args.save_detections, detections)
+        print(f"Wrote {len(detections)} detections to {args.save_detections}")
+
+    coco_eval_with_custom_sizes(
+        dataset.build_coco_gt(),
+        detections,
+        dataset.class_names,
+        title=title,
+    )
+
+
+if __name__ == "__main__":
+    main()
