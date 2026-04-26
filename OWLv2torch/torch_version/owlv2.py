@@ -453,6 +453,20 @@ class OwlV2(nn.Module):
         self.load_state_dict(state_dict, strict=True)
     
     def preprocess_image(self, image, fast=False):
+        """Preprocess one or more images for OwlV2 detection.
+
+        Accepts a single PIL image / file path, or a list/tuple of either.
+        Always returns a ``[B, 3, H, W]`` float tensor (B=1 for a single input).
+
+        Per-sample preprocessing is used (the ``accurate`` path runs scipy's
+        gaussian-filter + zoom on each image individually, which can't be
+        meaningfully vectorised), but the outputs are stacked into a batch so
+        downstream forward passes can run with B>1.
+        """
+        if isinstance(image, (list, tuple)):
+            tensors = [self.preprocess_image(img, fast=fast).squeeze(0) for img in image]
+            return torch.stack(tensors, dim=0)
+
         if isinstance(image, str):
             image = Image.open(image)
 
@@ -490,6 +504,12 @@ class OwlV2(nn.Module):
         return logits_per_image, logits_per_text, vision_features, text_features, vision_full
 
     def forward_object_detection(self, pixel_values, token_ids, attention_mask):
+        batch_size = pixel_values.shape[0]
+        token_ids, attention_mask, _ = normalize_detection_queries(
+            token_ids, attention_mask, batch_size
+        )
+        max_text_queries = token_ids.shape[0] // batch_size
+
         # Detection only needs the vision hidden states and the projected text
         # features. Avoid the CLIP-style logit matmuls from ``forward`` that
         # would otherwise be discarded.

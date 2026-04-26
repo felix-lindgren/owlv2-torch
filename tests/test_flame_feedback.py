@@ -58,15 +58,15 @@ def test_flame_feedback_labels_append_and_persist(tmp_path):
     ]
     pipeline.label_candidates([0], [True])
 
-    assert pipeline._train_embeddings.shape == (3, 3)
+    assert pipeline._train_embeddings.shape == (3, 2)
     assert np.array_equal(pipeline._train_labels, np.array([1, 0, 1], dtype=np.int32))
     assert np.allclose(
         pipeline._train_embeddings,
         np.array(
             [
-                [1.0, 1.5, 0.1],
-                [2.0, 2.5, 0.2],
-                [3.0, 3.5, 0.3],
+                [1.0, 1.5],
+                [2.0, 2.5],
+                [3.0, 3.5],
             ],
             dtype=np.float32,
         ),
@@ -98,9 +98,9 @@ def test_flame_feedback_labels_append_and_persist(tmp_path):
 
     pipeline.add_feedback_labels([1], [False])
 
-    assert pipeline._train_embeddings.shape == (4, 3)
+    assert pipeline._train_embeddings.shape == (4, 2)
     assert np.array_equal(pipeline._train_labels, np.array([1, 0, 1, 0], dtype=np.int32))
-    assert np.allclose(pipeline._train_embeddings[-1], np.array([30.0, 30.5, 1.3], dtype=np.float32))
+    assert np.allclose(pipeline._train_embeddings[-1], np.array([30.0, 30.5], dtype=np.float32))
 
     save_path = tmp_path / "flame.pkl"
     pipeline.save(str(save_path))

@@ -1,0 +1,82 @@
+Base:
+=== DIOR test set: COCO mAP ===
+metric                       IoU               value
+  AP   area=all           @[0.50:0.95]     0.0706
+  AP   area=all           @0.50            0.1235
+  AP   area=all           @0.75            0.0697
+  AP   area=very_tiny     @[0.50:0.95]     0.0003
+  AP   area=tiny          @[0.50:0.95]     0.0164
+  AP   area=small         @[0.50:0.95]     0.0305
+  AP   area=medium        @[0.50:0.95]     0.0790
+  AP   area=large         @[0.50:0.95]     0.1153
+
+  AR   area=all         maxDets=100     0.2879
+  AR   area=very_tiny   maxDets=100     0.0147
+  AR   area=tiny        maxDets=100     0.0517
+  AR   area=small       maxDets=100     0.0951
+  AR   area=medium      maxDets=100     0.2799
+  AR   area=large       maxDets=100     0.3800
+
+=== Per-class AP @[0.50:0.95] (area=all) ===
+  Airplane                       0.3684
+  Airport                        0.0002
+  Baseball field                 0.1336
+  Basketball court               0.0272
+  Bridge                         0.0049
+  Chimney                        0.0028
+  Dam                            0.0045
+  Expressway service area        0.0014
+  Expressway toll station        0.0211
+  Golf course                    0.0008
+  Ground track field             0.0910
+  Harbor                         0.0979
+  Overpass                       0.0143
+  Ship                           0.3537
+  Stadium                        0.0909
+  Storage tank                   0.0563
+  Tennis court                   0.0034
+  Train station                  0.0015
+  Vehicle                        0.1382
+  Wind mill                      0.0002
+
+
+Large:
+=== DIOR test set: COCO mAP ===
+metric                       IoU               value
+  AP   area=all           @[0.50:0.95]     0.1016
+  AP   area=all           @0.50            0.1663
+  AP   area=all           @0.75            0.1051
+  AP   area=very_tiny     @[0.50:0.95]     0.0020
+  AP   area=tiny          @[0.50:0.95]     0.0221
+  AP   area=small         @[0.50:0.95]     0.0404
+  AP   area=medium        @[0.50:0.95]     0.1203
+  AP   area=large         @[0.50:0.95]     0.1523
+
+  AR   area=all         maxDets=100     0.3186
+  AR   area=very_tiny   maxDets=100     0.0084
+  AR   area=tiny        maxDets=100     0.0689
+  AR   area=small       maxDets=100     0.1125
+  AR   area=medium      maxDets=100     0.3001
+  AR   area=large       maxDets=100     0.4262
+
+=== Per-class AP @[0.50:0.95] (area=all) ===
+  Airplane                       0.4630
+  Airport                        0.0000
+  Baseball field                 0.1639
+  Basketball court               0.0842
+  Bridge                         0.0086
+  Chimney                        0.0075
+  Dam                            0.0319
+  Expressway service area        0.0008
+  Expressway toll station        0.0514
+  Golf course                    0.0041
+  Ground track field             0.1784
+  Harbor                         0.0628
+  Overpass                       0.0100
+  Ship                           0.3770
+  Stadium                        0.2717
+  Storage tank                   0.1253
+  Tennis court                   0.0262
+  Train station                  0.0006
+  Vehicle                        0.1639
+  Wind mill                      0.0004

@@ -28,25 +28,40 @@ class FlameConfig:
     """Configuration for the FLAME pipeline."""
     # Proposal generation
     objectness_threshold: float = 0.1       # low threshold for high recall
-    text_score_threshold: float = 0.0       # keep all text-matched proposals
+    text_score_threshold: float = 0.0       # threshold on sigmoid(text logit); 0 keeps all text-matched proposals
     max_proposals_per_image: int = 500      # cap proposals per image
 
     # Active sample selection
     pca_components: int = 32                # PCA dimensionality for density estimation
     kde_bandwidth: float = 0.5              # KDE bandwidth
-    marginal_quantile_low: float = 0.05     # lower density quantile for marginal band
-    marginal_quantile_high: float = 0.40    # upper density quantile for marginal band
+    # Marginal band defined as { s : rl * f̂(s*) <= f̂(s) <= ru * f̂(s*) },
+    # i.e. the "donut" around the density mode (paper Algorithm 1, line 7).
+    marginal_density_ratio_low: float = 0.25   # rl in (0, 1)
+    marginal_density_ratio_high: float = 0.75  # ru in (rl, 1)
     num_clusters: int = 30                  # number of clusters (= num shots to annotate)
 
     # Classifier
     classifier_type: str = "svm"            # "svm" or "mlp"
+    # The paper uses an RBF SVM by default for the lightweight refiner.
     svm_kernel: str = "rbf"
-    svm_C: float = 10.0
+    svm_C: float = 1.0
     mlp_hidden: tuple = (128, 64)
     mlp_max_iter: int = 500
 
     # Inference
-    classifier_threshold: float = 0.5       # threshold for the refiner classifier
+    # For SVM, the refiner score is sigmoid(decision_function); threshold 0.5
+    # therefore corresponds to the SVM's natural decision boundary
+    # (decision_function >= 0). For MLP it is the predict_proba threshold.
+    classifier_threshold: float = 0.5
+
+    # Logging
+    verbose: bool = True                    # set False to silence per-call FLAME prints
+
+    # Preprocessing
+    fast_image_preprocess: bool = False     # use torchvision resize instead of scipy exact resize
+
+    # Inference precision
+    use_autocast: bool = True               # use CUDA autocast for OWLv2 inference
 
 
 @dataclass
@@ -54,7 +69,7 @@ class FlameProposal:
     """A single detection proposal with its features."""
     box: np.ndarray              # [4] xyxy in pixel coords
     score: float                 # objectness * text similarity
-    text_similarity: float       # raw text similarity logit
+    text_similarity: float       # cosine(image embedding, text embedding), used by FLAME selection
     objectness: float
     embedding: np.ndarray        # [D] projected visual embedding
     image_idx: int               # which image this came from
@@ -100,7 +115,10 @@ class FlamePipeline:
         self._train_embeddings: Optional[np.ndarray] = None
         self._train_labels: Optional[np.ndarray] = None
         self._detection_proposals: list[FlameProposal] = []
-        self._detection_augmented_embeddings: Optional[np.ndarray] = None
+        # Cached *classifier-space* embeddings (raw visual embeddings) for the
+        # detections returned by the most recent detect() call. Used by
+        # add_feedback_labels() so feedback features match training features.
+        self._detection_classifier_embeddings: Optional[np.ndarray] = None
 
     @torch.no_grad()
     def generate_proposals(
@@ -121,71 +139,89 @@ class FlamePipeline:
         from OWLv2torch.utils.tokenizer import tokenize
 
         self.proposals = []
+        if not images:
+            return self.proposals
+
         device = next(self.model.parameters()).device
 
         token_ids = tokenize([text_query], context_length=16, truncate=True).to(device)
         attention_mask = (token_ids == 0).to(device)
 
-        for img_idx, image in enumerate(images):
-            # Preprocess
-            pixel_values = self.model.preprocess_image(image).to(device)
+        pixel_values = self.model.preprocess_image(
+            images,
+            fast=self.config.fast_image_preprocess,
+        ).to(device)
 
-            # Run detection
-            pred_logits, objectness_logits, pred_boxes, class_embeds, _ = \
+        use_autocast = self.config.use_autocast and device.type == "cuda"
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_autocast):
+            pred_logits, objectness_logits, pred_boxes, class_embeds, extras = \
                 self.model.forward_object_detection(pixel_values, token_ids, attention_mask)
+            text_embeds = extras[1]
 
-            # pred_logits: [1, P*P, 1], objectness: [1, P*P], boxes: [1, P*P, 4]
-            # class_embeds: [1, P*P, D]
-            text_scores = pred_logits[0, :, 0]             # [P*P]
-            obj_scores = torch.sigmoid(objectness_logits[0])  # [P*P]
-            combined_scores = torch.sigmoid(text_scores) * obj_scores
-
-            # Get image size for box postprocessing
-            if image_sizes is not None:
-                img_size = torch.tensor([image_sizes[img_idx]], dtype=torch.float32)
-            else:
+            if image_sizes is None:
                 from PIL import Image as PILImage
-                if isinstance(image, str):
-                    pil_img = PILImage.open(image)
-                else:
-                    pil_img = image
-                img_size = torch.tensor([[pil_img.height, pil_img.width]], dtype=torch.float32)
 
-            # Postprocess boxes to xyxy pixel coords
-            boxes_xyxy = self.model.postprocess_boxes(pred_boxes, img_size.to(device))  # [1, P*P, 4]
-            boxes_xyxy = boxes_xyxy[0]  # [P*P, 4]
+                image_sizes = []
+                for image in images:
+                    pil_img = PILImage.open(image) if isinstance(image, str) else image
+                    image_sizes.append((pil_img.height, pil_img.width))
 
-            # Filter by objectness threshold
-            mask = obj_scores > self.config.objectness_threshold
+            img_size = torch.tensor(image_sizes, dtype=torch.float32, device=device)
+            boxes_xyxy = self.model.postprocess_boxes(pred_boxes.float(), img_size)  # [B, P*P, 4]
+
+        objectness_logits = objectness_logits.float()
+        pred_logits = pred_logits.float()
+        class_embeds = class_embeds.float()
+        text_embeds = text_embeds.float()
+        obj_scores = torch.sigmoid(objectness_logits)       # [B, P*P]
+        text_scores = pred_logits[:, :, 0]                  # [B, P*P]
+        text_probs = torch.sigmoid(text_scores)
+        combined_scores = text_probs * obj_scores
+        text_cosines = torch.einsum("bpd,bd->bp", class_embeds, text_embeds[:, 0, :])
+
+        for img_idx in range(len(images)):
+            mask = (
+                (obj_scores[img_idx] > self.config.objectness_threshold)
+                & (text_probs[img_idx] >= self.config.text_score_threshold)
+            )
             indices = torch.where(mask)[0]
 
-            # Cap proposals
             if len(indices) > self.config.max_proposals_per_image:
-                topk = torch.topk(combined_scores[indices], self.config.max_proposals_per_image)
+                topk = torch.topk(
+                    combined_scores[img_idx, indices],
+                    self.config.max_proposals_per_image,
+                )
                 indices = indices[topk.indices]
 
-            embeddings = class_embeds[0]  # [P*P, D] — projected image features
+            boxes_np = boxes_xyxy[img_idx, indices].detach().cpu().numpy()
+            scores_np = combined_scores[img_idx, indices].detach().cpu().numpy()
+            text_np = text_cosines[img_idx, indices].detach().cpu().numpy()
+            obj_np = obj_scores[img_idx, indices].detach().cpu().numpy()
+            embeddings_np = class_embeds[img_idx, indices].detach().cpu().numpy()
 
-            for idx in indices:
-                i = idx.item()
+            for j, patch_idx in enumerate(indices.detach().cpu().numpy()):
                 proposal = FlameProposal(
-                    box=boxes_xyxy[i].cpu().numpy(),
-                    score=combined_scores[i].item(),
-                    text_similarity=text_scores[i].item(),
-                    objectness=obj_scores[i].item(),
-                    embedding=embeddings[i].cpu().numpy(),
+                    box=boxes_np[j],
+                    score=float(scores_np[j]),
+                    text_similarity=float(text_np[j]),
+                    objectness=float(obj_np[j]),
+                    embedding=embeddings_np[j],
                     image_idx=img_idx,
-                    patch_idx=i,
+                    patch_idx=int(patch_idx),
                 )
                 self.proposals.append(proposal)
 
-        print(f"[FLAME] Generated {len(self.proposals)} proposals from {len(images)} images")
+        if self.config.verbose:
+            print(f"[FLAME] Generated {len(self.proposals)} proposals from {len(images)} images")
         return self.proposals
 
     def _build_augmented_embeddings(self, proposals: Optional[list[FlameProposal]] = None) -> np.ndarray:
         """
-        Stage 2: Build augmented embeddings by concatenating visual embedding
-        with text similarity score.
+        Build augmented embeddings (visual embedding ⊕ text cosine similarity).
+
+        These are used **only** for the active-selection step (PCA + KDE), per
+        Algorithm 1, lines 1–4 of the paper. The classifier itself is trained
+        on raw visual embeddings — see ``_build_classifier_embeddings``.
         """
         if proposals is None:
             proposals = self.proposals
@@ -194,6 +230,19 @@ class FlamePipeline:
         text_sims = np.array([p.text_similarity for p in proposals])[:, None]  # [N, 1]
         augmented = np.concatenate([embeddings, text_sims], axis=1)      # [N, D+1]
         return augmented
+
+    def _build_classifier_embeddings(self, proposals: Optional[list[FlameProposal]] = None) -> np.ndarray:
+        """
+        Build the feature matrix used to train and query the refiner.
+
+        Per the paper's lemmas, the classifier operates on the raw visual
+        embeddings ``xi`` (not the augmented ``[xi, ci]`` used for selection).
+        Including the text-similarity scalar here would let the refiner re-fit
+        the original detector's score, defeating the purpose of correcting it.
+        """
+        if proposals is None:
+            proposals = self.proposals
+        return np.stack([p.embedding for p in proposals])  # [N, D]
 
     def select_annotation_candidates(self) -> list[int]:
         """
@@ -230,21 +279,37 @@ class FlamePipeline:
         kde.fit(projected)
         log_densities = kde.score_samples(projected)  # [N]
 
-        # Step 4: Find marginal samples (between quantile thresholds)
-        low_q = np.quantile(log_densities, cfg.marginal_quantile_low)
-        high_q = np.quantile(log_densities, cfg.marginal_quantile_high)
-        marginal_mask = (log_densities >= low_q) & (log_densities <= high_q)
+        # Step 4: Find marginal samples — the band of points whose density
+        # lies between rl*f̂(s*) and ru*f̂(s*), where s* = argmax f̂(s).
+        # Working in log-space avoids underflow: log f̂(sL) = log(rl) + log f̂(s*).
+        rl = float(cfg.marginal_density_ratio_low)
+        ru = float(cfg.marginal_density_ratio_high)
+        if not (0.0 < rl < ru < 1.0):
+            raise ValueError(
+                "marginal_density_ratio_low/high must satisfy 0 < rl < ru < 1, "
+                f"got rl={rl}, ru={ru}"
+            )
+
+        log_mode = float(log_densities.max())
+        log_lower = np.log(rl) + log_mode  # outer band edge (lower density)
+        log_upper = np.log(ru) + log_mode  # inner band edge (closer to mode)
+        marginal_mask = (log_densities >= log_lower) & (log_densities <= log_upper)
         marginal_indices = np.where(marginal_mask)[0]
 
         if len(marginal_indices) < cfg.num_clusters:
-            # Expand marginal band if too few samples
-            sorted_indices = np.argsort(log_densities)
-            n_take = min(cfg.num_clusters * 3, len(sorted_indices))
-            marginal_indices = sorted_indices[:n_take]
+            # Fallback: relax the band but still prefer points whose density is
+            # closest to the band rather than absolute outliers. Rank by
+            # distance (in log-density) to the band midpoint and take the top-N.
+            log_band_mid = 0.5 * (log_lower + log_upper)
+            dist_to_band = np.abs(log_densities - log_band_mid)
+            n_take = min(max(cfg.num_clusters * 3, cfg.num_clusters), len(log_densities))
+            marginal_indices = np.argsort(dist_to_band)[:n_take]
 
-        # Step 5: Cluster marginals for diversity, pick one per cluster
+        # Step 5: Cluster marginals for diversity in the original visual
+        # embedding space, matching Algorithm 1's k-means on X_marginal.
         n_clusters = min(cfg.num_clusters, len(marginal_indices))
-        marginal_features = projected[marginal_indices]
+        classifier_features = self._build_classifier_embeddings()
+        marginal_features = classifier_features[marginal_indices]
 
         kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
         cluster_labels = kmeans.fit_predict(marginal_features)
@@ -259,7 +324,8 @@ class FlamePipeline:
             selected.append(int(best))
 
         self._candidate_indices = selected
-        print(f"[FLAME] Selected {len(selected)} annotation candidates from {len(self.proposals)} proposals")
+        if self.config.verbose:
+            print(f"[FLAME] Selected {len(selected)} annotation candidates from {len(self.proposals)} proposals")
         return selected
 
     def get_candidate_crops(
@@ -307,8 +373,8 @@ class FlamePipeline:
             candidate_indices: indices into self.proposals
             labels: True = positive (correct detection), False = negative (false positive)
         """
-        augmented = self._build_augmented_embeddings()
-        self._append_training_samples(augmented[candidate_indices], labels)
+        classifier_features = self._build_classifier_embeddings()
+        self._append_training_samples(classifier_features[candidate_indices], labels)
         self._print_training_label_stats(len(labels), prefix="Labeled")
 
     def _append_training_samples(self, embeddings: np.ndarray, labels: list[bool] | np.ndarray):
@@ -353,7 +419,7 @@ class FlamePipeline:
                 'detection_indices' field.
             labels: True = positive (correct detection), False = negative (false positive)
         """
-        if self._detection_augmented_embeddings is None:
+        if self._detection_classifier_embeddings is None:
             raise RuntimeError("No detection feedback available. Call detect() first.")
 
         if len(detection_indices) != len(labels):
@@ -362,11 +428,11 @@ class FlamePipeline:
         if len(detection_indices) == 0:
             return
 
-        max_index = len(self._detection_augmented_embeddings) - 1
+        max_index = len(self._detection_classifier_embeddings) - 1
         if min(detection_indices) < 0 or max(detection_indices) > max_index:
             raise IndexError("detection index out of range for the most recent detect() call")
 
-        feedback_embeddings = self._detection_augmented_embeddings[detection_indices]
+        feedback_embeddings = self._detection_classifier_embeddings[detection_indices]
         self._append_training_samples(feedback_embeddings, labels)
         self._print_training_label_stats(len(labels), prefix="Added feedback labels for")
 
@@ -400,10 +466,16 @@ class FlamePipeline:
 
         # Train classifier
         if cfg.classifier_type == "svm":
+            # No probability=True: Platt-scaling on ~30 points yields an
+            # uncalibrated predict_proba that destroys ranking quality
+            # (which is what COCO mAP measures). We rank by decision_function
+            # at inference time instead — see detect().
+            # class_weight="balanced" handles label skew without resorting to
+            # SMOTE for small imbalances.
             self.refiner = SVC(
                 kernel=cfg.svm_kernel,
                 C=cfg.svm_C,
-                probability=True,
+                class_weight="balanced",
                 random_state=42,
             )
         elif cfg.classifier_type == "mlp":
@@ -418,6 +490,27 @@ class FlamePipeline:
         self.refiner.fit(X_scaled, y)
         train_acc = self.refiner.score(X_scaled, y)
         print(f"[FLAME] Trained {cfg.classifier_type} refiner — training accuracy: {train_acc:.3f}")
+
+    def _refiner_scores(self, X_scaled: np.ndarray) -> np.ndarray:
+        """
+        Map refiner outputs to a [0, 1] positive-class score.
+
+        For SVM: sigmoid(decision_function). Monotonic in the SVM's signed
+        margin, so AP ranking is identical to ranking by decision_function,
+        and a threshold of 0.5 corresponds to decision_function >= 0
+        (the SVM's natural decision boundary).
+
+        For MLP: predict_proba[:, 1].
+        """
+        if isinstance(self.refiner, SVC):
+            margins = self.refiner.decision_function(X_scaled)
+            # Numerically stable sigmoid.
+            return np.where(
+                margins >= 0,
+                1.0 / (1.0 + np.exp(-margins)),
+                np.exp(margins) / (1.0 + np.exp(margins)),
+            )
+        return self.refiner.predict_proba(X_scaled)[:, 1]
 
     @torch.no_grad()
     def detect(
@@ -447,17 +540,6 @@ class FlamePipeline:
         old_proposals = self.proposals
         proposals = self.generate_proposals(images, text_query, image_sizes)
 
-        # Build augmented embeddings
-        augmented = self._build_augmented_embeddings(proposals)
-        X_scaled = self._refiner_scaler.transform(augmented)
-
-        # Classify
-        refiner_probs = self.refiner.predict_proba(X_scaled)[:, 1]  # P(positive)
-
-        self._detection_proposals = []
-        self._detection_augmented_embeddings = []
-
-        # Group results by image
         num_images = len(images)
         results = [
             {
@@ -470,6 +552,38 @@ class FlamePipeline:
             for _ in range(num_images)
         ]
 
+        # Short-circuit: if no proposals survived objectness filtering across
+        # the whole batch there's nothing to classify (and ``np.stack([])``
+        # would otherwise blow up inside the feature builder).
+        if not proposals:
+            self._detection_proposals = []
+            self._detection_classifier_embeddings = None
+            for r in results:
+                r["boxes"] = np.zeros((0, 4))
+                r["scores"] = np.zeros(0)
+                r["refiner_scores"] = np.zeros(0)
+                r["proposal_indices"] = np.zeros(0, dtype=np.int32)
+                r["detection_indices"] = np.zeros(0, dtype=np.int32)
+            self.proposals = old_proposals
+            if self.config.verbose:
+                print(f"[FLAME] Refined: 0/0 proposals kept across {num_images} images")
+            return results
+
+        # Build classifier features (raw visual embeddings — must match training)
+        classifier_features = self._build_classifier_embeddings(proposals)
+        X_scaled = self._refiner_scaler.transform(classifier_features)
+
+        # Score proposals. For SVM we deliberately avoid predict_proba (Platt
+        # scaling on ~30 points is unreliable) and instead pass the signed
+        # margin through a sigmoid: this preserves the SVM's ranking — what
+        # COCO mAP actually evaluates — and yields a [0, 1] score that
+        # composes cleanly with the original detector score (e.g. via
+        # `--score-combine product`). MLP keeps predict_proba.
+        refiner_probs = self._refiner_scores(X_scaled)
+
+        self._detection_proposals = []
+        kept_features: list[np.ndarray] = []
+
         for i, (proposal, prob) in enumerate(zip(proposals, refiner_probs)):
             if prob >= self.config.classifier_threshold:
                 r = results[proposal.image_idx]
@@ -480,12 +594,12 @@ class FlamePipeline:
                 r["proposal_indices"].append(i)
                 r["detection_indices"].append(detection_idx)
                 self._detection_proposals.append(proposal)
-                self._detection_augmented_embeddings.append(augmented[i])
+                kept_features.append(classifier_features[i])
 
-        if self._detection_augmented_embeddings:
-            self._detection_augmented_embeddings = np.stack(self._detection_augmented_embeddings)
+        if kept_features:
+            self._detection_classifier_embeddings = np.stack(kept_features)
         else:
-            self._detection_augmented_embeddings = None
+            self._detection_classifier_embeddings = None
 
         # Convert to arrays
         for r in results:
@@ -507,7 +621,8 @@ class FlamePipeline:
 
         total_detections = sum(len(r["boxes"]) for r in results)
         total_proposals = len(proposals)
-        print(f"[FLAME] Refined: {total_detections}/{total_proposals} proposals kept across {num_images} images")
+        if self.config.verbose:
+            print(f"[FLAME] Refined: {total_detections}/{total_proposals} proposals kept across {num_images} images")
 
         return results
 
@@ -540,5 +655,5 @@ class FlamePipeline:
         self._train_embeddings = state.get("train_embeddings")
         self._train_labels = state.get("train_labels")
         self._detection_proposals = []
-        self._detection_augmented_embeddings = None
+        self._detection_classifier_embeddings = None
         print(f"[FLAME] Loaded refiner from {path}")
