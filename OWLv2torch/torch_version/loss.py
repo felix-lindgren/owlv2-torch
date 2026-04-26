@@ -154,15 +154,16 @@ def build_proto_targets(proto_bank: VisualPrototypeBank, labels: torch.Tensor) -
 
 
 def _hard_negative_indices(
-    proto_logits: torch.Tensor,
+    class_logits: torch.Tensor,
+    objectness_logits: torch.Tensor,
     matched_indices: torch.Tensor,
     num_positives: int,
     negative_ratio: int,
     max_negatives: int,
 ) -> torch.Tensor:
-    """Select unmatched patch indices with the highest prototype scores."""
-    Q = proto_logits.shape[0]
-    device = proto_logits.device
+    """Select unmatched patch indices with the highest detection scores."""
+    Q = class_logits.shape[0]
+    device = class_logits.device
 
     neg_mask = torch.ones(Q, dtype=torch.bool, device=device)
     if matched_indices.numel():
@@ -181,9 +182,28 @@ def _hard_negative_indices(
     if limit <= 0:
         return neg_indices[:0]
 
-    scores = proto_logits[neg_indices].detach().max(dim=-1).values
-    hard_order = torch.topk(scores, k=limit).indices
+    with torch.no_grad():
+        class_scores = torch.sigmoid(class_logits[neg_indices].float()).max(dim=-1).values
+        obj_scores = torch.sigmoid(objectness_logits[neg_indices].float())
+        scores = class_scores * obj_scores
+    hard_order = torch.topk(scores, k=limit, sorted=True).indices
     return neg_indices[hard_order]
+
+
+def _objectness_loss(
+    objectness_logits: torch.Tensor,
+    positive_indices: torch.Tensor,
+    negative_indices: torch.Tensor,
+) -> torch.Tensor | None:
+    """BCE over positives plus mined negatives, instead of every easy background patch."""
+    if positive_indices.numel() == 0 and negative_indices.numel() == 0:
+        return None
+
+    selected = torch.cat([positive_indices, negative_indices])
+    targets = torch.zeros(selected.shape[0], device=objectness_logits.device, dtype=objectness_logits.dtype)
+    if positive_indices.numel():
+        targets[:positive_indices.numel()] = 1.0
+    return F.binary_cross_entropy_with_logits(objectness_logits[selected], targets)
 
 
 def compute_losses(outputs, targets, bank: VisualPrototypeBank,
@@ -217,7 +237,8 @@ def compute_losses(outputs, targets, bank: VisualPrototypeBank,
         idx_q, idx_g = indices[b]
         if len(idx_q) == 0:
             idx_neg = _hard_negative_indices(
-                proto_logits[b],
+                class_logits[b],
+                objectness_logits[b],
                 idx_q,
                 num_positives=0,
                 negative_ratio=negative_ratio,
@@ -235,8 +256,9 @@ def compute_losses(outputs, targets, bank: VisualPrototypeBank,
                     )
                 )
             if use_objectness:
-                obj_target = torch.zeros_like(objectness_logits[b])
-                obj_losses.append(F.binary_cross_entropy_with_logits(objectness_logits[b], obj_target))
+                obj_loss = _objectness_loss(objectness_logits[b], idx_q, idx_neg)
+                if obj_loss is not None:
+                    obj_losses.append(obj_loss)
             continue
 
         # Gather matched predictions
@@ -255,7 +277,8 @@ def compute_losses(outputs, targets, bank: VisualPrototypeBank,
         cls_pos_losses.append(sigmoid_focal_loss(pl, Y_proto, alpha=0.25, gamma=2.0, reduction="mean"))
 
         idx_neg = _hard_negative_indices(
-            proto_logits[b],
+            class_logits[b],
+            objectness_logits[b],
             idx_q,
             num_positives=len(idx_q),
             negative_ratio=negative_ratio,
@@ -285,9 +308,9 @@ def compute_losses(outputs, targets, bank: VisualPrototypeBank,
             giou_losses.append(1.0 - giou.diag().mean())
         # Objectness (optional): positives at matched indices, negatives otherwise
         if use_objectness:
-            obj_t = torch.zeros_like(ob)
-            obj_t[idx_q] = 1.0
-            obj_losses.append(F.binary_cross_entropy_with_logits(ob, obj_t))
+            obj_loss = _objectness_loss(ob, idx_q, idx_neg)
+            if obj_loss is not None:
+                obj_losses.append(obj_loss)
 
     L_cls_pos = torch.stack(cls_pos_losses).mean() if cls_pos_losses else torch.tensor(0.0, device=pred_boxes.device)
     L_cls_neg = torch.stack(cls_neg_losses).mean() if cls_neg_losses else torch.tensor(0.0, device=pred_boxes.device)
