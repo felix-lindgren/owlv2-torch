@@ -10,7 +10,7 @@ import onnx
 from onnxsim import simplify
 from safetensors import safe_open
 
-from owlv2 import OwlV2
+from OWLv2torch.torch_version.owlv2 import OwlV2
 
 
 def load_weights(path: str) -> dict:
@@ -24,16 +24,12 @@ def load_weights(path: str) -> dict:
     return state_dict
 
 
-def main(
-    weights_path: str = "weights/model.safetensors",
-    onnx_path: str = "owlv2_vis.onnx",
-    image_size: int = 960,
+def export_vision_tower(
+    vision_model: torch.nn.Module,
+    onnx_path: str,
+    image_size: int,
 ):
-    model = OwlV2()
-    model.eval()
-    model.load_state_dict(load_weights(weights_path))
-    vision_model = model.vision_model
-
+    vision_model.eval()
     dummy_input = torch.rand(1, 3, image_size, image_size)
     torch.onnx.export(
         vision_model,
@@ -57,6 +53,18 @@ def main(
         onnx.save_model(onnx_model, onnx_path)
     else:
         onnx.save_model(model_simp, onnx_path)
+
+
+def main(
+    weights_path: str = "weights/model.safetensors",
+    onnx_path: str = "owlv2_vis.onnx",
+    image_size: int = 960,
+    model_type: str = "base",
+):
+    del weights_path  # Weights are loaded by OwlV2 from the HuggingFace cache.
+    model = OwlV2(model_type=model_type)
+    model.eval()
+    export_vision_tower(model.vision_model, onnx_path, image_size)
 
 
 if __name__ == "__main__":

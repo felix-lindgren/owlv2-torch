@@ -27,6 +27,13 @@ Or for development:
 pip install -e ".[dev]"
 ```
 
+Install TensorRT support when you want to build and run the accelerated vision
+tower:
+
+```bash
+pip install -e ".[trt]"
+```
+
 ## Quick Start
 
 ### Text-conditioned detection
@@ -59,6 +66,19 @@ probs = torch.max(pred_logits, dim=-1)
 scores = torch.sigmoid(probs.values)
 labels = probs.indices
 ```
+
+### TensorRT vision tower
+
+```python
+from OWLv2torch import OwlV2TRT
+
+model = OwlV2TRT(output_dir=".")
+```
+
+When no paths are supplied, the TensorRT variant writes
+`owlv2_vis_base.onnx` and `owlv2_vis_base.engine` in the current directory if
+the engine is missing. Use `output_dir="artifacts"` to place both files in a
+different folder, or pass `onnx_path` / `engine_path` for exact filenames.
 
 ### Prototype-based detection
 

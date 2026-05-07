@@ -31,6 +31,9 @@ dependencies = [
     "open-clip-torch>=3.3.0",
     "datasets>=4.8.4",
     "imbalanced-learn>=0.14.1",
+    "onnxsim>=0.6.3",
+    "onnxruntime>=1.24.3",
+    "onnxscript>=0.7.0",
 ]
 
 [project.optional-dependencies]

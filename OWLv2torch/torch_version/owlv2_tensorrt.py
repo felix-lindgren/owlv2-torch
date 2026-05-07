@@ -12,6 +12,7 @@ explicit ``cudaStreamSynchronize`` — CPU sync only happens when the caller
 actually pulls data back to host (``.cpu()``, ``.item()``, etc.).
 """
 
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -27,7 +28,6 @@ try:
 except ImportError:  # pragma: no cover - optional dep
     trt = None
     TRT_AVAILABLE = False
-
 
 timer = Timer()
 
@@ -120,18 +120,86 @@ else:  # pragma: no cover - only hit when tensorrt isn't installed
 class OwlV2TRT(OwlV2):
     """OWLv2 variant that runs the vision tower with TensorRT when available."""
 
-    def __init__(self, engine_path):
-        super().__init__()
-        self.engine_path = engine_path
+    def __init__(
+        self,
+        engine_path: str | Path | None = None,
+        *,
+        onnx_path: str | Path | None = None,
+        output_dir: str | Path = ".",
+        model_type: str = "base",
+        build_missing: bool = True,
+        min_batch: int = 1,
+        opt_batch: int = 1,
+        max_batch: int = 8,
+        workspace_gb: int = 8,
+        fp16: bool = True,
+    ):
+        self.output_dir = Path(output_dir)
+        artifact_stem = f"owlv2_vis_{model_type}"
+        self.engine_path = self._artifact_path(
+            engine_path, self.output_dir / f"{artifact_stem}.engine"
+        )
+        self.onnx_path = self._artifact_path(
+            onnx_path,
+            self.engine_path.with_suffix(".onnx")
+            if engine_path is not None
+            else self.output_dir / f"{artifact_stem}.onnx",
+        )
+        self.build_missing = build_missing
+        self.engine_build_kwargs = {
+            "min_batch": min_batch,
+            "opt_batch": opt_batch,
+            "max_batch": max_batch,
+            "workspace_gb": workspace_gb,
+            "fp16": fp16,
+        }
         self.trt = None
+        super().__init__(model_type=model_type)
 
-    def load_model(self, model_path):
-        super().load_model(model_path)
+    @staticmethod
+    def _artifact_path(path: str | Path | None, default: Path) -> Path:
+        return Path(path) if path is not None else default
+
+    def _ensure_artifacts(self):
+        if self.engine_path.exists():
+            return
+
+        self.onnx_path.parent.mkdir(parents=True, exist_ok=True)
+        self.engine_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if not self.onnx_path.exists():
+            from OWLv2torch.torch_version.export import export_vision_tower
+
+            print(f"Exporting OWLv2 vision ONNX to {self.onnx_path}")
+            export_vision_tower(self.vision_model, str(self.onnx_path), self.image_size)
+
+        if not TRT_AVAILABLE:
+            print("TensorRT is not installed; ONNX was exported but engine build was skipped.")
+            return
+        if not torch.cuda.is_available():
+            print("CUDA is not available; ONNX was exported but engine build was skipped.")
+            return
+
+        from OWLv2torch.torch_version.build_engine import build_engine
+
+        print(f"Building OWLv2 TensorRT engine to {self.engine_path}")
+        build_engine(
+            onnx_file_path=str(self.onnx_path),
+            engine_file_path=str(self.engine_path),
+            image_size=self.image_size,
+            **self.engine_build_kwargs,
+        )
+
+    def _load_model(self, model_path):
+        super()._load_model(model_path)
+
+        if self.build_missing:
+            self._ensure_artifacts()
 
         engine_ready = (
             TRT_AVAILABLE
             and torch.cuda.is_available()
-            and Path(self.engine_path).exists()
+            and self.engine_path.exists()
         )
         if engine_ready:
             self.trt = TRTRunner(
@@ -169,14 +237,45 @@ class OwlV2TRT(OwlV2):
         return vision_features, vision_pooled, vision_full
 
 
-if __name__ == "__main__":
-    engine_path = "owlv2_vis.engine"
-    img = Image.open("img.jpg")
-    img_array = np.array(img.resize((960, 960)))
-    inputs = img_array.transpose(2, 0, 1)  # (3, 960, 960)
+def _parse_args():
+    p = argparse.ArgumentParser(description="Run OWLv2 with an optional TensorRT vision tower.")
+    p.add_argument("--output-dir", default=".")
+    p.add_argument("--onnx", default=None)
+    p.add_argument("--engine", default=None)
+    p.add_argument("--model-type", default="base", choices=["base", "large"])
+    p.add_argument("--image", default="img.jpg")
+    p.add_argument("--min-batch", type=int, default=1)
+    p.add_argument("--opt-batch", type=int, default=1)
+    p.add_argument("--max-batch", type=int, default=8)
+    p.add_argument("--workspace-gb", type=int, default=8)
+    p.add_argument("--no-fp16", action="store_true")
+    p.add_argument("--no-build", action="store_true")
+    return p.parse_args()
 
-    model = OwlV2TRT(engine_path)
-    model.load_model("weights/model.safetensors")
+
+if __name__ == "__main__":
+    args = _parse_args()
+    model = OwlV2TRT(
+        engine_path=args.engine,
+        onnx_path=args.onnx,
+        output_dir=args.output_dir,
+        model_type=args.model_type,
+        build_missing=not args.no_build,
+        min_batch=args.min_batch,
+        opt_batch=args.opt_batch,
+        max_batch=args.max_batch,
+        workspace_gb=args.workspace_gb,
+        fp16=not args.no_fp16,
+    )
+
+    if not Path(args.image).exists():
+        print(f"No image found at {args.image}; artifact setup is complete.")
+        raise SystemExit(0)
+
+    img = Image.open(args.image)
+    img_array = np.array(img.resize((model.image_size, model.image_size)))
+    inputs = img_array.transpose(2, 0, 1)  # (3, H, W)
+
     model.eval()
     model.cuda()
     print(inputs.shape, inputs.dtype)
