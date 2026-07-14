@@ -343,13 +343,13 @@ class OwlV2(nn.Module):
 
         logit_scale = getattr(self.model, "logit_scale", None)
         scale = logit_scale.exp() if logit_scale is not None else 1.0
-        logits_per_text = torch.matmul(vision_features, text_features.t()) * scale
+        logits_per_image = torch.matmul(vision_features, text_features.t()) * scale
 
         logit_bias = getattr(self.model, "logit_bias", None)
         if logit_bias is not None:
-            logits_per_text = logits_per_text + logit_bias
+            logits_per_image = logits_per_image + logit_bias
 
-        logits_per_image = logits_per_text.t()
+        logits_per_text = logits_per_image.t()
         return logits_per_image, logits_per_text, vision_features, text_features, vision_full
 
     @staticmethod
@@ -388,8 +388,12 @@ class OwlV2(nn.Module):
 
     def forward_object_detection(self, pixel_values, token_ids, attention_mask=None):
         batch_size = pixel_values.shape[0]
+        shared_queries = token_ids.ndim == 2
         token_ids, attention_mask, max_text_queries = normalize_detection_queries(
-            token_ids, attention_mask, batch_size
+            token_ids,
+            attention_mask,
+            batch_size,
+            repeat_shared=False,
         )
 
         vision_full = self.openclip.dense_image_tokens(pixel_values)
@@ -412,8 +416,14 @@ class OwlV2(nn.Module):
         batch_size, num_patches, num_patches, hidden_dim = feature_map.shape
         image_feats = torch.reshape(feature_map, (batch_size, num_patches * num_patches, hidden_dim))
 
-        text_features = text_features.reshape(batch_size, max_text_queries, text_features.shape[-1])
-        token_ids = token_ids.reshape(batch_size, max_text_queries, token_ids.shape[-1])
+        if shared_queries:
+            text_features = text_features.unsqueeze(0).expand(batch_size, -1, -1)
+            token_ids = token_ids.unsqueeze(0).expand(batch_size, -1, -1)
+        else:
+            text_features = text_features.reshape(
+                batch_size, max_text_queries, text_features.shape[-1]
+            )
+            token_ids = token_ids.reshape(batch_size, max_text_queries, token_ids.shape[-1])
         query_mask = token_ids[..., 0] > 0
 
         pred_logits, class_embeds = self.class_head(image_feats, text_features, query_mask)
@@ -425,53 +435,53 @@ class OwlV2(nn.Module):
 
     def postprocess_boxes(self, boxes, image_size, compensate_padding=True):
         if isinstance(image_size, (list, tuple)):
-            image_height = torch.tensor([i[0] for i in image_size])
-            image_width = torch.tensor([i[1] for i in image_size])
+            target_sizes = torch.as_tensor(
+                image_size, device=boxes.device, dtype=boxes.dtype
+            )
         elif isinstance(image_size, torch.Tensor):
-            image_height, image_width = image_size.unbind(1)
+            target_sizes = image_size.to(device=boxes.device, dtype=boxes.dtype)
         else:
             raise ValueError("`target_sizes` must be a list, tuple or torch.Tensor")
 
+        if target_sizes.ndim != 2 or target_sizes.shape[1] != 2:
+            raise ValueError(
+                "`target_sizes` must have shape [batch_size, 2] as (height, width), "
+                f"got {tuple(target_sizes.shape)}"
+            )
+        if target_sizes.shape[0] != boxes.shape[0]:
+            raise ValueError(
+                f"target size batch {target_sizes.shape[0]} does not match box batch "
+                f"{boxes.shape[0]}"
+            )
+        image_height, image_width = target_sizes.unbind(1)
+
         center_x, center_y, width, height = boxes.unbind(-1)
-        boxes = torch.stack(
-            [
-                center_x - 0.5 * width,
-                center_y - 0.5 * height,
-                center_x + 0.5 * width,
-                center_y + 0.5 * height,
-            ],
-            dim=-1,
+        x_coords = torch.stack(
+            (center_x - 0.5 * width, center_x + 0.5 * width), dim=-1
+        )
+        y_coords = torch.stack(
+            (center_y - 0.5 * height, center_y + 0.5 * height), dim=-1
         )
 
         if compensate_padding:
-            hl = image_height > image_width
-            wl = image_width > image_height
             eps = torch.finfo(boxes.dtype).eps
+            height_larger = (image_height > image_width).view(-1, 1, 1)
+            width_larger = (image_width > image_height).view(-1, 1, 1)
+            x_factor = (image_width / image_height.clamp_min(eps)).view(-1, 1, 1)
+            y_factor = (image_height / image_width.clamp_min(eps)).view(-1, 1, 1)
+            x_factor = x_factor.clamp_min(eps)
+            y_factor = y_factor.clamp_min(eps)
 
-            if hl.any():
-                clip_factor = (
-                    (image_width[hl] / image_height[hl])
-                    .to(device=boxes.device, dtype=boxes.dtype)
-                    .view(-1, 1, 1)
-                    .clamp_min(eps)
-                )
-                boxes[hl, :, 0:4:2] = torch.clamp(
-                    boxes[hl, :, 0:4:2], torch.tensor(0.0, device=boxes.device), clip_factor
-                )
-                boxes[hl, :, 0:4:2] = boxes[hl, :, 0:4:2] / clip_factor
+            compensated_x = torch.minimum(x_coords.clamp_min(0), x_factor) / x_factor
+            compensated_y = torch.minimum(y_coords.clamp_min(0), y_factor) / y_factor
+            x_coords = torch.where(height_larger, compensated_x, x_coords)
+            y_coords = torch.where(width_larger, compensated_y, y_coords)
 
-            if wl.any():
-                clip_factor = (
-                    (image_height[wl] / image_width[wl])
-                    .to(device=boxes.device, dtype=boxes.dtype)
-                    .view(-1, 1, 1)
-                    .clamp_min(eps)
-                )
-                boxes[wl, :, 1:4:2] = torch.clamp(
-                    boxes[wl, :, 1:4:2], torch.tensor(0.0, device=boxes.device), clip_factor
-                )
-                boxes[wl, :, 1:4:2] = boxes[wl, :, 1:4:2] / clip_factor
-
-        scale_factor = torch.stack([image_width, image_height, image_width, image_height], dim=1)
-        scale_factor = scale_factor.unsqueeze(1).to(boxes.device)
-        return boxes * scale_factor
+        boxes_xyxy = torch.stack(
+            (x_coords[..., 0], y_coords[..., 0], x_coords[..., 1], y_coords[..., 1]),
+            dim=-1,
+        )
+        scale_factor = torch.stack(
+            (image_width, image_height, image_width, image_height), dim=1
+        ).unsqueeze(1)
+        return boxes_xyxy * scale_factor

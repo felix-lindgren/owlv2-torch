@@ -224,17 +224,10 @@ class OwlV2TRT(OwlV2):
             )
         return pooled_output, full_vision
 
-    def get_vision_features(self, pixel_values, normalize=True):
+    def _get_vision_outputs(self, pixel_values):
         if self.trt is not None:
-            vision_pooled, vision_full = self.trt_inference(pixel_values)
-        else:
-            vision_pooled, vision_full = self.vision_model(pixel_values)
-        vision_features = self.visual_projection(vision_pooled)
-        if normalize:
-            vision_features = vision_features / (
-                torch.linalg.norm(vision_features, dim=-1, keepdim=True) + 1e-6
-            )
-        return vision_features, vision_pooled, vision_full
+            return self.trt_inference(pixel_values)
+        return self.vision_model(pixel_values)
 
 
 def _parse_args():

@@ -267,8 +267,10 @@ def compute_losses(outputs, targets, bank: VisualPrototypeBank,
         pl = proto_logits[b][idx_q]        # [M, C*K]
         ob = objectness_logits[b]
 
-        gt_boxes = targets[b]["boxes"].to(pb.device)      # [M,4]
-        gt_labels = targets[b]["labels"].long().to(cb.device)  # [M]
+        # Hungarian matching can permute the targets. Keep boxes and labels aligned
+        # with idx_q instead of accidentally supervising against the original order.
+        gt_boxes = targets[b]["boxes"].to(pb.device)[idx_g]  # [M,4]
+        gt_labels = targets[b]["labels"].long().to(cb.device)[idx_g]  # [M]
 
         # Prototype multi-label targets for classification
         Y_proto = build_proto_targets(bank, gt_labels)    # [M, C*K]

@@ -2864,9 +2864,9 @@ requires-dist = [
     { name = "safetensors", specifier = ">=0.5.3" },
     { name = "scipy", specifier = ">=1.7.3" },
     { name = "tensorrt", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'trt') or (platform_machine == 'x86_64' and sys_platform == 'win32' and extra == 'trt')", specifier = ">=10.0.0", index = "https://pypi.nvidia.com/" },
-    { name = "torch", specifier = ">=1.13.1" },
+    { name = "torch", specifier = ">=2.1.0" },
     { name = "torchmetrics", marker = "extra == 'train'", specifier = ">=0.11.4" },
-    { name = "torchvision", specifier = ">=0.14.1" },
+    { name = "torchvision", specifier = ">=0.16.0" },
     { name = "transformers", specifier = ">=4.30.2" },
 ]
 provides-extras = ["train", "dev", "trt"]

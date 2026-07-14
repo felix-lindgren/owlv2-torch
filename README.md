@@ -67,6 +67,25 @@ scores = torch.sigmoid(probs.values)
 labels = probs.indices
 ```
 
+For a fixed query set used across many image batches, encode the text once and
+reuse the projected embeddings:
+
+```python
+with torch.inference_mode():
+    query_embeds, query_mask = model.encode_detection_queries(
+        token_ids, attention_mask
+    )
+
+    for pixel_batch in image_batches:
+        outputs = model.forward_object_detection_from_embeddings(
+            pixel_batch, query_embeds, query_mask
+        )
+```
+
+Two-dimensional token tensors are treated as queries shared by every image.
+Use `[batch_size, num_queries, sequence_length]` token tensors when each image
+has a different query set.
+
 ### TensorRT vision tower
 
 ```python

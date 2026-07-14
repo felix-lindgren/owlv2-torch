@@ -7,15 +7,21 @@ def normalize_detection_queries(
     token_ids: torch.Tensor,
     attention_mask: Optional[torch.Tensor],
     batch_size: int,
+    *,
+    repeat_shared: bool = True,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], int]:
     """
-    Normalize detection queries to the flattened [batch_size * num_queries, seq_len]
-    layout expected by the OWLv2 detection heads.
+    Normalize detection-query layout and optionally flatten/repeat it to
+    ``[batch_size * num_queries, seq_len]``.
 
-    A 2D query tensor whose first dimension is not divisible by batch_size is treated
-    as a shared query set and repeated for each image in the batch. Callers with an
-    explicitly batched query tensor can pass [batch_size, num_queries, seq_len] to
-    avoid ambiguity when a shared query count is divisible by batch_size.
+    A 2D query tensor is always a shared query set. A 3D query tensor is always an
+    explicitly batched query set. This avoids silently interpreting shared queries
+    as per-image queries when ``num_queries`` happens to be divisible by
+    ``batch_size``.
+
+    Set ``repeat_shared=False`` when shared queries will be encoded once and the
+    resulting embeddings expanded across the image batch. The default retains the
+    flattened output layout for lower-level callers.
     """
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
@@ -48,20 +54,28 @@ def normalize_detection_queries(
             attention_mask = attention_mask.reshape(batch_size * num_queries, token_ids.shape[-1])
         return token_ids.reshape(batch_size * num_queries, token_ids.shape[-1]), attention_mask, num_queries
 
-    if attention_mask is not None and attention_mask.shape != token_ids.shape:
-        raise ValueError(
-            f"attention_mask shape {tuple(attention_mask.shape)} does not match "
-            f"token_ids shape {tuple(token_ids.shape)}"
+    if attention_mask is not None:
+        same_token_shape = (
+            attention_mask.ndim == 2 and attention_mask.shape == token_ids.shape
         )
+        additive_attention_shape = (
+            attention_mask.ndim >= 3
+            and attention_mask.shape[0] == token_ids.shape[0]
+            and attention_mask.shape[-2:] == (token_ids.shape[1], token_ids.shape[1])
+        )
+        if not same_token_shape and not additive_attention_shape:
+            raise ValueError(
+                f"attention_mask shape {tuple(attention_mask.shape)} is incompatible "
+                f"with token_ids shape {tuple(token_ids.shape)}"
+            )
 
     num_query_rows = token_ids.shape[0]
     if num_query_rows == 0:
         raise ValueError("token_ids must contain at least one query")
 
-    if num_query_rows % batch_size == 0:
-        return token_ids, attention_mask, num_query_rows // batch_size
-
-    token_ids = token_ids.repeat(batch_size, 1)
-    if attention_mask is not None:
-        attention_mask = attention_mask.repeat(batch_size, 1)
+    if repeat_shared:
+        token_ids = token_ids.repeat(batch_size, 1)
+        if attention_mask is not None:
+            repeats = (batch_size,) + (1,) * (attention_mask.ndim - 1)
+            attention_mask = attention_mask.repeat(repeats)
     return token_ids, attention_mask, num_query_rows

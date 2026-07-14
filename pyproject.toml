@@ -20,8 +20,8 @@ version = "0.1"
 dependencies = [
     "ftfy",
     "EzLogger @ git+https://github.com/felix-lindgren/Logging",
-    "torch>=1.13.1",
-    "torchvision>=0.14.1",
+    "torch>=2.1.0",
+    "torchvision>=0.16.0",
     "safetensors>=0.5.3",
     "huggingface-hub>=0.16.4",
     "regex>=2024.4.16",

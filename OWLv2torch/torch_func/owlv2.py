@@ -44,9 +44,10 @@ def process_sequences(sequences: list[list[int]], start_pos: int = 0, default_ma
 
 def attention(x: torch.Tensor, layer_weights: LayerWeights, model_params, attn_mask = None):
     bsz, _, _ = x.shape
-    xq = F.linear(x, layer_weights.wq, bias=layer_weights.wq_b).view(bsz, -1 ,model_params.n_heads, model_params.head_dim).transpose(1,2).contiguous()
-    xk = F.linear(x, layer_weights.wk, bias=layer_weights.wk_b).view(bsz, -1 ,model_params.n_heads, model_params.head_dim).transpose(1,2).contiguous()
-    xv = F.linear(x, layer_weights.wv, bias=layer_weights.wv_b).view(bsz, -1 ,model_params.n_heads, model_params.head_dim).transpose(1,2).contiguous()
+    head_shape = (bsz, -1, model_params.n_heads, model_params.head_dim)
+    xq = F.linear(x, layer_weights.wq, bias=layer_weights.wq_b).view(head_shape).transpose(1, 2)
+    xk = F.linear(x, layer_weights.wk, bias=layer_weights.wk_b).view(head_shape).transpose(1, 2)
+    xv = F.linear(x, layer_weights.wv, bias=layer_weights.wv_b).view(head_shape).transpose(1, 2)
     output = torch.nn.functional.scaled_dot_product_attention(
         xq,
         xk,
@@ -145,7 +146,13 @@ def compute_box_bias(num_patches: int) -> torch.Tensor:
 
 def text_obj_det(token_ids, attn_mask, pixel_values, w, model_params):
     batch_size = pixel_values.shape[0]
-    token_ids, attn_mask, max_text_queries = normalize_detection_queries(token_ids, attn_mask, batch_size)
+    shared_queries = token_ids.ndim == 2
+    token_ids, attn_mask, max_text_queries = normalize_detection_queries(
+        token_ids,
+        attn_mask,
+        batch_size,
+        repeat_shared=False,
+    )
 
     # Encode vision and text
     with timer("encode", gpu=True):
@@ -168,8 +175,12 @@ def text_obj_det(token_ids, attn_mask, pixel_values, w, model_params):
     image_feats = feature_map.reshape(new_size).reshape(batch_size, -1, feature_map.shape[-1])
 
     # Reshape text features
-    text_features = text_features.reshape(batch_size, max_text_queries, -1)
-    token_ids = token_ids.reshape(batch_size, max_text_queries, -1)
+    if shared_queries:
+        text_features = text_features.unsqueeze(0).expand(batch_size, -1, -1)
+        token_ids = token_ids.unsqueeze(0).expand(batch_size, -1, -1)
+    else:
+        text_features = text_features.reshape(batch_size, max_text_queries, -1)
+        token_ids = token_ids.reshape(batch_size, max_text_queries, -1)
     query_mask = token_ids[..., 0] > 0
     
     # Predict classes, objectness, and boxes
