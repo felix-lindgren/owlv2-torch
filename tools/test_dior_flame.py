@@ -12,15 +12,21 @@ Pipeline per target class:
     6. Run the refiner on the test split, collect (box, refiner_score)
        triples, optionally NMS, and feed them into a single COCO eval.
 
-The script also runs the matching zero-shot baseline on the same test images
-so the FLAME delta is visible in one report.
+By default, the script also runs the matching zero-shot baseline on the same
+test images so the FLAME delta is visible in one report.
 
 Usage:
     python tools/test_dior_flame.py --model-size large --shots 30 \
         --support-images 8 --limit 200 --classes ship harbor
 
+Add ``--skip-zero-shot`` when only the FLAME training/evaluation result is
+needed and the matching zero-shot baseline would be unnecessary work.
+
 Requires the ``train`` extras (``pip install -e ".[train]"``) for
 ``faster-coco-eval`` plus ``scikit-learn`` (already a FLAME dep).
+
+The same driver also backs ``tools/test_fashionpedia_flame.py``. Fashionpedia
+uses its ``train`` split for support images and ``val`` for evaluation.
 """
 
 from __future__ import annotations
@@ -41,13 +47,36 @@ from OWLv2torch import OwlV2, tokenize
 from OWLv2torch.torch_version.flame import FlameConfig, FlamePipeline
 
 
+DATASET_SPECS = {
+    "dior": {
+        "dataset_id": "HichTala/dior",
+        "display_name": "DIOR",
+        "train_split": "train",
+        "eval_split": "test",
+        "bbox_format": "xywh",
+        "query_template": "a satellite photo of a {name}",
+    },
+    "fashionpedia": {
+        "dataset_id": "detection-datasets/fashionpedia",
+        "display_name": "Fashionpedia",
+        "train_split": "train",
+        "eval_split": "val",
+        "bbox_format": "xyxy",
+        "query_template": "a photo of {name}",
+    },
+}
+
+
 # ---------------------------------------------------------------------------
 # Helpers (mirrors tools/test_dior.py so the two reports are comparable).
 # ---------------------------------------------------------------------------
-def class_name_to_query(name: str) -> str:
-    """Convert DIOR class names like ``"Expressway service area"`` to a prompt."""
+def class_name_to_query(
+    name: str,
+    template: str = DATASET_SPECS["dior"]["query_template"],
+) -> str:
+    """Convert a dataset class name to an OWLv2 text prompt."""
     cleaned = name.strip().lower().replace("-", " ").replace("_", " ")
-    return f"a satellite photo of a {cleaned}"
+    return template.format(name=cleaned)
 
 
 INF = float("inf")
@@ -61,11 +90,34 @@ AREA_RANGES: list[tuple[str, tuple[float, float]]] = [
 ]
 
 
-def build_coco_gt(dataset, class_names: list[str]) -> dict:
-    """Convert an HF DIOR split into a COCO-format dict (matches test_dior.py)."""
+def bbox_to_xywh(
+    bbox: list[float] | tuple[float, float, float, float],
+    bbox_format: str,
+) -> tuple[float, float, float, float]:
+    """Normalize a COCO ``xywh`` or Pascal VOC ``xyxy`` box to ``xywh``."""
+    x1, y1, third, fourth = [float(v) for v in bbox]
+    if bbox_format == "xywh":
+        return x1, y1, third, fourth
+    if bbox_format == "xyxy":
+        return x1, y1, max(0.0, third - x1), max(0.0, fourth - y1)
+    raise ValueError(f"Unknown bbox format: {bbox_format}")
+
+
+def build_coco_gt(
+    dataset,
+    class_names: list[str],
+    bbox_format: str = "xywh",
+    description: str = "DIOR test set (HichTala/dior) — FLAME few-shot",
+) -> dict:
+    """Convert a Hugging Face detection split into a COCO-format dict."""
     images, annotations = [], []
     ann_id = 1
-    for sample in dataset:
+    metadata = (
+        dataset.remove_columns("image")
+        if hasattr(dataset, "column_names") and "image" in dataset.column_names
+        else dataset
+    )
+    for sample in metadata:
         img_id = int(sample["image_id"])
         images.append({
             "id": img_id,
@@ -77,7 +129,9 @@ def build_coco_gt(dataset, class_names: list[str]) -> dict:
         cats = sample["objects"]["category"]
         areas = sample["objects"].get("area")
         for i, (bbox, cat) in enumerate(zip(bboxes, cats)):
-            x, y, w, h = [float(v) for v in bbox]
+            x, y, w, h = bbox_to_xywh(bbox, bbox_format)
+            if w <= 0.0 or h <= 0.0:
+                continue
             area = float(areas[i]) if areas is not None else w * h
             annotations.append({
                 "id": ann_id,
@@ -90,7 +144,7 @@ def build_coco_gt(dataset, class_names: list[str]) -> dict:
             ann_id += 1
     categories = [{"id": i, "name": n} for i, n in enumerate(class_names)]
     return {
-        "info": {"description": "DIOR test set (HichTala/dior) — FLAME few-shot"},
+        "info": {"description": description},
         "licenses": [],
         "images": images,
         "annotations": annotations,
@@ -115,6 +169,12 @@ def coco_eval_with_custom_sizes(
     coco_dt = coco_gt.loadRes(detections)
 
     cocoeval = COCOeval_faster(coco_gt, coco_dt, iouType="bbox")
+    eval_class_idxs = (
+        list(range(len(class_names)))
+        if class_idxs is None
+        else list(class_idxs)
+    )
+    cocoeval.params.catIds = eval_class_idxs
     cocoeval.params.areaRng = [list(r) for _, r in AREA_RANGES]
     cocoeval.params.areaRngLbl = [lbl for lbl, _ in AREA_RANGES]
     cocoeval.params.maxDets = [1, 10, 100]
@@ -149,14 +209,11 @@ def coco_eval_with_custom_sizes(
         ar = _mean(recall[:, :, area_idx, last_md_idx])
         print(f"  AR   area={lbl:<10s}  maxDets={max_dets[-1]:<4d}  {ar:>8.4f}")
 
-    if class_idxs is None:
-        class_idxs = list(range(len(class_names)))
-
     print(f"\n=== {title}: Per-class AP @[0.50:0.95] (area=all) ===")
     all_idx = next(i for i, (lbl, _) in enumerate(AREA_RANGES) if lbl == "all")
-    for k in class_idxs:
-        name = class_names[k]
-        per_cls = _mean(precision[:, :, k, all_idx, last_md_idx])
+    for eval_idx, class_idx in enumerate(eval_class_idxs):
+        name = class_names[class_idx]
+        per_cls = _mean(precision[:, :, eval_idx, all_idx, last_md_idx])
         print(f"  {name:30s} {per_cls:.4f}")
 
 
@@ -165,8 +222,17 @@ def coco_eval_with_custom_sizes(
 # ---------------------------------------------------------------------------
 def iou_xyxy_vs_xywh(box_xyxy: np.ndarray, gt_xywh: tuple[float, float, float, float]) -> float:
     """IoU between a single xyxy proposal and a single COCO-style xywh GT box."""
+    return iou_xyxy_vs_bbox(box_xyxy, gt_xywh, bbox_format="xywh")
+
+
+def iou_xyxy_vs_bbox(
+    box_xyxy: np.ndarray,
+    gt_bbox: tuple[float, float, float, float],
+    bbox_format: str,
+) -> float:
+    """IoU between an ``xyxy`` proposal and a ground-truth box."""
     ax1, ay1, ax2, ay2 = float(box_xyxy[0]), float(box_xyxy[1]), float(box_xyxy[2]), float(box_xyxy[3])
-    gx, gy, gw, gh = gt_xywh
+    gx, gy, gw, gh = bbox_to_xywh(gt_bbox, bbox_format)
     bx1, by1, bx2, by2 = float(gx), float(gy), float(gx + gw), float(gy + gh)
     ix1, iy1 = max(ax1, bx1), max(ay1, by1)
     ix2, iy2 = min(ax2, bx2), min(ay2, by2)
@@ -186,6 +252,7 @@ def auto_label_candidates(
     support_samples: list[dict],
     class_idx: int,
     iou_threshold: float,
+    bbox_format: str = "xywh",
 ) -> list[bool]:
     """For each FLAME candidate, label True if its box matches a GT of ``class_idx``."""
     labels: list[bool] = []
@@ -204,7 +271,10 @@ def auto_label_candidates(
         if not gts:
             labels.append(False)
             continue
-        max_iou = max(iou_xyxy_vs_xywh(prop.box, gt) for gt in gts)
+        max_iou = max(
+            iou_xyxy_vs_bbox(prop.box, gt, bbox_format=bbox_format)
+            for gt in gts
+        )
         labels.append(max_iou >= iou_threshold)
     return labels
 
@@ -234,8 +304,8 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def collate_dior_images(samples: list[dict]) -> tuple[list[Image.Image], list[int]]:
-    """Decode a DIOR batch to RGB PIL images plus image ids."""
+def collate_hf_images(samples: list[dict]) -> tuple[list[Image.Image], list[int]]:
+    """Decode a Hugging Face detection batch to RGB PIL images plus ids."""
     images = [sample["image"].convert("RGB") for sample in samples]
     image_ids = [int(sample["image_id"]) for sample in samples]
     return images, image_ids
@@ -251,7 +321,7 @@ def materialise_test_images_with_dataloader(
         "batch_size": max(1, batch_size),
         "shuffle": False,
         "num_workers": max(0, num_workers),
-        "collate_fn": collate_dior_images,
+        "collate_fn": collate_hf_images,
         "pin_memory": False,
     }
     if num_workers > 0:
@@ -403,12 +473,15 @@ def run_flame_for_class(
         "n_pos": 0,
         "n_neg": 0,
         "trained": False,
+        "zero_shot_skipped": False,
         "skipped_reason": None,
     }
-    text_query = class_name_to_query(class_name)
+    text_query = class_name_to_query(class_name, args.query_template)
     stage_times: dict[str, float] = {}
+    run_zero_shot = not getattr(args, "skip_zero_shot", False)
+    info["zero_shot_skipped"] = not run_zero_shot
     stage_pbar = tqdm(
-        total=7,
+        total=7 if run_zero_shot else 6,
         desc=f"class[{class_name}]",
         leave=False,
         dynamic_ncols=True,
@@ -470,7 +543,12 @@ def run_flame_for_class(
         t0 = time.perf_counter()
         stage_pbar.set_postfix_str("auto-labeling")
         labels = auto_label_candidates(
-            flame, candidate_indices, support_samples, class_idx, args.iou_threshold
+            flame,
+            candidate_indices,
+            support_samples,
+            class_idx,
+            args.iou_threshold,
+            bbox_format=args.bbox_format,
         )
         n_pos = sum(labels)
         n_neg = len(labels) - n_pos
@@ -525,22 +603,24 @@ def run_flame_for_class(
         finish_stage("flame", t0)
 
         # 6. Zero-shot baseline (same query, same images) for a side-by-side delta.
-        t0 = time.perf_counter()
-        stage_pbar.set_postfix_str("running zero-shot")
-        zero_dets = zero_shot_predict(
-            model,
-            test_images,
-            test_image_ids,
-            class_idx=class_idx,
-            text_query=text_query,
-            device=str(next(model.parameters()).device),
-            score_threshold=args.score_threshold,
-            top_k=args.top_k,
-            batch_size=args.detect_batch_size,
-            fast_preprocess=args.fast_preprocess,
-            use_autocast=args.autocast,
-        )
-        finish_stage("zero", t0)
+        zero_dets: list[dict] = []
+        if run_zero_shot:
+            t0 = time.perf_counter()
+            stage_pbar.set_postfix_str("running zero-shot")
+            zero_dets = zero_shot_predict(
+                model,
+                test_images,
+                test_image_ids,
+                class_idx=class_idx,
+                text_query=text_query,
+                device=str(next(model.parameters()).device),
+                score_threshold=args.score_threshold,
+                top_k=args.top_k,
+                batch_size=args.detect_batch_size,
+                fast_preprocess=args.fast_preprocess,
+                use_autocast=args.autocast,
+            )
+            finish_stage("zero", t0)
         info["stage_times"] = stage_times
         return flame_dets, zero_dets, info
     finally:
@@ -550,18 +630,42 @@ def run_flame_for_class(
 # ---------------------------------------------------------------------------
 # Top-level driver
 # ---------------------------------------------------------------------------
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(default_dataset: str = "dior", description: Optional[str] = None) -> None:
+    parser = argparse.ArgumentParser(description=description or __doc__)
+    parser.add_argument(
+        "--dataset",
+        default=default_dataset,
+        choices=sorted(DATASET_SPECS),
+        help="Detection dataset to use (the wrapper scripts set this default).",
+    )
     parser.add_argument("--model-size", default="large", choices=["base", "large"])
-    parser.add_argument("--split", default="test", help="DIOR split for evaluation")
-    parser.add_argument("--train-split", default="train", help="DIOR split for support sampling")
+    parser.add_argument(
+        "--split",
+        default=None,
+        help="Evaluation split (default: test for DIOR, val for Fashionpedia).",
+    )
+    parser.add_argument(
+        "--train-split",
+        default=None,
+        help="Split used for support sampling (default: train).",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        default=None,
+        help="Optional Hugging Face datasets cache directory.",
+    )
     parser.add_argument(
         "--limit", type=int, default=None,
         help="Cap number of test images (for smoke tests).",
     )
     parser.add_argument(
         "--classes", nargs="*", default=None,
-        help="Restrict evaluation to these DIOR class names (default: all).",
+        help="Restrict evaluation to these exact class names (default: all).",
+    )
+    parser.add_argument(
+        "--query-template",
+        default=None,
+        help="Text prompt template containing {name}; defaults by dataset.",
     )
 
     # FLAME knobs.
@@ -587,6 +691,11 @@ def main() -> None:
                         help="Use refiner prob alone, or refiner * (sigmoid_class * sigmoid_obj).")
 
     # Eval knobs.
+    parser.add_argument(
+        "--skip-zero-shot",
+        action="store_true",
+        help="Skip zero-shot baseline inference and evaluation.",
+    )
     parser.add_argument("--score-threshold", type=float, default=0.0,
                         help="Used only by the zero-shot baseline.")
     parser.add_argument("--top-k", type=int, default=300,
@@ -610,6 +719,11 @@ def main() -> None:
 
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+    spec = DATASET_SPECS[args.dataset]
+    args.split = args.split or spec["eval_split"]
+    args.train_split = args.train_split or spec["train_split"]
+    args.query_template = args.query_template or spec["query_template"]
+    args.bbox_format = spec["bbox_format"]
     if args.detect_batch_size is None:
         args.detect_batch_size = 32 if args.model_size == "base" else 8
     seed_everything(args.seed)
@@ -624,19 +738,38 @@ def main() -> None:
     print(
         f"Inference settings: detect_batch_size={args.detect_batch_size}, "
         f"autocast={args.autocast}, fast_preprocess={args.fast_preprocess}, "
-        f"num_workers={args.num_workers}"
+        f"num_workers={args.num_workers}, zero_shot={not args.skip_zero_shot}"
     )
 
-    print(f"Loading HichTala/dior splits: train='{args.train_split}', test='{args.split}'...")
+    print(
+        f"Loading {spec['dataset_id']} splits: "
+        f"train='{args.train_split}', eval='{args.split}'..."
+    )
     from datasets import load_dataset
-    train_ds = load_dataset("HichTala/dior", split=args.train_split)
-    test_ds = load_dataset("HichTala/dior", split=args.split)
+    train_ds = load_dataset(
+        spec["dataset_id"],
+        split=args.train_split,
+        cache_dir=args.cache_dir,
+    )
+    test_ds = load_dataset(
+        spec["dataset_id"],
+        split=args.split,
+        cache_dir=args.cache_dir,
+    )
     if args.limit is not None:
         test_ds = test_ds.select(range(min(args.limit, len(test_ds))))
     print(f"  -> train={len(train_ds)}, test={len(test_ds)}")
 
     class_names: list[str] = test_ds.features["objects"]["category"].feature.names
-    coco_gt_dict = build_coco_gt(test_ds, class_names)
+    coco_gt_dict = build_coco_gt(
+        test_ds,
+        class_names,
+        bbox_format=args.bbox_format,
+        description=(
+            f"{spec['display_name']} {args.split} set ({spec['dataset_id']}) "
+            "— FLAME few-shot"
+        ),
+    )
 
     if args.classes:
         unknown = [c for c in args.classes if c not in class_names]
@@ -673,11 +806,16 @@ def main() -> None:
         if info["skipped_reason"]:
             print(f"  SKIP: {info['skipped_reason']}")
         else:
+            zero_summary = (
+                "zero_shot=skipped"
+                if args.skip_zero_shot
+                else f"zero_dets={len(zero_dets)}"
+            )
             print(
                 f"  proposals={info['n_proposals']}  "
                 f"candidates={info['n_candidates']}  "
                 f"pos={info['n_pos']}  neg={info['n_neg']}  "
-                f"flame_dets={len(flame_dets)}  zero_dets={len(zero_dets)}"
+                f"flame_dets={len(flame_dets)}  {zero_summary}"
             )
             stage_times = info.get("stage_times")
             if stage_times:
@@ -692,7 +830,8 @@ def main() -> None:
     if args.nms_iou > 0:
         n_before = len(flame_dets_all)
         flame_dets_all = per_class_nms(flame_dets_all, args.nms_iou)
-        zero_dets_all = per_class_nms(zero_dets_all, args.nms_iou)
+        if not args.skip_zero_shot:
+            zero_dets_all = per_class_nms(zero_dets_all, args.nms_iou)
         print(f"\nNMS@{args.nms_iou}: flame {n_before} -> {len(flame_dets_all)}")
 
     if args.save_detections:
@@ -700,17 +839,18 @@ def main() -> None:
             json.dump({"flame": flame_dets_all, "zero_shot": zero_dets_all, "info": infos}, f)
         print(f"Wrote detections + info to {args.save_detections}")
 
-    # Two side-by-side reports on the *same* GT, restricted (in interpretation)
-    # to the evaluated classes — COCO eval will report nan for the others.
-    coco_eval_with_custom_sizes(
-        coco_gt_dict, zero_dets_all, class_names,
-        title=f"DIOR zero-shot baseline ({args.model_size})",
-        class_idxs=target_class_idxs,
-    )
+    # Side-by-side reports on the same GT and selected category ids when the
+    # baseline is enabled; otherwise only evaluate FLAME.
+    if not args.skip_zero_shot:
+        coco_eval_with_custom_sizes(
+            coco_gt_dict, zero_dets_all, class_names,
+            title=f"{spec['display_name']} zero-shot baseline ({args.model_size})",
+            class_idxs=target_class_idxs,
+        )
     coco_eval_with_custom_sizes(
         coco_gt_dict, flame_dets_all, class_names,
         title=(
-            f"DIOR FLAME few-shot (shots={args.shots}, "
+            f"{spec['display_name']} FLAME few-shot (shots={args.shots}, "
             f"support_images={args.support_images}, classifier={args.classifier})"
         ),
         class_idxs=target_class_idxs,

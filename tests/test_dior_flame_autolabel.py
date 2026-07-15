@@ -17,6 +17,7 @@ _spec.loader.exec_module(_module)  # type: ignore[union-attr]
 
 iou_xyxy_vs_xywh = _module.iou_xyxy_vs_xywh
 auto_label_candidates = _module.auto_label_candidates
+iou_xyxy_vs_bbox = _module.iou_xyxy_vs_bbox
 
 
 class _StubProposal:
@@ -86,3 +87,34 @@ def test_auto_label_skips_other_classes():
         flame, [0], support_samples, class_idx=3, iou_threshold=0.5
     )
     assert labels == [False]
+
+
+def test_auto_label_accepts_fashionpedia_pascal_voc_boxes():
+    support_samples = [
+        {
+            "objects": {
+                # Pascal VOC xyxy
+                "bbox": [[10, 20, 40, 60]],
+                "category": [2],
+            }
+        }
+    ]
+    proposals = [
+        _StubProposal([10, 20, 40, 60], image_idx=0),
+        _StubProposal([0, 0, 5, 5], image_idx=0),
+    ]
+
+    assert iou_xyxy_vs_bbox(
+        proposals[0].box,
+        (10, 20, 40, 60),
+        bbox_format="xyxy",
+    ) == 1.0
+    labels = auto_label_candidates(
+        _StubFlame(proposals),
+        [0, 1],
+        support_samples,
+        class_idx=2,
+        iou_threshold=0.5,
+        bbox_format="xyxy",
+    )
+    assert labels == [True, False]

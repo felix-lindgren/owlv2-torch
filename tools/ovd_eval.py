@@ -44,10 +44,14 @@ DOTA_V1_5_CLASSES: list[str] = [
     "container-crane",
 ]
 
+FASHIONPEDIA_DATASET_ID = "detection-datasets/fashionpedia"
+SATELLITE_QUERY_TEMPLATE = "a satellite photo of a {name}"
+PHOTO_QUERY_TEMPLATE = "a photo of {name}"
 
-def class_name_to_query(name: str) -> str:
+
+def class_name_to_query(name: str, template: str = SATELLITE_QUERY_TEMPLATE) -> str:
     cleaned = name.strip().lower().replace("-", " ").replace("_", " ")
-    return f"a satellite photo of a {cleaned}"
+    return template.format(name=cleaned)
 
 
 def normalize_class_name(name: str) -> str:
@@ -222,6 +226,103 @@ class DiorDetectionDataset(Dataset):
             "images": images,
             "annotations": annotations,
             "categories": [{"id": i, "name": n} for i, n in enumerate(self.class_names)],
+        }
+
+
+class FashionpediaDetectionDataset(Dataset):
+    """Fashionpedia split adapted to the inference and COCO-eval interfaces.
+
+    Hugging Face stores Fashionpedia boxes as Pascal VOC ``xyxy`` coordinates.
+    ``build_coco_gt`` converts them to the COCO ``xywh`` representation used by
+    the evaluation helpers in this repository.
+    """
+
+    def __init__(
+        self,
+        split: str = "val",
+        limit: Optional[int] = None,
+        cache_dir: Optional[str | Path] = None,
+        dataset=None,
+    ):
+        if dataset is None:
+            from datasets import load_dataset
+
+            dataset = load_dataset(
+                FASHIONPEDIA_DATASET_ID,
+                split=split,
+                cache_dir=str(cache_dir) if cache_dir is not None else None,
+            )
+        if limit is not None:
+            dataset = dataset.select(range(min(limit, len(dataset))))
+        self.ds = dataset
+        self.split = split
+        self.class_names: list[str] = (
+            dataset.features["objects"]["category"].feature.names
+        )
+
+    def __len__(self) -> int:
+        return len(self.ds)
+
+    def __getitem__(self, idx: int) -> dict:
+        sample = self.ds[idx]
+        image = sample["image"].convert("RGB")
+        return {
+            "image": image,
+            "image_id": int(sample["image_id"]),
+            "target_size": (image.height, image.width),
+            "offset": (0.0, 0.0),
+        }
+
+    def build_coco_gt(self) -> dict:
+        images = []
+        annotations = []
+        ann_id = 1
+        metadata = (
+            self.ds.remove_columns("image")
+            if "image" in self.ds.column_names
+            else self.ds
+        )
+        for sample in metadata:
+            img_id = int(sample["image_id"])
+            images.append({
+                "id": img_id,
+                "width": int(sample["width"]),
+                "height": int(sample["height"]),
+                "file_name": f"{img_id}.jpg",
+            })
+            bboxes = sample["objects"]["bbox"]
+            cats = sample["objects"]["category"]
+            areas = sample["objects"].get("area")
+            for i, (bbox, cat) in enumerate(zip(bboxes, cats)):
+                x_min, y_min, x_max, y_max = [float(v) for v in bbox]
+                width = max(0.0, x_max - x_min)
+                height = max(0.0, y_max - y_min)
+                if width <= 0.0 or height <= 0.0:
+                    continue
+                area = float(areas[i]) if areas is not None else width * height
+                annotations.append({
+                    "id": ann_id,
+                    "image_id": img_id,
+                    "category_id": int(cat),
+                    "bbox": [x_min, y_min, width, height],
+                    "area": area,
+                    "iscrowd": 0,
+                })
+                ann_id += 1
+
+        return {
+            "info": {
+                "description": (
+                    f"Fashionpedia {self.split} set ({FASHIONPEDIA_DATASET_ID})"
+                )
+            },
+            "licenses": [],
+            "images": images,
+            "annotations": annotations,
+            "categories": [
+                {"id": i, "name": name}
+                for i, name in enumerate(self.class_names)
+            ],
         }
 
 
@@ -417,8 +518,9 @@ def run_owlv2_inference(
     use_autocast: bool,
     num_workers: int,
     desc: str,
+    query_template: str = SATELLITE_QUERY_TEMPLATE,
 ) -> list[dict]:
-    queries = [class_name_to_query(c) for c in class_names]
+    queries = [class_name_to_query(c, query_template) for c in class_names]
     text_inputs = tokenize(queries, context_length=16, truncate=True).to(device)
     attention_mask = (text_inputs == 0).to(device)
     return run_detection_inference(
@@ -646,8 +748,17 @@ def build_eval_dataset(args):
         )
         title = args.title or Path(args.ann_file).stem
     elif args.dataset == "dior":
-        dataset = DiorDetectionDataset(split=args.split, limit=args.limit)
-        title = args.title or f"DIOR {args.split}"
+        split = args.split or "test"
+        dataset = DiorDetectionDataset(split=split, limit=args.limit)
+        title = args.title or f"DIOR {split}"
+    elif args.dataset == "fashionpedia":
+        split = args.split or "val"
+        dataset = FashionpediaDetectionDataset(
+            split=split,
+            limit=args.limit,
+            cache_dir=args.hf_cache_dir,
+        )
+        title = args.title or f"Fashionpedia {split}"
     elif args.dataset == "dota":
         dataset = DotaDetectionDataset(
             data_root=args.data_root,
@@ -663,12 +774,23 @@ def build_eval_dataset(args):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate OWLv2 on COCO, DIOR, or DOTA.")
-    parser.add_argument("--dataset", choices=["coco", "dior", "dota"], required=True)
+    parser = argparse.ArgumentParser(
+        description="Evaluate OWLv2 on COCO, DIOR, DOTA, or Fashionpedia."
+    )
+    parser.add_argument(
+        "--dataset",
+        choices=["coco", "dior", "dota", "fashionpedia"],
+        required=True,
+    )
     parser.add_argument("--model-size", default="large", choices=["base", "large"])
     parser.add_argument("--ann-file", type=Path, default=None, help="COCO annotation JSON.")
     parser.add_argument("--image-root", type=Path, default=None, help="COCO image root.")
-    parser.add_argument("--split", default="test", help="DIOR split.")
+    parser.add_argument(
+        "--split",
+        default=None,
+        help="Hugging Face split (default: test for DIOR, val for Fashionpedia).",
+    )
+    parser.add_argument("--hf-cache-dir", type=Path, default=None)
     parser.add_argument("--data-root", type=Path, default=Path("data/dotav1_5"))
     parser.add_argument("--tile-size", type=int, default=0)
     parser.add_argument("--tile-overlap", type=int, default=200)
@@ -683,6 +805,11 @@ def main() -> None:
     parser.set_defaults(autocast=True)
     parser.add_argument("--save-detections", default=None)
     parser.add_argument("--title", default=None)
+    parser.add_argument(
+        "--query-template",
+        default=None,
+        help="Text prompt template containing {name}; defaults by dataset type.",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -695,6 +822,13 @@ def main() -> None:
 
     print(f"Loading OwlV2 ({args.model_size}) on {args.device}...")
     model = OwlV2(args.model_size).eval().to(args.device)
+    query_template = args.query_template
+    if query_template is None:
+        query_template = (
+            SATELLITE_QUERY_TEMPLATE
+            if args.dataset in {"dior", "dota"}
+            else PHOTO_QUERY_TEMPLATE
+        )
     detections = run_owlv2_inference(
         model,
         dataset,
@@ -707,6 +841,7 @@ def main() -> None:
         use_autocast=args.autocast,
         num_workers=args.num_workers,
         desc=f"{title} inference",
+        query_template=query_template,
     )
 
     if args.save_detections:

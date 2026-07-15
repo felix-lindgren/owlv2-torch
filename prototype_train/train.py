@@ -100,9 +100,10 @@ class AugmentedDetectionDataset(Dataset):
     """Wraps a CocoDetection (PIL + raw anns) and applies bbox-aware augmentations,
     then the model's image transform. Emits (image_tensor, {"boxes": cxcywh_norm, "labels"}).
 
-    Augmentations: discrete 0/90/180/270 rotation, horizontal/vertical flip,
+    Augmentations: optional discrete 0/90/180/270 rotation and flips,
     RandomZoomOut (smaller objects), RandomIoUCrop (larger / cropped objects),
-    SanitizeBoundingBoxes, then ColorJitter on the image only.
+    SanitizeBoundingBoxes, then ColorJitter on the image only. Rotation and
+    vertical flips can be disabled for orientation-sensitive datasets.
     """
 
     def __init__(
@@ -120,11 +121,17 @@ class AugmentedDetectionDataset(Dataset):
         iou_crop_min_scale=0.5,
         iou_crop_max_scale=1.0,
         sanitize_min_size=2.0,
+        random_right_angle_rotation=True,
+        horizontal_flip_prob=0.5,
+        vertical_flip_prob=0.5,
     ):
         self.base = base
         self.image_transform = image_transform
         self.category_id_to_label = category_id_to_label
         self.augment = augment
+        self.random_right_angle_rotation = random_right_angle_rotation
+        self.horizontal_flip_prob = horizontal_flip_prob
+        self.vertical_flip_prob = vertical_flip_prob
         if augment:
             self.geom = Tv2.Compose([
                 Tv2.RandomZoomOut(fill=0, side_range=(1.0, zoom_out_max), p=zoom_out_prob),
@@ -179,17 +186,17 @@ class AugmentedDetectionDataset(Dataset):
         boxes = tv_tensors.BoundingBoxes(xyxy, format="XYXY", canvas_size=(H, W))
 
         if self.augment:
-            # Discrete 0/90/180/270 rotation
-            k = int(torch.randint(0, 4, ()).item())
-            if k > 0:
-                angle = float(k * 90)
-                image = TvF.rotate(image, angle=angle, expand=True)
-                boxes = TvF.rotate(boxes, angle=angle, expand=True)
-            # H/V flips (aerial imagery is symmetric)
-            if torch.rand(()).item() < 0.5:
+            if self.random_right_angle_rotation:
+                # Discrete 0/90/180/270 rotation (useful for aerial imagery).
+                k = int(torch.randint(0, 4, ()).item())
+                if k > 0:
+                    angle = float(k * 90)
+                    image = TvF.rotate(image, angle=angle, expand=True)
+                    boxes = TvF.rotate(boxes, angle=angle, expand=True)
+            if torch.rand(()).item() < self.horizontal_flip_prob:
                 image = TvF.horizontal_flip(image)
                 boxes = TvF.horizontal_flip(boxes)
-            if torch.rand(()).item() < 0.5:
+            if torch.rand(()).item() < self.vertical_flip_prob:
                 image = TvF.vertical_flip(image)
                 boxes = TvF.vertical_flip(boxes)
             # Joint scale aug (zoom out + iou crop) + sanitize
@@ -553,8 +560,12 @@ def coco_eval(
     log_to_mlflow=True,
     output_format: str = "prototype",
     title: str = "COCO Evaluation Results",
+    max_batches: int | None = None,
 ):
     model.eval()
+    device_type = torch.device(device).type
+    if max_batches is not None and max_batches <= 0:
+        raise ValueError(f"max_batches must be positive or None, got {max_batches}")
     
     # Initialize torchmetrics mAP
     metric = MeanAveragePrecision(
@@ -572,11 +583,16 @@ def coco_eval(
     drawn = 0
 
     with torch.no_grad():
-        pbar = tqdm(val_loader, desc="Evaluating")
-        for batch in pbar:
+        total_batches = len(val_loader)
+        if max_batches is not None:
+            total_batches = min(total_batches, max_batches)
+        pbar = tqdm(val_loader, desc="Evaluating", total=total_batches)
+        for batch_index, batch in enumerate(pbar):
+            if max_batches is not None and batch_index >= max_batches:
+                break
             pixel_values = batch["images"].to(device, non_blocking=True)  # [B, C, H, W], normalized with CLIP stats
             batch_targets = batch["targets"]
-            with torch.autocast(device):
+            with torch.autocast(device_type=device_type):
                 outputs = model(pixel_values)
             if output_format == "prototype":
                 logits, objectness_logits, pred_boxes = outputs[1], outputs[2], outputs[3]
@@ -694,7 +710,7 @@ def main():
     # Configuration
     config = {
         "device": "cuda",
-        "C": 1,
+        "C": 46,
         "K": 8,
         "model_type": "base",
         "prototype_init_mode": "visual",  # random, text, visual
@@ -727,7 +743,7 @@ def main():
         "eval_sample_score_threshold": 0.01,
         "eval_sample_topk": 25,
         "eval_sample_dir": "eval_samples",
-        "external_eval_enabled": True,
+        "external_eval_enabled": False,
         "external_eval_datasets": ["dior", "dota"],
         "external_eval_limit": 250,
         "external_eval_batch_size": 16,
@@ -739,11 +755,11 @@ def main():
         "dota_tile_size": 1024,
         "dota_tile_overlap": 200,
         "dota_include_difficult": False,
-        "category_ids": [0],
-        "train_dataset_path": "/home/fellin/repos/rnd/dataset-utils/out_ships_1024_train_val/annotations.json",
-        "train_images_path": "/home/fellin/repos/rnd/dataset-utils/out_ships_1024_train_val",
-        "val_dataset_path": "/home/fellin/repos/rnd/dataset-utils/out_ships_1024_test/coco_merged_tiles_1024.json",
-        "val_images_path": "/home/fellin/repos/rnd/dataset-utils/out_ships_1024_test/images"
+        "category_ids": None,
+        "train_dataset_path": "/mnt/datasets/fashion/fashionpedia_coco/train/annotations.json",
+        "train_images_path": "/mnt/datasets/fashion/fashionpedia_coco/train/images",
+        "val_dataset_path": "/mnt/datasets/fashion/fashionpedia_coco/val/annotations.json",
+        "val_images_path": "/mnt/datasets/fashion/fashionpedia_coco/val/images",
     }
     
     with mlflow.start_run(run_name=f"owlv2_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}"):

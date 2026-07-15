@@ -119,6 +119,92 @@ outputs = detector(pixel_values)
 # Use compute_losses() from OWLv2torch.torch_version.loss
 ```
 
+### Fashionpedia
+
+The Fashionpedia scripts load
+[`detection-datasets/fashionpedia`](https://huggingface.co/datasets/detection-datasets/fashionpedia)
+directly through Hugging Face Datasets. Fashionpedia has no public test split,
+so evaluation uses `val`. Its Pascal VOC boxes are converted to COCO boxes for
+the repository's mAP evaluator.
+
+Run the zero-shot baseline:
+
+```bash
+uv run --extra train python tools/test_fashionpedia.py \
+  --model-size base \
+  --fast-preprocess
+```
+
+Train FLAME refiners from Fashionpedia `train` support images and compare them
+with the zero-shot baseline on `val`:
+
+```bash
+uv run --extra train python tools/test_fashionpedia_flame.py \
+  --model-size base \
+  --classes "shirt, blouse" "shoe" \
+  --shots 30 \
+  --support-images 8 \
+  --fast-preprocess
+```
+
+Omit `--classes` to run all 46 categories. Use `--limit` for a validation-set
+smoke test and `--cache-dir` to control where the 3.48 GB dataset is cached.
+
+#### Text-conditioned fine-tuning
+
+To adapt OWLv2 to fashion while retaining arbitrary text queries, train through
+the normal text-conditioned detection path rather than a prototype bank. The
+trainer expects the COCO files produced by `tools/convert_fashionpedia_to_coco.py`:
+
+```bash
+uv run --extra train python prototype_train/train_text.py \
+  --train-annotations /mnt/datasets/fashion/fashionpedia_coco/train/annotations.json \
+  --train-images /mnt/datasets/fashion/fashionpedia_coco/train/images \
+  --val-annotations /mnt/datasets/fashion/fashionpedia_coco/val/annotations.json \
+  --val-images /mnt/datasets/fashion/fashionpedia_coco/val/images \
+  --model-type base \
+  --batch-size 8 \
+  --epochs 20 \
+  --run-zero-shot-baseline
+```
+
+By default, the text and vision towers remain frozen while the class, box and
+objectness heads are trained. Add `--vision-blocks 2` if head-only adaptation
+plateaus. `--text-blocks 1` is available for specialist vocabulary, but should
+generally be used only after trying the frozen text tower. Comma-separated
+Fashionpedia class names are automatically expanded into prompt aliases and a
+different prompt variant is sampled for every class on each training step.
+
+For short configuration experiments, stop and evaluate by optimizer step rather
+than waiting for a complete epoch:
+
+```bash
+uv run --extra train python prototype_train/train_text.py \
+  ...dataset arguments... \
+  --max-steps 200 \
+  --eval-every-steps 50 \
+  --eval-max-batches 20
+```
+
+When `--max-steps` is set, the cosine schedule also advances per optimizer step.
+`--eval-every-steps` replaces epoch-based evaluation, while
+`--eval-max-batches` makes the reported validation mAP an approximate metric
+over the first N validation batches. A final evaluation is always run unless
+the last requested step was already evaluated.
+
+The trainer writes compact delta checkpoints to `text_checkpoints/best.pth` and
+`text_checkpoints/final.pth`. Load one on top of the same pretrained model:
+
+```python
+from OWLv2torch import OwlV2
+from prototype_train.train_text import load_text_checkpoint
+
+model = OwlV2("base")
+metadata = load_text_checkpoint(model, "text_checkpoints/best.pth")
+```
+
+Pass `--save-full-model` if a standalone full state dictionary is preferable.
+
 ## Project Structure
 
 ```
