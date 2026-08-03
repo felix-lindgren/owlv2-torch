@@ -27,8 +27,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from OWLv2torch.torch_version.owlv2 import OwlV2
-from OWLv2torch.torch_version.text_loss import compute_text_query_losses
+from OWLv2torch.torch_version.text_loss import (
+    CLASS_LOSS_CHOICES,
+    compute_text_query_losses,
+)
 from OWLv2torch.utils.tokenizer import tokenize
+from prototype_train.gpu_augment import BatchAugmentor
 from prototype_train.train import (
     AugmentedDetectionDataset,
     aug_collate_fn,
@@ -170,6 +174,16 @@ def configure_trainable_parameter_groups(model: OwlV2, args) -> list[dict]:
     return groups
 
 
+def log_eval_metrics(metrics, prefix: str, step: int | None = None) -> None:
+    """Log the scalar entries of a torchmetrics result, skipping per-class tensors."""
+    scalars = {
+        f"{prefix}{key}": mlflow_metric_value(value)
+        for key, value in metrics.items()
+        if not (hasattr(value, "numel") and value.numel() != 1)
+    }
+    mlflow.log_metrics(scalars, step=step)
+
+
 def evaluation_prompts(class_names: list[str], template: str) -> list[str]:
     if "{name}" not in template:
         raise ValueError("The evaluation prompt template must contain a '{name}' placeholder")
@@ -242,6 +256,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--val-batch-size",
+        type=int,
+        help="Validation batch size. Defaults to --batch-size when omitted.",
+    )
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--eval-every", type=int, default=1)
     parser.add_argument(
@@ -260,8 +279,105 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Use at most this many validation batches per evaluation.",
     )
     parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--gpu-augment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Run mosaic, colour jitter and normalisation on the device with "
+            "kornia instead of jittering per sample in the dataloader workers. "
+            "Required by --mosaic-prob. Needs --augment."
+        ),
+    )
+    parser.add_argument(
+        "--mosaic-prob",
+        type=float,
+        default=0.5,
+        help=(
+            "Per-image probability of replacing the image with a mosaic of "
+            "--mosaic-grid images drawn from the same batch. 0 disables it."
+        ),
+    )
+    parser.add_argument(
+        "--mosaic-grid",
+        type=int,
+        nargs=2,
+        default=(2, 2),
+        metavar=("ROWS", "COLS"),
+        help="Mosaic tiling. The output keeps the model's input resolution.",
+    )
+    parser.add_argument(
+        "--mosaic-start-ratio",
+        type=float,
+        nargs=2,
+        default=(0.3, 0.7),
+        metavar=("LOW", "HIGH"),
+        help=(
+            "Range the mosaic crop's top-left corner is sampled from, as a "
+            "fraction of the input size. Values near 0.5 keep all tiles visible."
+        ),
+    )
+    parser.add_argument(
+        "--mosaic-min-visibility",
+        type=float,
+        default=0.2,
+        help=(
+            "Drop a mosaic box when the mosaic crop leaves less than this "
+            "fraction of its original area."
+        ),
+    )
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Compile the vision encoder for faster training (about 1.10x end-to-end).",
+    )
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=1,
+        help=(
+            "Micro-batches accumulated per optimizer step, for an effective batch "
+            "of --batch-size x --grad-accum-steps. --max-steps, --eval-every-steps "
+            "and the scheduler all count optimizer steps, so keep samples seen "
+            "constant by dividing --max-steps by this value. Note this is not "
+            "numerically identical to the same effective batch in one go: each "
+            "micro-batch's loss is normalised by its own box/image counts and the "
+            "micro-batch losses are then averaged, so a sparse image carries the "
+            "same weight as a crowded one."
+        ),
+    )
+    parser.add_argument(
+        "--grad-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Recompute encoder-block activations during backward instead of "
+            "storing them. Roughly halves activation memory (allowing larger "
+            "--batch-size) at about a 20%% step-time cost. Blocks that are frozen and fed a "
+            "detached input are skipped, so this is a no-op with --vision-blocks 0 "
+            "--text-blocks 0."
+        ),
+    )
+    parser.add_argument(
+        "--val-transform",
+        choices=("fast", "accurate"),
+        default="fast",
+        help=(
+            "Validation preprocessing. 'fast' matches the transform used for training "
+            "and is far cheaper on CPU; 'accurate' uses the scipy resize."
+        ),
+    )
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=0,
+        help=(
+            "Linearly warm up the learning rates over this many scheduler steps. "
+            "Scheduler steps are optimizer steps with --max-steps, epochs otherwise."
+        ),
+    )
 
     parser.add_argument("--head-learning-rate", type=float, default=1e-5)
     parser.add_argument("--vision-learning-rate", type=float, default=1e-6)
@@ -283,7 +399,37 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Repeat for prompt augmentation; must contain {name}",
     )
     parser.add_argument("--eval-prompt-template", default="a photo of {name}")
-    parser.add_argument("--negative-ratio", type=int, default=5)
+    parser.add_argument(
+        "--class-loss",
+        choices=CLASS_LOSS_CHOICES,
+        default="focal",
+        help=(
+            "Classification term. 'focal' is the matched + hard-negative-mined "
+            "split; 'mal' (DEIM) and 'vfl' are dense IoU-aware losses that ignore "
+            "the negative-mining flags. Box and objectness terms are identical "
+            "across all three, so runs are directly comparable."
+        ),
+    )
+    parser.add_argument(
+        "--class-loss-gamma",
+        type=float,
+        default=1.5,
+        help="Focusing exponent for --class-loss mal/vfl (DEIM uses 1.5).",
+    )
+    parser.add_argument(
+        "--class-loss-alpha",
+        type=float,
+        help=(
+            "Background weight for --class-loss mal/vfl. Default: unscaled for "
+            "mal, 0.2 for vfl, matching DEIM."
+        ),
+    )
+    parser.add_argument(
+        "--negative-ratio",
+        type=int,
+        default=5,
+        help="Negatives mined per positive. Used by --class-loss focal and by the objectness term.",
+    )
     parser.add_argument("--max-negatives-per-image", type=int, default=512)
     parser.add_argument("--negative-loss-weight", type=float, default=1.0)
     parser.add_argument("--lambda-class", type=float, default=1.0)
@@ -292,7 +438,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda-objectness", type=float, default=0.5)
 
     parser.add_argument("--confidence-threshold", type=float, default=0.001)
-    parser.add_argument("--eval-top-k", type=int, default=300)
+    parser.add_argument(
+        "--eval-top-k",
+        type=int,
+        default=100,
+        help=(
+            "Detections kept per image for evaluation. torchmetrics caps AP at 100 "
+            "detections, so larger values only cost CPU time in the metric update."
+        ),
+    )
     parser.add_argument("--score-with-objectness", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--run-zero-shot-baseline", action="store_true")
     parser.add_argument("--output-dir", default="text_checkpoints")
@@ -306,6 +460,8 @@ def main(argv: list[str] | None = None) -> None:
     args = build_argument_parser().parse_args(argv)
     if args.epochs <= 0:
         raise ValueError("epochs must be positive")
+    if args.val_batch_size is not None and args.val_batch_size <= 0:
+        raise ValueError("val_batch_size must be positive")
     if args.eval_every < 0:
         raise ValueError("eval_every must be non-negative")
     if args.max_steps is not None and args.max_steps <= 0:
@@ -314,6 +470,15 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("eval_every_steps must be positive")
     if args.eval_max_batches is not None and args.eval_max_batches <= 0:
         raise ValueError("eval_max_batches must be positive")
+    if args.warmup_steps < 0:
+        raise ValueError("warmup_steps must be non-negative")
+    if args.grad_accum_steps < 1:
+        raise ValueError("grad_accum_steps must be at least 1")
+    if not 0.0 <= args.mosaic_prob <= 1.0:
+        raise ValueError("mosaic_prob must be in [0, 1]")
+    gpu_augment = args.augment and args.gpu_augment
+    if args.mosaic_prob > 0 and not gpu_augment:
+        raise ValueError("--mosaic-prob requires --augment and --gpu-augment")
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -336,6 +501,8 @@ def main(argv: list[str] | None = None) -> None:
         parameter_groups = configure_trainable_parameter_groups(model, args)
         if not parameter_groups:
             raise RuntimeError("No trainable parameter groups were configured")
+        if args.grad_checkpointing:
+            model.set_gradient_checkpointing(True)
 
         train_dataset = CocoDetection(
             annFile=args.train_annotations,
@@ -344,7 +511,11 @@ def main(argv: list[str] | None = None) -> None:
         val_dataset = CocoDetection(
             annFile=args.val_annotations,
             root=args.val_images,
-            transform=model.image_transform,
+            transform=(
+                model.image_transform_fast
+                if args.val_transform == "fast"
+                else model.image_transform_accurate
+            ),
         )
         category_ids = args.category_ids or sorted(train_dataset.coco.getCatIds())
         missing_val_ids = set(category_ids) - set(val_dataset.coco.getCatIds())
@@ -358,6 +529,8 @@ def main(argv: list[str] | None = None) -> None:
         prompt_pools = build_prompt_pools(class_names, prompt_templates)
         eval_prompts = evaluation_prompts(class_names, args.eval_prompt_template)
         detector = TextQueryDetector(model, eval_prompts).to(device)
+        if args.compile:
+            model.vision_model.encoder.compile()
 
         train_indices = select_shot_indices(
             train_dataset,
@@ -365,14 +538,29 @@ def main(argv: list[str] | None = None) -> None:
             args.shots_per_class,
             args.seed,
         )
+        # With GPU augmentation the workers stop at the unnormalised square
+        # image; mosaic and the colour jitter want [0, 1] inputs, so the
+        # normalisation moves to the end of the device-side pipeline.
         train_augmented = AugmentedDetectionDataset(
             train_dataset,
-            model.image_transform_fast,
+            model.image_transform_unnormed if gpu_augment else model.image_transform_fast,
             category_id_to_label,
             augment=args.augment,
             random_right_angle_rotation=False,
             horizontal_flip_prob=0.5,
             vertical_flip_prob=0.0,
+            photometric=not gpu_augment,
+        )
+        batch_augmentor = (
+            BatchAugmentor(
+                model.image_size,
+                mosaic_prob=args.mosaic_prob,
+                mosaic_grid=tuple(args.mosaic_grid),
+                mosaic_start_ratio_range=tuple(args.mosaic_start_ratio),
+                min_box_visibility=args.mosaic_min_visibility,
+            ).to(device)
+            if gpu_augment
+            else None
         )
         train_loader = DataLoader(
             Subset(train_augmented, train_indices),
@@ -383,10 +571,11 @@ def main(argv: list[str] | None = None) -> None:
             pin_memory=device.type == "cuda",
             persistent_workers=args.num_workers > 0,
             prefetch_factor=4 if args.num_workers > 0 else None,
+            drop_last=True,
         )
         val_loader = DataLoader(
             val_dataset,
-            batch_size=args.batch_size,
+            batch_size=args.val_batch_size or args.batch_size,
             collate_fn=partial(
                 coco_collate_fn,
                 id2size=val_dataset.coco.imgs,
@@ -402,9 +591,29 @@ def main(argv: list[str] | None = None) -> None:
             parameter_groups,
             weight_decay=args.weight_decay,
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.max_steps or args.epochs
-        )
+        scheduler_steps = args.max_steps or args.epochs
+        if args.warmup_steps:
+            if args.warmup_steps >= scheduler_steps:
+                raise ValueError(
+                    f"warmup_steps must be smaller than the {scheduler_steps} scheduler "
+                    "steps in the run"
+                )
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[
+                    torch.optim.lr_scheduler.LinearLR(
+                        optimizer, start_factor=0.1, total_iters=args.warmup_steps
+                    ),
+                    torch.optim.lr_scheduler.CosineAnnealingLR(
+                        optimizer, T_max=scheduler_steps - args.warmup_steps
+                    ),
+                ],
+                milestones=[args.warmup_steps],
+            )
+        else:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=scheduler_steps
+            )
         amp_enabled = args.amp and device.type == "cuda"
         scaler = torch.amp.GradScaler(device.type, enabled=amp_enabled)
 
@@ -413,6 +622,10 @@ def main(argv: list[str] | None = None) -> None:
         )
         print(f"Classes: {len(class_names)}")
         print(f"Training images: {len(train_indices)}")
+        print(
+            f"Effective batch: {args.batch_size * args.grad_accum_steps} "
+            f"({args.batch_size} x {args.grad_accum_steps} accumulated)"
+        )
         print(f"Trainable parameters: {trainable_count:,}")
         for group in parameter_groups:
             count = sum(parameter.numel() for parameter in group["params"])
@@ -426,6 +639,7 @@ def main(argv: list[str] | None = None) -> None:
                     "class_names": str(class_names),
                     "train_images_selected": len(train_indices),
                     "trainable_parameters": trainable_count,
+                    "effective_batch_size": args.batch_size * args.grad_accum_steps,
                 }
             )
 
@@ -443,8 +657,7 @@ def main(argv: list[str] | None = None) -> None:
                 max_batches=args.eval_max_batches,
             )
             if args.mlflow:
-                for key, value in baseline_metrics.items():
-                    mlflow.log_metric(f"baseline/{key}", mlflow_metric_value(value))
+                log_eval_metrics(baseline_metrics, "baseline/")
 
         output_dir = Path(args.output_dir)
         best_map = float("-inf")
@@ -452,12 +665,15 @@ def main(argv: list[str] | None = None) -> None:
         global_step = 0
         last_eval_step = None
         completed_epoch = 0
-        if len(train_loader) == 0:
+        num_batches = len(train_loader)
+        if num_batches == 0:
             raise RuntimeError("The training loader is empty")
+        accum_steps = args.grad_accum_steps
+        steps_per_epoch = (num_batches + accum_steps - 1) // accum_steps
         if args.max_steps is None:
             epochs_to_run = args.epochs
         else:
-            epochs_to_run = (args.max_steps + len(train_loader) - 1) // len(train_loader)
+            epochs_to_run = (args.max_steps + steps_per_epoch - 1) // steps_per_epoch
 
         def run_validation(epoch_number: int, step: int) -> None:
             nonlocal best_map, latest_map, last_eval_step
@@ -478,10 +694,16 @@ def main(argv: list[str] | None = None) -> None:
             latest_map = float(metrics["map"])
             last_eval_step = step
             if args.mlflow:
-                for key, value in metrics.items():
-                    mlflow.log_metric(
-                        f"val/{key}", mlflow_metric_value(value), step=step
-                    )
+                log_eval_metrics(metrics, "val/", step=step)
+            save_checkpoint(
+                output_dir / "last.pth",
+                model,
+                class_names,
+                eval_prompts,
+                args,
+                epoch=epoch_number,
+                map_value=latest_map,
+            )
             if latest_map > best_map:
                 best_map = latest_map
                 save_checkpoint(
@@ -499,25 +721,37 @@ def main(argv: list[str] | None = None) -> None:
             detector.train()
             running_loss = 0.0
             epoch_steps = 0
-            progress_total = len(train_loader)
+            progress_total = num_batches
             if args.max_steps is not None:
-                progress_total = min(progress_total, args.max_steps - global_step)
+                progress_total = min(
+                    progress_total, (args.max_steps - global_step) * accum_steps
+                )
             progress = tqdm(
                 train_loader,
                 desc=f"Text training epoch {epoch + 1}",
                 total=progress_total,
             )
-            for batch in progress:
-                if args.max_steps is not None and global_step >= args.max_steps:
-                    break
+            optimizer.zero_grad(set_to_none=True)
+            accumulated = 0
+            window_size = 0
+            window_losses: dict[str, float] = {}
+            for batch_index, batch in enumerate(progress):
+                if accumulated == 0:
+                    # The last window of an epoch can be short, so normalise by the
+                    # number of micro-batches it actually holds rather than by
+                    # accum_steps: a truncated window keeps the same effective lr.
+                    window_size = min(accum_steps, num_batches - batch_index)
+                    window_losses = {}
                 images = batch["images"].to(device, non_blocking=True)
+                targets = batch["targets"]
+                if batch_augmentor is not None:
+                    images, targets = batch_augmentor(images, targets)
                 prompts = sample_prompt_set(prompt_pools, prompt_generator)
-                optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type=device.type, enabled=amp_enabled):
                     outputs = detector(images, prompts=prompts)
                     losses = compute_text_query_losses(
                         outputs,
-                        batch["targets"],
+                        targets,
                         lambda_cls=args.lambda_class,
                         lambda_l1=args.lambda_l1,
                         lambda_giou=args.lambda_giou,
@@ -525,8 +759,20 @@ def main(argv: list[str] | None = None) -> None:
                         negative_ratio=args.negative_ratio,
                         max_negatives_per_image=args.max_negatives_per_image,
                         negative_loss_weight=args.negative_loss_weight,
+                        class_loss=args.class_loss,
+                        class_loss_gamma=args.class_loss_gamma,
+                        class_loss_alpha=args.class_loss_alpha,
                     )
-                scaler.scale(losses["loss"]).backward()
+                scaler.scale(losses["loss"] / window_size).backward()
+                for name, value in losses.items():
+                    window_losses[name] = (
+                        window_losses.get(name, 0.0) + float(value.detach()) / window_size
+                    )
+                accumulated += 1
+                if accumulated < window_size:
+                    continue
+                accumulated = 0
+
                 if args.grad_clip_norm > 0:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(
@@ -535,8 +781,9 @@ def main(argv: list[str] | None = None) -> None:
                     )
                 scaler.step(optimizer)
                 scaler.update()
+                optimizer.zero_grad(set_to_none=True)
 
-                current_loss = float(losses["loss"].detach())
+                current_loss = window_losses["loss"]
                 running_loss += current_loss
                 global_step += 1
                 epoch_steps += 1
@@ -547,7 +794,17 @@ def main(argv: list[str] | None = None) -> None:
                     step=(f"{global_step}/{args.max_steps}" if args.max_steps else global_step),
                 )
                 if args.mlflow:
-                    mlflow.log_metric("train/loss_step", current_loss, step=global_step)
+                    mlflow.log_metrics(
+                        {
+                            "train/loss_step": current_loss,
+                            **{
+                                f"train/{name}": value
+                                for name, value in window_losses.items()
+                                if name != "loss"
+                            },
+                        },
+                        step=global_step,
+                    )
 
                 if (
                     args.eval_every_steps is not None

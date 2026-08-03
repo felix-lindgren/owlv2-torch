@@ -103,7 +103,9 @@ class AugmentedDetectionDataset(Dataset):
     Augmentations: optional discrete 0/90/180/270 rotation and flips,
     RandomZoomOut (smaller objects), RandomIoUCrop (larger / cropped objects),
     SanitizeBoundingBoxes, then ColorJitter on the image only. Rotation and
-    vertical flips can be disabled for orientation-sensitive datasets.
+    vertical flips can be disabled for orientation-sensitive datasets, and
+    ``photometric=False`` drops the ColorJitter for callers that redo it on the
+    GPU (see ``prototype_train.gpu_augment``).
     """
 
     def __init__(
@@ -124,6 +126,7 @@ class AugmentedDetectionDataset(Dataset):
         random_right_angle_rotation=True,
         horizontal_flip_prob=0.5,
         vertical_flip_prob=0.5,
+        photometric=True,
     ):
         self.base = base
         self.image_transform = image_transform
@@ -145,11 +148,15 @@ class AugmentedDetectionDataset(Dataset):
                 ),
                 Tv2.SanitizeBoundingBoxes(min_size=sanitize_min_size),
             ])
-            self.photo = Tv2.ColorJitter(
-                brightness=color_jitter_brightness,
-                contrast=color_jitter_contrast,
-                saturation=color_jitter_saturation,
-                hue=color_jitter_hue,
+            self.photo = (
+                Tv2.ColorJitter(
+                    brightness=color_jitter_brightness,
+                    contrast=color_jitter_contrast,
+                    saturation=color_jitter_saturation,
+                    hue=color_jitter_hue,
+                )
+                if photometric
+                else None
             )
         else:
             self.geom = None
@@ -204,7 +211,8 @@ class AugmentedDetectionDataset(Dataset):
             sample = self.geom(sample)
             image, boxes, labels = sample["image"], sample["boxes"], sample["labels"]
             # Photometric (image only)
-            image = self.photo(image)
+            if self.photo is not None:
+                image = self.photo(image)
 
         # Apply OWL's image transform: SquarePad -> Resize -> Normalize
         image_tensor = self.image_transform(image)

@@ -1,0 +1,34 @@
+2026/08/02 16:35:41 INFO mlflow.tracking.fluent: Experiment with name 'OwlV2-Text-Training' does not exist. Creating a new experiment.
+loading annotations into memory...
+Done (t=1.13s)
+creating index...
+index created!
+loading annotations into memory...
+Done (t=0.02s)
+creating index...
+index created!
+Classes: 46
+Training images: 45623
+Trainable parameters: 4,992,775
+  class_head: 789,250 parameters at lr=5e-06
+  box_head: 2,103,300 parameters at lr=5e-06
+  objectness_head: 2,100,225 parameters at lr=5e-06
+Evaluating:   0%|          | 0/73 [00:00<?, ?it/s]Evaluating:   1%|▏         | 1/73 [00:07<08:38,  7.20s/it]Evaluating:   3%|▎         | 2/73 [00:11<06:44,  5.70s/it]Evaluating:   4%|▍         | 3/73 [00:16<06:05,  5.22s/it]Evaluating:   5%|▌         | 4/73 [00:21<05:45,  5.00s/it]Evaluating:   7%|▋         | 5/73 [00:25<05:31,  4.88s/it]Evaluating:   8%|▊         | 6/73 [00:30<05:21,  4.80s/it]Evaluating:  10%|▉         | 7/73 [00:35<05:14,  4.76s/it]Evaluating:  11%|█         | 8/73 [00:39<05:07,  4.73s/it]Evaluating:  12%|█▏        | 9/73 [00:44<05:01,  4.72s/it]Evaluating:  14%|█▎        | 10/73 [00:49<04:56,  4.70s/it]Evaluating:  15%|█▌        | 11/73 [00:53<04:51,  4.70s/it]Evaluating:  16%|█▋        | 12/73 [00:58<04:46,  4.69s/it]Evaluating:  18%|█▊        | 13/73 [01:03<04:41,  4.69s/it]Evaluating:  19%|█▉        | 14/73 [01:07<04:36,  4.68s/it]Evaluating:  21%|██        | 15/73 [01:12<04:31,  4.69s/it]Evaluating:  22%|██▏       | 16/73 [01:17<04:27,  4.69s/it]Evaluating:  23%|██▎       | 17/73 [01:22<04:22,  4.70s/it]Evaluating:  25%|██▍       | 18/73 [01:26<04:18,  4.70s/it]Evaluating:  26%|██▌       | 19/73 [01:31<04:13,  4.70s/it]Evaluating:  27%|██▋       | 20/73 [01:36<04:09,  4.70s/it]Evaluating:  29%|██▉       | 21/73 [01:40<04:04,  4.70s/it]Evaluating:  30%|███       | 22/73 [01:45<03:59,  4.70s/it]Evaluating:  32%|███▏      | 23/73 [01:50<03:55,  4.70s/it]Evaluating:  33%|███▎      | 24/73 [01:54<03:50,  4.70s/it]Evaluating:  34%|███▍      | 25/73 [01:59<03:45,  4.70s/it]Evaluating:  36%|███▌      | 26/73 [02:04<03:41,  4.70s/it]Evaluating:  37%|███▋      | 27/73 [02:09<03:36,  4.70s/it]Evaluating:  38%|███▊      | 28/73 [02:13<03:31,  4.70s/it]Evaluating:  40%|███▉      | 29/73 [02:18<03:26,  4.70s/it]Evaluating:  41%|████      | 30/73 [02:23<03:22,  4.70s/it]Evaluating:  42%|████▏     | 31/73 [02:27<03:17,  4.70s/it]Evaluating:  44%|████▍     | 32/73 [02:32<03:12,  4.70s/it]Evaluating:  45%|████▌     | 33/73 [02:37<03:08,  4.70s/it]Evaluating:  47%|████▋     | 34/73 [02:41<03:03,  4.70s/it]Evaluating:  48%|████▊     | 35/73 [02:46<02:58,  4.70s/it]Evaluating:  49%|████▉     | 36/73 [02:51<02:53,  4.70s/it]Evaluating:  51%|█████     | 37/73 [02:56<02:49,  4.70s/it]Evaluating:  52%|█████▏    | 38/73 [03:00<02:44,  4.70s/it]Evaluating:  53%|█████▎    | 39/73 [03:05<02:40,  4.71s/it]Evaluating:  55%|█████▍    | 40/73 [03:10<02:35,  4.71s/it]Evaluating:  56%|█████▌    | 41/73 [03:14<02:30,  4.71s/it]Evaluating:  58%|█████▊    | 42/73 [03:19<02:26,  4.72s/it]Evaluating:  59%|█████▉    | 43/73 [03:24<02:21,  4.72s/it]Evaluating:  60%|██████    | 44/73 [03:29<02:16,  4.72s/it]Evaluating:  62%|██████▏   | 45/73 [03:33<02:12,  4.72s/it]Evaluating:  63%|██████▎   | 46/73 [03:38<02:07,  4.72s/it]Evaluating:  64%|██████▍   | 47/73 [03:43<02:02,  4.72s/it]Evaluating:  66%|██████▌   | 48/73 [03:47<01:57,  4.72s/it]Evaluating:  67%|██████▋   | 49/73 [03:52<01:53,  4.72s/it]Evaluating:  68%|██████▊   | 50/73 [03:57<01:48,  4.72s/it]Evaluating:  70%|██████▉   | 51/73 [04:02<01:43,  4.72s/it]Evaluating:  71%|███████   | 52/73 [04:06<01:39,  4.72s/it]Evaluating:  73%|███████▎  | 53/73 [04:11<01:34,  4.72s/it]Evaluating:  74%|███████▍  | 54/73 [04:16<01:29,  4.72s/it]Evaluating:  75%|███████▌  | 55/73 [04:21<01:24,  4.72s/it]Evaluating:  77%|███████▋  | 56/73 [04:25<01:20,  4.72s/it]Evaluating:  78%|███████▊  | 57/73 [04:30<01:15,  4.72s/it]Evaluating:  79%|███████▉  | 58/73 [04:35<01:10,  4.72s/it]Evaluating:  81%|████████  | 59/73 [04:39<01:06,  4.72s/it]Evaluating:  82%|████████▏ | 60/73 [04:44<01:01,  4.72s/it]Evaluating:  84%|████████▎ | 61/73 [04:49<00:56,  4.72s/it]Evaluating:  85%|████████▍ | 62/73 [04:54<00:51,  4.72s/it]Evaluating:  86%|████████▋ | 63/73 [04:58<00:47,  4.72s/it]Evaluating:  88%|████████▊ | 64/73 [05:03<00:42,  4.72s/it]Evaluating:  89%|████████▉ | 65/73 [05:08<00:37,  4.72s/it]Evaluating:  90%|█████████ | 66/73 [05:12<00:33,  4.72s/it]Evaluating:  92%|█████████▏| 67/73 [05:17<00:28,  4.72s/it]Evaluating:  93%|█████████▎| 68/73 [05:22<00:23,  4.72s/it]Evaluating:  95%|█████████▍| 69/73 [05:27<00:18,  4.72s/it]Evaluating:  96%|█████████▌| 70/73 [05:31<00:14,  4.72s/it]Evaluating:  97%|█████████▋| 71/73 [05:36<00:09,  4.72s/it]Evaluating:  99%|█████████▊| 72/73 [05:41<00:04,  4.72s/it]Evaluating: 100%|██████████| 73/73 [05:43<00:00,  3.83s/it]Evaluating: 100%|██████████| 73/73 [05:43<00:00,  4.70s/it]
+
+=== Text-conditioned baseline ===
+mAP (IoU=0.50:0.95): 0.2404
+mAP (IoU=0.50): 0.3234
+mAP (IoU=0.75): 0.2721
+mAP (small): 0.0439
+mAP (medium): 0.1694
+mAP (large): 0.2840
+Traceback (most recent call last):
+  File "/home/fellin/repos/openvocab/owlv2-torch/prototype_train/train_text.py", line 668, in <module>
+    main()
+  File "/home/fellin/repos/openvocab/owlv2-torch/prototype_train/train_text.py", line 491, in main
+    mlflow.log_metric(f"baseline/{key}", mlflow_metric_value(value))
+                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/fellin/repos/openvocab/owlv2-torch/prototype_train/train.py", line 259, in mlflow_metric_value
+    return value.item() if hasattr(value, "item") else value
+           ^^^^^^^^^^^^
+RuntimeError: a Tensor with 46 elements cannot be converted to Scalar

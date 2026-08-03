@@ -38,6 +38,7 @@ dependencies = [
 
 [project.optional-dependencies]
 train = [
+    "kornia>=0.8.0",
     "pycocotools>=2.0.7",
     "torchmetrics>=0.11.4",
     "faster-coco-eval>=1.6.8",

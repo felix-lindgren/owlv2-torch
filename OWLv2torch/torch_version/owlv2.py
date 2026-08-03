@@ -8,6 +8,7 @@ from safetensors import safe_open
 
 import torchvision.transforms.v2 as T
 import torchvision.transforms.v2.functional as TF
+from torch.utils.checkpoint import checkpoint
 from PIL import Image
 from scipy import ndimage as ndi
 
@@ -185,10 +186,25 @@ class Encoder(nn.Module):
             EncoderLayer(hidden_size, num_heads, mlp_dim, dropout)
             for _ in range(num_layers)
         ])
+        # Toggled by OwlV2.set_gradient_checkpointing; recomputes each block's
+        # activations in backward instead of keeping them alive.
+        self.gradient_checkpointing = False
+
+    def _should_checkpoint(self, layer, x) -> bool:
+        if not (self.gradient_checkpointing and self.training and torch.is_grad_enabled()):
+            return False
+        # A layer whose input is detached and whose parameters are all frozen
+        # stores no activations to begin with, so recomputing it is pure cost.
+        # With partial fine-tuning (e.g. only the last N blocks trainable) this
+        # skips the frozen prefix of the tower.
+        return x.requires_grad or any(p.requires_grad for p in layer.parameters())
 
     def forward(self, x, mask=None):
         for layer in self.layers:
-            x = layer(x, mask)
+            if self._should_checkpoint(layer, x):
+                x = checkpoint(layer, x, mask, use_reentrant=False)
+            else:
+                x = layer(x, mask)
         return x
 
 class VisionTower(nn.Module):
@@ -458,6 +474,35 @@ class OwlV2(nn.Module):
         # into the already allocated module parameters.
         self.load_state_dict(state_dict, strict=True, assign=True)
     
+    def set_gradient_checkpointing(
+        self, enabled: bool = True, vision: bool = True, text: bool = True
+    ) -> "OwlV2":
+        """Trade compute for activation memory in the transformer towers.
+
+        Each selected encoder block is re-run during backward instead of keeping
+        its activations, which is where nearly all of the training memory sits.
+        Checkpointing only takes effect while the module is in training mode with
+        grad enabled, so inference and evaluation paths are untouched.
+
+        Args:
+            enabled: turn checkpointing on or off.
+            vision: apply to the vision tower's encoder.
+            text: apply to the text tower's encoder.
+        """
+        if vision:
+            self.vision_model.encoder.gradient_checkpointing = enabled
+        if text:
+            self.text_model.encoder.gradient_checkpointing = enabled
+        return self
+
+    @property
+    def gradient_checkpointing(self) -> bool:
+        """True if either tower is checkpointing."""
+        return (
+            self.vision_model.encoder.gradient_checkpointing
+            or self.text_model.encoder.gradient_checkpointing
+        )
+
     def preprocess_image(self, image, fast=False):
         """Preprocess one or more images for OwlV2 detection.
 
