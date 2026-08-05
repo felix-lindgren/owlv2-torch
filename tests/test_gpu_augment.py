@@ -119,6 +119,60 @@ def test_mosaic_carries_labels_through_ragged_and_empty_targets():
             assert counts[int(label)] > 0
 
 
+@pytest.mark.parametrize("mosaic_prob", (0.25, 0.5, 0.75))
+def test_mosaic_keeps_labels_attached_when_only_part_of_the_batch_is_mosaicked(mosaic_prob):
+    """kornia emits one permutation row per *applied* sample, not per batch entry.
+
+    Reading those rows as batch-indexed misaligns every label once the per-sample
+    probability skips anyone, so this has to hold below ``mosaic_prob=1.0`` too.
+    """
+    batch_size = 6
+    images = constant_colour_batch(batch_size)
+    saw_partial = False
+    for seed in range(12):
+        torch.manual_seed(seed)
+        augmentor = BatchAugmentor(
+            IMAGE_SIZE,
+            mosaic_prob=mosaic_prob,
+            min_box_visibility=0.0,
+            color_jitter_brightness=0.0,
+            color_jitter_contrast=0.0,
+            color_jitter_saturation=0.0,
+            color_jitter_hue=0.0,
+        )
+        targets = full_image_targets(batch_size)
+        mosaic_images, mosaic_targets = augmentor._apply_mosaic(images, targets)
+
+        applied = augmentor.mosaic._params["batch_prob"] > 0.5
+        saw_partial |= 0 < int(applied.sum()) < batch_size
+        for index, (image, target) in enumerate(zip(mosaic_images, mosaic_targets)):
+            for box, label in zip(target["boxes"], target["labels"]):
+                assert box_interior_colours(image, box).tolist() == pytest.approx(
+                    [colour_of_label(label, batch_size)]
+                )
+            if not applied[index]:
+                # A skipped sample must come back exactly as it went in.
+                assert target["labels"].tolist() == [index]
+                assert target["boxes"].flatten().tolist() == pytest.approx([0.5, 0.5, 1.0, 1.0])
+    assert saw_partial, "no seed produced a partially mosaicked batch"
+
+
+def test_mosaic_passes_the_batch_through_when_no_sample_is_selected():
+    """With nothing sampled kornia also skips the per-cell box expansion."""
+    batch_size = 4
+    images = constant_colour_batch(batch_size)
+    for seed in range(200):
+        torch.manual_seed(seed)
+        augmentor = BatchAugmentor(IMAGE_SIZE, mosaic_prob=0.05, min_box_visibility=0.0)
+        targets = full_image_targets(batch_size)
+        out_images, out_targets = augmentor._apply_mosaic(images, targets)
+        if float(augmentor.mosaic._params["batch_prob"].sum()) == 0:
+            assert out_targets is targets
+            assert torch.equal(out_images, images)
+            return
+    pytest.fail("no seed left the whole batch unmosaicked")
+
+
 def test_mosaic_visibility_threshold_drops_heavily_clipped_boxes():
     torch.manual_seed(2)
     batch_size = 8

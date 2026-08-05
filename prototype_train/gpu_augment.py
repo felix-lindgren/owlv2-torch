@@ -146,11 +146,38 @@ class BatchAugmentor(nn.Module):
         applied = params["batch_prob"].to(device) > 0.5
         cells = permutation.shape[1]
 
+        # With nothing sampled kornia returns the batch untouched *and* skips the
+        # per-cell box expansion, so there is no mosaic layout to rebuild.
+        if not bool(applied.any()):
+            return images, targets
+
+        # kornia samples one permutation row per *applied* sample, indexed by rank
+        # among them rather than by batch position, so the rows have to be
+        # scattered back onto the batch before they can index anything of length
+        # ``batch_size``. A sample the per-sample probability skipped keeps its own
+        # boxes in block 0, which the identity fill plus the block mask below
+        # encode. When every sample is mosaicked this is the identity.
+        if permutation.shape[0] != int(applied.sum()):
+            raise RuntimeError(
+                f"kornia returned {permutation.shape[0]} mosaic permutations for "
+                f"{int(applied.sum())} augmented samples; labels cannot be recovered"
+            )
+        batch_permutation = (
+            torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, cells).clone()
+        )
+        batch_permutation[applied] = permutation
+        permutation = batch_permutation
+
         # RandomMosaic returns B x (cells * max_boxes) x 4: block ``k`` holds the
         # boxes of source image ``permutation[:, k]``, translated into the mosaic
         # and clamped to the crop. Gathering the labels the same way is what
         # keeps them attached to their boxes. For samples the per-sample
         # probability skipped, kornia keeps block 0 and zeroes the rest.
+        if mosaic_boxes.shape[1] != cells * max_boxes:
+            raise RuntimeError(
+                f"Expected {cells * max_boxes} mosaic box slots, got "
+                f"{mosaic_boxes.shape[1]}; the block layout is not as assumed"
+            )
         out_labels = torch.cat([labels[permutation[:, k]] for k in range(cells)], dim=1)
         keep = torch.cat(
             [

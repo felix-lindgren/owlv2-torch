@@ -17,6 +17,7 @@ from pathlib import Path
 
 import mlflow
 import torch
+from mlflow.exceptions import MlflowException
 from torch import nn
 from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import CocoDetection
@@ -87,6 +88,42 @@ def build_prompt_pools(
             raise ValueError(f"No prompts could be built for class {class_name!r}")
         pools.append(prompts)
     return pools
+
+
+def drop_categories_by_name(
+    coco, category_ids: list[int], excluded: list[str]
+) -> tuple[list[int], list[str]]:
+    """Remove categories whose name matches ``excluded``, order otherwise preserved.
+
+    Matching is on the cleaned full category name, so a multi-alias category such
+    as ``"shirt, blouse"`` must be named in full. An unmatched entry raises rather
+    than silently keeping the class it was meant to drop.
+    """
+    wanted = {_clean_query_text(name) for name in excluded}
+    cleaned_by_id = {
+        category_id: _clean_query_text(coco.cats[category_id]["name"])
+        for category_id in category_ids
+    }
+    unmatched = sorted(wanted - set(cleaned_by_id.values()))
+    if unmatched:
+        available = ", ".join(sorted(cleaned_by_id.values()))
+        raise ValueError(
+            f"--exclude-class-names did not match any category: {unmatched}. "
+            f"Available: {available}"
+        )
+    kept = [
+        category_id
+        for category_id in category_ids
+        if cleaned_by_id[category_id] not in wanted
+    ]
+    if not kept:
+        raise ValueError("--exclude-class-names removed every category")
+    dropped = [
+        cleaned_by_id[category_id]
+        for category_id in category_ids
+        if cleaned_by_id[category_id] in wanted
+    ]
+    return kept, dropped
 
 
 def sample_prompt_set(
@@ -174,6 +211,19 @@ def configure_trainable_parameter_groups(model: OwlV2, args) -> list[dict]:
     return groups
 
 
+def log_metrics(metrics: dict[str, float], step: int | None = None) -> None:
+    """Log metrics, treating a failing tracking store as non-fatal.
+
+    The SQLite store raises ``database is locked`` when a concurrent run holds the
+    write lock. The per-step call site runs thousands of times, so letting that
+    propagate takes down a multi-hour run to save a single metric point.
+    """
+    try:
+        mlflow.log_metrics(metrics, step=step)
+    except MlflowException as error:
+        print(f"Skipped MLflow metrics at step {step}: {error}", file=sys.stderr)
+
+
 def log_eval_metrics(metrics, prefix: str, step: int | None = None) -> None:
     """Log the scalar entries of a torchmetrics result, skipping per-class tensors."""
     scalars = {
@@ -181,7 +231,7 @@ def log_eval_metrics(metrics, prefix: str, step: int | None = None) -> None:
         for key, value in metrics.items()
         if not (hasattr(value, "numel") and value.numel() != 1)
     }
-    mlflow.log_metrics(scalars, step=step)
+    log_metrics(scalars, step=step)
 
 
 def evaluation_prompts(class_names: list[str], template: str) -> list[str]:
@@ -251,6 +301,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-type", choices=("base", "large"), default="base")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--category-ids", nargs="+", type=int)
+    parser.add_argument(
+        "--exclude-class-names",
+        nargs="+",
+        help=(
+            "Drop these COCO categories, matched against category names after the "
+            "same cleaning applied to prompts (an unmatched name is an error). "
+            "Their boxes leave both the training targets and the validation "
+            "ground truth, and their queries leave the prompt set, so the metric "
+            "is computed over the remaining classes only and is NOT comparable to "
+            "a run with a different class set."
+        ),
+    )
     parser.add_argument("--shots-per-class", type=int)
     parser.add_argument("--seed", type=int, default=0)
 
@@ -518,6 +580,11 @@ def main(argv: list[str] | None = None) -> None:
             ),
         )
         category_ids = args.category_ids or sorted(train_dataset.coco.getCatIds())
+        if args.exclude_class_names:
+            category_ids, excluded_names = drop_categories_by_name(
+                train_dataset.coco, category_ids, args.exclude_class_names
+            )
+            print(f"Excluded {len(excluded_names)} classes: {', '.join(excluded_names)}")
         missing_val_ids = set(category_ids) - set(val_dataset.coco.getCatIds())
         if missing_val_ids:
             raise ValueError(f"Validation annotations are missing category ids {sorted(missing_val_ids)}")
@@ -794,7 +861,7 @@ def main(argv: list[str] | None = None) -> None:
                     step=(f"{global_step}/{args.max_steps}" if args.max_steps else global_step),
                 )
                 if args.mlflow:
-                    mlflow.log_metrics(
+                    log_metrics(
                         {
                             "train/loss_step": current_loss,
                             **{
@@ -822,11 +889,16 @@ def main(argv: list[str] | None = None) -> None:
             average_loss = running_loss / max(1, epoch_steps)
             print(f"Epoch {epoch + 1}: average loss {average_loss:.4f}")
             if args.mlflow:
-                mlflow.log_metric("train/loss_epoch", average_loss, step=epoch + 1)
-                for group in optimizer.param_groups:
-                    mlflow.log_metric(
-                        f"train/lr/{group['name']}", group["lr"], step=epoch + 1
-                    )
+                log_metrics(
+                    {
+                        "train/loss_epoch": average_loss,
+                        **{
+                            f"train/lr/{group['name']}": group["lr"]
+                            for group in optimizer.param_groups
+                        },
+                    },
+                    step=epoch + 1,
+                )
 
             should_evaluate_by_epoch = (
                 args.eval_every_steps is None

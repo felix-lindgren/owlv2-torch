@@ -360,7 +360,7 @@ and the broken loss, so the depth sweep starts from scratch. All arms use
 
 vision-blocks 2 is A's winner, already run.
 
-### C1 result (2026-08-04) — no measurable gain from deeper unfreezing
+### C1 result (2026-08-04) — ~~no measurable gain from deeper unfreezing~~ CONFOUNDED, see finding 15
 
 C1 ran with MAL γ1.5, `--vision-blocks 6 --vision-learning-rate 5e-6
 --grad-checkpointing --val-batch-size 16`. MLflow `owlv2_text_20260803_213605`,
@@ -387,12 +387,67 @@ something else changes: the curve from vb2 → vb6 is flat, so vb12 and vb24 are
 paying 4x and 9x the step time to explore a direction that produced no gradient of
 improvement, and both were already expected to lose to C1.
 
+> **WRONG — retracted 2026-08-04 (finding 15).** This comparison was confounded:
+> C1 changed **two** variables against A2, `vision_blocks` 2→6 *and*
+> `vision_learning_rate` 1e-5→5e-6. The control run C4 shows the lower vision LR
+> costs −0.0050 map on its own, which was masking the depth gain. At a *fixed*
+> vision LR, vb6 beats vb2 by **+0.0080 map** — above the noise floor. Depth is
+> live, not dead, and the C2/C3 "drop" recommendation that follows from this
+> finding must be re-opened.
+
 **13. The one thing worth a follow-up is `map_large`.** C1 reached 0.3958 against
 A2's 0.3914 / 0.3915. That +0.0044 would be unremarkable on any other metric, but
 map_large is the only metric that came out seed-stable (Δ 0.0001 across the A2
 pair). If large-object accuracy is the target, one more seed of C1 would settle
 whether this is real. Caveat: a seed-sd estimated from n=2 is itself unreliable,
 so this is a hypothesis, not a finding.
+
+> **Confirmed 2026-08-04 (finding 14).** C1 seed 1 landed at `map_large` 0.3947
+> against seed 0's 0.3958. Both C1 seeds beat both A2 seeds with no overlap.
+
+### C1 seed repeat + the vision-LR control (2026-08-04)
+
+Two runs, both at the standard 2200-step protocol.
+
+- **C1 seed 1** — C1's exact config, seed 0 → 1. MLflow
+  `owlv2_text_20260804_181631`, ~2h40.
+- **C4 (new)** — A2's exact config with **only** `--vision-learning-rate` changed,
+  1e-5 → 5e-6. `--vision-blocks 2`, no checkpointing, seed 0. MLflow
+  `owlv2_text_20260804_210944`, ~2h00. This is the missing cell that makes C1
+  interpretable. *On disk it is `text_checkpoints/fashionpedia_large_C2_vb2_vlr5e6_20260804`
+  and `logs/train_text_C2_vb2_vlr5e6_20260804.log` — the "C2" there is a launch-time
+  misnomer and **not** block C's C2 (vision-blocks 12), which has never been run.*
+
+The 2x2, final values at the 2200-step budget:
+
+| `map` / `map_large` | vision-lr 1e-5 | vision-lr 5e-6 |
+|---|---|---|
+| **vb2** | A2: 0.3268 / 0.3914, 0.3326 / 0.3915 | **C4: 0.3247 / 0.3893** |
+| **vb6** | *never run* | C1: 0.3332 / 0.3958, 0.3322 / 0.3947 |
+
+**14. `map_large` is seed-stable at convergence in both configs, and mid-training
+spread is not the floor.** C1's two seeds finished 0.3958 / 0.3947 (Δ 0.0011),
+matching the A2 pair's Δ 0.0001. But the same C1 pair differed by **0.0512** at
+step 550, 0.0131 at 1100 and 0.0114 at 1650 before collapsing to 0.0011 at 2200 —
+so a seed floor read off a partially-annealed eval overstates it by up to 50x.
+Related: C1 seed 0 fell 0.4037 → 0.3958 over its last 550 steps while seed 1 *rose*
+0.3923 → 0.3947, so that late drop was noise, not the larger model turning over.
+**Only compare fully-annealed evals.** On overall `map`, C1's seed spread was
+0.0010 against A2's 0.0058 — the ±0.006 floor is a property of a config, not a
+constant.
+
+**15. Depth is the driver, not the vision LR — and the confound hid it.** With
+vision LR held at 5e-6, vb6 beats vb2 by **+0.0080 map** and **+0.0059 map_large**.
+With depth held at vb2, dropping the vision LR 1e-5 → 5e-6 is worth **−0.0050 map**
+and **−0.0022 map_large**, i.e. flat to mildly harmful. So C1's headline advantage
+over A2 was *understated*: its own halved vision LR was working against the depth
+gain it was meant to demonstrate. Finding 12's "vb6 buys nothing" is an artifact of
+comparing across two changed variables at once. Caveat: C4 is n=1, so the depth
+contrast is one seed against two.
+
+**16. The obvious next run is the untested cell, vb6 @ vision-lr 1e-5.** If the two
+effects are additive it should beat every 2200-step arm on both metrics; it is also
+the only way to test whether they are additive rather than interacting. ~2h50.
 
 Notes:
 
@@ -406,6 +461,62 @@ Notes:
 - Optimizer state for full unfreeze is 2.4 GiB (AdamW fp32 moments); that is
   already in the measured 8.30 GiB peak.
 - Run C1 and C2 concurrently, then C0 and C3.
+
+## Block E — training budget (new, 2026-08-04)
+
+Motivated by the "revised again" section below: every arm through 2026-08-03 was
+still climbing at step 2200 (0.39 of an epoch), so the binding constraint looked
+like budget rather than objective or capacity.
+
+| run | flags | status |
+|---|---|---|
+| **E1** | A2's config at `--max-steps 6600` (3x budget), `--eval-every-steps 550` | **crashed at ~step 4828/6600** |
+
+*On disk E1 is `text_checkpoints/fashionpedia_large_B1_mal6600_20260804` and
+`logs/train_text_B1_mal6600_20260804.log`; MLflow `owlv2_text_20260804_181323`. The
+"B1" there is a launch-time misnomer and **not** block B's B1 (bs4 × accum 4).*
+
+### E1 partial result — the budget is the biggest lever found so far
+
+E1 died at 22:33 from the MLflow lock bug (see Infrastructure below), 73% through.
+Last completed eval was step 4400; the checkpoint at that step is on disk.
+
+| step | 550 | 1100 | 1650 | 2200 | 2750 | 3300 | 3850 | 4400 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| map | 0.2823 | 0.3017 | 0.2764 | 0.3191 | 0.3299 | 0.3277 | 0.3390 | **0.3443** |
+| map_large | 0.3232 | 0.3523 | 0.3411 | 0.3770 | 0.3906 | 0.3799 | 0.4019 | 0.3921 |
+
+**17. 3x budget beats every 2200-step arm, and it had not flattened when it died.**
+E1's 0.3443 at step 4400 is **+0.0117 over the best 2200-step result** (A2 seed 1,
+0.3326) — about 2x the noise floor, and the largest margin any change has produced
+in this project. It was still climbing. Budget dominates loss choice (≤0.01,
+inside noise), unfreeze depth (+0.008) and vision LR (−0.005).
+
+**18. Do not compare a stretched-cosine run to a short one before it anneals.**
+`--max-steps` sets `T_max`, so tripling the budget holds the LR near peak for
+thousands of steps the short arms never spent there. LR multiplier by step:
+
+| step | A2 (2200) | E1 (6600) |
+|---|---:|---:|
+| 550 | ×0.891 | ×0.988 |
+| 1100 | ×0.537 | ×0.943 |
+| 1650 | ×0.160 | ×0.866 |
+| 2200 | ×0.000 | ×0.764 |
+| 3850 | — | ×0.380 |
+| 5500 | — | ×0.069 |
+
+E1 led at 550, trailed at 1100–2200, and only pulled clear after ×0.5. Its dip at
+step 1650 (0.2764, below its own step-550 value) was a high-LR wobble, not
+degradation — bucketed into 275-step windows `train/L_cls` fell monotonically the
+whole run (1.587 → 1.303). **Single-step loss samples are too noisy to read a trend
+from; bucket before concluding anything.**
+
+**19. Open question E1 did not get to answer.** Where the curve flattens. That
+lives in the last ~1500 steps, at ×0.07 LR and below, which E1 never reached. A
+clean rerun is needed — and there is **no resume**: `save_text_checkpoint` stores
+weights, class names, epoch and config, but no optimizer/scaler/scheduler state, so
+restarting from `last.pth` would drop a warm model into a fresh cosine at full LR
+with reset Adam moments. That is not a continuation and would not be comparable.
 
 ## Block D — mosaic (3 runs)
 
@@ -445,7 +556,149 @@ per-sample op) and that `--mosaic-prob 0 --gpu-augment` matches
 `--no-gpu-augment` on mAP within noise. If it does not, every block-D result is
 confounded by the jitter change.
 
+> **Partly resolved 2026-08-04.** `--gpu-augment` defaults to True and **was already
+> active in every arm run so far** (A1–A4, both A2 seeds, C1 both seeds, C4, E1).
+> With `--mosaic-prob 0` the mosaic op is `None` but `ColorJiggle(0.3, 0.3, 0.2,
+> 0.02)` still runs at p=1.0, followed by device-side normalisation, plus
+> `horizontal_flip_prob=0.5` in the dataloader. Smoke-tested `BatchAugmentor`
+> directly: jitter fires per-image, boxes pass through untouched with mosaic off,
+> and mosaic rebuilds boxes while preserving resolution with it on. So **no existing
+> arm is confounded relative to another** — they all share the same augmentation —
+> and a "rerun with gpu-augs" would be a bit-identical duplicate. What remains
+> untested is the `--no-gpu-augment` CPU-path comparison, which only matters if a
+> block-D result is ever compared against a pre-`gpu_augment` run.
+
 ---
+
+## Block F — the 34-class set (new, 2026-08-05)
+
+Per-class AP from C1, grouped against train-split box counts:
+
+| group | classes | share of boxes | mean AP |
+|---|---:|---:|---:|
+| main garments + accessories | 27 | 48.9% | 0.472 |
+| garment parts | 9 | 45.1% | 0.232 |
+| decorations | 10 | 6.0% | 0.049 |
+
+**12 categories dropped**, leaving 34. The decorations go as a group (applique,
+bead, bow, flower, fringe, ribbon, rivet, ruffle, sequin, tassel): mean AP 0.049
+for 6% of the boxes, and bead/rivet are about one cell of the 14px patch grid, so
+this is nearly free. **neckline** goes because it fails the annotation-consistency
+test hardest while being common enough to do real damage — 34,257 boxes on 33,159
+images generating false negatives across the val set. **epaulette** goes for the
+same reason at much lower volume (874 boxes, 507 images, ~0.05% of image area).
+
+`sleeve`, `collar`, `lapel`, `pocket` and `hood` are **kept**, along with `buckle`
+and `zipper`. Those seven are the bulk of the 45.1% garment-parts supervision, and
+per finding 17 the run is budget-limited — cutting box supervision on an underfit
+model is a real risk, not a free cleanup. `sleeve` at 0.571 and `collar` at 0.271
+are working.
+
+Measured effect on supervision, both splits:
+
+| split | anns | kept | boxes/image |
+|---|---:|---:|---|
+| train | 333,391 | 278,334 (83.5%) | 7.3 → 6.1 |
+| val | 8,781 | 7,317 (83.3%) | 7.6 → 6.3 |
+
+**No image is emptied by the filter** — all 45,623 train and 1,158 val images
+retain at least one kept box — so the trainer needs no image-dropping logic and
+epoch size is unchanged.
+
+Implemented as `--exclude-class-names NAME [NAME ...]` in `train_text.py`, matched
+on the cleaned full category name with an unmatched name raising rather than
+silently keeping the class it was meant to drop. It resolves to `category_ids`
+before anything else reads them, so the boxes leave the training targets *and* the
+validation ground truth, and the queries leave the prompt set.
+
+> **`val/map` from block F is not comparable to any earlier run.** 34 queries
+> instead of 46, and the metric averages over a different, easier set of classes.
+> Only compare block F arms to each other.
+
+| run | change | status |
+|---|---|---|
+| **F1** | 34 classes, `--mosaic-prob 0`, `--max-steps 6600` | launched 21:02, GPU 0 |
+| **F2** | 34 classes, `--mosaic-prob 0.5 --mosaic-grid 2 2`, `--max-steps 6600` | launched 21:01, GPU 1 |
+
+Everything else at the standard protocol with MAL γ1.5, `--vision-blocks 2`,
+`--vision-learning-rate 1e-5`, bs8, seed 0, `--compile --val-batch-size 16`,
+`--eval-every-steps 550` (12 evals). MLflow `owlv2_text_20260805_210220` (F1) and
+`owlv2_text_20260805_210122` (F2). Checkpoints in
+`text_checkpoints/fashionpedia_large_F{1,2}_34cls_{nomosaic,mosaic}_20260805`.
+
+These two arms answer three things at once: the E1 rerun the schedule called for
+(F1 is E1's config at the reduced class set, and it carries the lock fix so it
+should survive), block D's D1 at a budget where a regularizer can actually pay,
+and the class-set change itself. Depth was deliberately held at vb2 rather than
+taking finding 16's vb6 — changing the class set and the capacity in the same run
+is precisely the two-variables-at-once confound that produced finding 15's
+retraction.
+
+## Infrastructure — mosaic was broken for every batch it did not fully cover (2026-08-05)
+
+**`--mosaic-prob 0.5` could never have run.** Found by smoke-testing block D's
+config before launching F2; the first training step raised
+`RuntimeError: The size of tensor a (2) must match the size of tensor b (4)`.
+
+kornia's `RandomMosaic` emits `_params["permutation"]` with **one row per applied
+sample**, indexed by rank among the applied samples — not one row per batch entry.
+`gpu_augment._apply_mosaic` read those rows as batch-indexed. Consequences:
+
+- `0 < applied < batch_size`: `permutation[:, k]` is shorter than the batch, so
+  every gather against it either raises or silently misaligns labels. At
+  `--mosaic-prob 0.5` this is the overwhelmingly common case.
+- `applied == 0`: kornia additionally skips the per-cell box expansion and returns
+  a `B x max_boxes x 4` tensor instead of `B x (cells*max_boxes) x 4`, which breaks
+  the size filter's broadcast.
+- `applied == batch_size` (i.e. `mosaic_prob=1.0`): rank order equals batch order,
+  so the old code was correct. **Every existing test used `mosaic_prob=1.0`**, and
+  so did the block D measurements above — which is why this survived, and why
+  those measurements stand.
+
+Fixed by scattering the applied rows back onto their batch positions with an
+identity fill for the skipped samples (whose own boxes kornia leaves in block 0,
+which the existing `applied[:, None] if k else True` mask already handles), plus an
+early return for the nothing-applied case. Both the block layout and the
+rank-ordering were confirmed empirically against kornia 0.8.3 with solid-colour
+source images before the fix was written, rather than assumed.
+
+Regression tests added in `tests/test_gpu_augment.py`: label-to-box attachment at
+`mosaic_prob` 0.25/0.5/0.75 over 12 seeds each (asserting a partially-mosaicked
+batch actually occurred, and that skipped samples come back byte-identical), and
+the nothing-applied passthrough. All four fail on the pre-fix code.
+
+## Infrastructure — the MLflow SQLite lock (2026-08-04)
+
+**E1 lost ~4.5 GPU-hours to this. Fixed, but read before launching parallel arms.**
+
+Two trainers writing `mlflow.db` concurrently (plus read queries against it for
+analysis) hit `sqlite3.OperationalError: database is locked`. SQLite's default
+rollback journal lets a reader block a writer, and MLflow's internal retry does not
+always outlast the contention. The per-step `mlflow.log_metrics` call in
+`train_text.py` had no exception handling and runs once per optimizer step, so a
+single transient lock propagated out of `main()` and killed the run.
+
+Four earlier non-fatal lock tracebacks appeared in E1's log before the fatal one.
+**Treat any lock traceback as the run being at risk**, not as evidence the failure
+class is benign — that inference was made during the run and was wrong.
+
+Fixes applied:
+
+1. `log_metrics()` helper in `train_text.py` wraps `mlflow.log_metrics` in
+   `try/except MlflowException`, reports to stderr and continues. All metric call
+   sites route through it. `mlflow.log_params` at startup is deliberately left
+   unguarded — failing loudly there is cheap. Verified both ways: a simulated
+   `database is locked` is swallowed, a `ValueError` still propagates.
+2. `mlflow.db` set to `PRAGMA journal_mode=WAL` (persistent), so readers and one
+   writer coexist.
+
+When querying `mlflow.db` while runs are active, connect read-only
+(`file:mlflow.db?mode=ro`) and keep polling minimal. Note `busy_timeout` is
+per-connection and does **not** persist in the file; only `journal_mode` does.
+
+**Still missing: resume support.** See finding 19. A crash at hour 5 of a 6-hour run
+currently means starting over. If block E runs become routine, checkpointing
+optimizer/scaler/scheduler state is worth the hour it would take to add.
 
 ## Schedule
 
@@ -456,13 +709,15 @@ Sequential by dependency, two GPUs in parallel within a block:
 | 0 | ~~`--compile`, `drop_last`, `--grad-accum-steps`, `--val-batch-size`~~ done; mosaic schedule outstanding | — | code only |
 | 1 | ~~A1 + A2~~ done (2026-08-03, 4.0 GPU-h, 2h00 wall) | — | — |
 | 1b | ~~A3 + A4~~ done (2026-08-03, 4.0 GPU-h, 1h59 wall) | — | — |
-| 2 | C0 (+ seed repeat of A2, recommended) | 4.0 | ~2h10 |
-| 3 | C1 + C2 | 6.8 | ~4h00 |
-| 4 | C3 + B1 | 8.0 | ~6h05 |
-| 5 | B2 + B3 | 3.8 | ~1h55 |
-| 6 | D1 + D2 | 4.4 | ~2h20 |
-| 7 | D3 (conditional) | 2.2 | ~2h20 |
-| | | **~36** | **~23 h** |
+| 2 | ~~C0~~ not run + ~~seed repeat of A2~~ done (2026-08-03) | — | — |
+| 3 | ~~C1~~ done (2026-08-03); C2 not run | — | — |
+| 3b | ~~C1 seed 1 + C4~~ done (2026-08-04, 4.7 GPU-h) | — | — |
+| 3c | ~~E1 (3x budget)~~ **crashed at 73%**, 4.5 GPU-h lost | — | — |
+| 4 | **F1 + F2** (34 classes, 6600 steps, mosaic off/on) ← running 2026-08-05 | ~10 | ~5h00 |
+| 5 | ~~B1/B2/B3~~ dropped | — | — |
+| 6 | C5 (vb6 @ vlr 1e-5) at the 34-class set and F's budget | 3.5 | ~3h30 |
+| 7 | D2 (mosaic-off tail) if F2 wins; D3 conditional on that | 2.2+ | ~2h20+ |
+| | | **~16 remaining** | **~11 h** |
 
 Phase 0's ~15% throughput win is not in those numbers; applying it first pays for
 itself several times over.
@@ -519,3 +774,39 @@ Concretely, the remaining blocks should be re-scoped as:
 - **D (mosaic): still worth running,** but at the longer budget, since mosaic is a
   regularizer and 0.39 epochs is far too short for regularization to pay.
 - **Anything kept must budget two seeds** (protocol note above).
+
+### Revised again after 2026-08-04 (E1, C1 seed 1, C4)
+
+Three runs today: E1 (3x budget, crashed at 73%), C1 seed 1, and C4 (the vision-LR
+control). Net effect — **one prior conclusion retracted, and the budget hypothesis
+confirmed as the strongest lever.**
+
+Everything measured, best-to-worst by effect size on `val/map`:
+
+| lever | effect | status |
+|---|---:|---|
+| **Budget 2200 → 4400 steps** | **+0.0117** | finding 17, still climbing when it died |
+| Unfreeze depth vb2 → vb6 (fixed LR) | +0.0080 | finding 15, n=1 vs n=2 |
+| Vision LR 1e-5 → 5e-6 (fixed depth) | −0.0050 | finding 15, mildly harmful |
+| Classification loss (4 arms) | ≤0.0093 | findings 0/9, inside seed noise |
+| Seed, same config | ±0.0058 | finding 9 — the floor everything above is read against |
+
+Priority order for the next session:
+
+1. **Rerun E1 clean** (~6h, GPU 0). The lock fix is in, so it should survive.
+   This is the only open question with a >0.01 effect, and it answers where the
+   curve flattens — which every future comparison needs in order to pick a budget.
+2. **C5: vb6 @ vision-lr 1e-5** (~2h50, GPU 1, finding 16). Fills the last cell of
+   the 2x2 and tests whether depth and LR are additive. Fits inside E1's window.
+3. **A second seed of C4** if the depth claim is going to carry weight — finding 15
+   currently rests on one seed against two.
+4. **Then D (mosaic)** at whatever budget step 1 establishes, not at 2200.
+
+Re-opened by finding 15: **C2/C3 are no longer clearly dead.** The depth curve is
++0.0080 from vb2 → vb6 at fixed LR, not flat as finding 12 claimed, so vb12 is worth
+one run *after* the budget question is settled — at the right budget and at vision-lr
+1e-5, not 2e-6. Do not run the original C2/C3 configs as written; their tapered LRs
+are exactly the confound that produced the retraction.
+
+Still true from yesterday: block B stays dropped, and nothing below ~0.01 should be
+ranked from single-seed runs.
