@@ -249,8 +249,14 @@ def save_checkpoint(
     *,
     epoch: int,
     map_value: float | None,
+    training_state: dict | None = None,
 ) -> None:
-    """Save a small trainable-parameter delta unless ``--save-full-model`` is set."""
+    """Save a small trainable-parameter delta unless ``--save-full-model`` is set.
+
+    ``training_state`` holds everything ``--resume`` needs beyond the weights.
+    Only ``last.pth`` carries it: the AdamW moments alone are twice the size of
+    the trainable delta, and nothing but ``--resume`` ever reads them.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     if args.save_full_model:
         model_state = {name: value.detach().cpu() for name, value in model.state_dict().items()}
@@ -275,14 +281,14 @@ def save_checkpoint(
             "epoch": epoch,
             "map": map_value,
             "config": vars(args),
+            "training_state": training_state,
         },
         path,
     )
 
 
-def load_text_checkpoint(model: OwlV2, checkpoint_path: str | Path) -> dict:
-    """Load either a full or delta checkpoint produced by this trainer."""
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+def apply_text_checkpoint(model: OwlV2, checkpoint: dict) -> dict:
+    """Load an already-read checkpoint's weights into ``model``."""
     incompatible = model.load_state_dict(
         checkpoint["model_state_dict"],
         strict=checkpoint.get("format") == "owlv2-text-finetune-full-v1",
@@ -290,6 +296,72 @@ def load_text_checkpoint(model: OwlV2, checkpoint_path: str | Path) -> dict:
     if checkpoint.get("format") != "owlv2-text-finetune-full-v1" and incompatible.unexpected_keys:
         raise RuntimeError(f"Unexpected checkpoint keys: {incompatible.unexpected_keys}")
     return checkpoint
+
+
+def load_text_checkpoint(model: OwlV2, checkpoint_path: str | Path) -> dict:
+    """Load either a full or delta checkpoint produced by this trainer."""
+    return apply_text_checkpoint(
+        model, torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    )
+
+
+# Changing any of these makes a resumed run neither a continuation of the old one
+# nor a clean new one, and the failure is silent: the optimizer state is keyed by
+# parameter position, the scheduler by step count, and the learning rates live in
+# the restored optimizer state, so a changed --vision-learning-rate is ignored
+# rather than applied.
+RESUME_CRITICAL_ARGS = (
+    "model_type",
+    "vision_blocks",
+    "text_blocks",
+    "train_box_head",
+    "train_objectness_head",
+    "head_learning_rate",
+    "vision_learning_rate",
+    "text_learning_rate",
+    "weight_decay",
+    "batch_size",
+    "grad_accum_steps",
+    "max_steps",
+    "epochs",
+    "warmup_steps",
+    "seed",
+    "shots_per_class",
+    "amp",
+)
+
+
+def check_resume_compatibility(
+    checkpoint: dict, args, class_names: list[str] | None = None
+) -> None:
+    """Reject a resume whose configuration differs from the run being continued.
+
+    The class set is only compared when ``class_names`` is supplied, so the
+    argument comparison can run before the tracking run is opened: a rejected
+    resume should not mark the run it was going to continue as failed.
+    """
+    saved = checkpoint.get("config") or {}
+    mismatches = [
+        f"{name}: checkpoint {saved.get(name)!r}, requested {getattr(args, name)!r}"
+        for name in RESUME_CRITICAL_ARGS
+        if name in saved and saved[name] != getattr(args, name)
+    ]
+    saved_classes = checkpoint.get("class_names")
+    if (
+        class_names is not None
+        and saved_classes is not None
+        and list(saved_classes) != list(class_names)
+    ):
+        mismatches.append(
+            f"class set: checkpoint has {len(saved_classes)} classes, "
+            f"this run has {len(class_names)}"
+        )
+    if mismatches:
+        raise ValueError(
+            "--resume checkpoint does not match this run's configuration:\n  "
+            + "\n  ".join(mismatches)
+            + "\nUse --init-from to start a new run from these weights instead."
+        )
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -511,6 +583,33 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--score-with-objectness", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--run-zero-shot-baseline", action="store_true")
+    parser.add_argument(
+        "--init-from",
+        help=(
+            "Load model weights from a checkpoint written by this trainer, then "
+            "train from scratch optimizer-wise. The checkpoint's class set need "
+            "not match this run's. Use --resume to continue an interrupted run."
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        help=(
+            "Continue an interrupted run from its last.pth (or a directory "
+            "containing one). Restores weights, optimizer, scheduler, AMP "
+            "scaler, step counters, best mAP and RNG state, and fast-forwards "
+            "the epoch's sample order to where it stopped. The configuration "
+            "must match the run being continued."
+        ),
+    )
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help=(
+            "Run one validation pass and exit without training or writing "
+            "checkpoints. With --init-from and --exclude-class-names this scores "
+            "existing weights against a different query set."
+        ),
+    )
     parser.add_argument("--output-dir", default="text_checkpoints")
     parser.add_argument("--save-full-model", action="store_true")
     parser.add_argument("--mlflow", action=argparse.BooleanOptionalAction, default=False)
@@ -541,6 +640,8 @@ def main(argv: list[str] | None = None) -> None:
     gpu_augment = args.augment and args.gpu_augment
     if args.mosaic_prob > 0 and not gpu_augment:
         raise ValueError("--mosaic-prob requires --augment and --gpu-augment")
+    if args.resume and args.init_from:
+        raise ValueError("--resume and --init-from are mutually exclusive")
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -549,12 +650,39 @@ def main(argv: list[str] | None = None) -> None:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available")
 
+    # Read before the tracking run is opened so a resume can rejoin the run it
+    # was interrupted in rather than starting a second one.
+    resume_checkpoint = None
+    if args.resume:
+        resume_path = Path(args.resume)
+        if resume_path.is_dir():
+            resume_path = resume_path / "last.pth"
+        resume_checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
+        if not resume_checkpoint.get("training_state"):
+            raise ValueError(
+                f"{resume_path} carries no training state, so it cannot be "
+                "resumed: it either predates --resume support or is a "
+                "best.pth/final.pth. Only last.pth stores optimizer state."
+            )
+        check_resume_compatibility(resume_checkpoint, args)
+
     if args.mlflow:
         configure_mlflow_tracking()
         mlflow.set_experiment(args.mlflow_experiment)
-        run_context = mlflow.start_run(
-            run_name=f"owlv2_text_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        resumed_run_id = (
+            resume_checkpoint["training_state"].get("mlflow_run_id")
+            if resume_checkpoint is not None
+            else None
         )
+        if resumed_run_id:
+            # Same run, so val/map stays a single series across the interruption.
+            # Train metrics between the last checkpoint and the crash are logged
+            # twice at those steps, once per attempt.
+            run_context = mlflow.start_run(run_id=resumed_run_id)
+        else:
+            run_context = mlflow.start_run(
+                run_name=f"owlv2_text_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            )
     else:
         run_context = nullcontext()
 
@@ -592,6 +720,21 @@ def main(argv: list[str] | None = None) -> None:
             category_id: label for label, category_id in enumerate(category_ids)
         }
         class_names = coco_class_names(train_dataset.coco, category_ids)
+
+        if resume_checkpoint is not None:
+            check_resume_compatibility(resume_checkpoint, args, class_names)
+            apply_text_checkpoint(model, resume_checkpoint)
+            print(f"Resuming from {resume_path}")
+        elif args.init_from:
+            initial_checkpoint = load_text_checkpoint(model, args.init_from)
+            print(f"Initialised weights from {args.init_from}")
+            initial_classes = initial_checkpoint.get("class_names") or []
+            if list(initial_classes) != list(class_names):
+                print(
+                    f"  checkpoint was trained on {len(initial_classes)} classes; "
+                    f"this run uses {len(class_names)}"
+                )
+
         prompt_templates = args.prompt_templates or list(DEFAULT_PROMPT_TEMPLATES)
         prompt_pools = build_prompt_pools(class_names, prompt_templates)
         eval_prompts = evaluation_prompts(class_names, args.eval_prompt_template)
@@ -629,17 +772,39 @@ def main(argv: list[str] | None = None) -> None:
             if gpu_augment
             else None
         )
-        train_loader = DataLoader(
-            Subset(train_augmented, train_indices),
-            batch_size=args.batch_size,
-            collate_fn=aug_collate_fn,
-            shuffle=True,
-            num_workers=args.num_workers,
-            pin_memory=device.type == "cuda",
-            persistent_workers=args.num_workers > 0,
-            prefetch_factor=4 if args.num_workers > 0 else None,
-            drop_last=True,
-        )
+        def make_train_loader(epoch: int, skip_batches: int = 0) -> DataLoader:
+            """Build one epoch's loader over an explicit, resumable sample order.
+
+            ``shuffle=True`` draws from the DataLoader's own RNG, which cannot be
+            positioned partway through an epoch. Materialising the permutation
+            here makes ``skip_batches`` an exact fast-forward — the resumed epoch
+            sees precisely the samples the interrupted one had left, and in the
+            same order — at the cost of the order differing from a pre-resume
+            run of the same seed.
+
+            The generator is passed to the loader as well, so worker
+            augmentation seeds depend only on the epoch rather than on where the
+            global RNG happens to be. Worker RNG is still not restored exactly on
+            resume: a worker re-seeded at the start of a truncated epoch reaches
+            a given sample at a different point in its stream.
+            """
+            generator = torch.Generator().manual_seed(args.seed * 1_000_003 + epoch)
+            order = torch.randperm(len(train_indices), generator=generator).tolist()
+            epoch_indices = [
+                train_indices[position]
+                for position in order[skip_batches * args.batch_size :]
+            ]
+            return DataLoader(
+                Subset(train_augmented, epoch_indices),
+                batch_size=args.batch_size,
+                collate_fn=aug_collate_fn,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=device.type == "cuda",
+                prefetch_factor=4 if args.num_workers > 0 else None,
+                drop_last=True,
+                generator=generator,
+            )
         val_loader = DataLoader(
             val_dataset,
             batch_size=args.val_batch_size or args.batch_size,
@@ -698,7 +863,7 @@ def main(argv: list[str] | None = None) -> None:
             count = sum(parameter.numel() for parameter in group["params"])
             print(f"  {group['name']}: {count:,} parameters at lr={group['lr']:.2g}")
 
-        if args.mlflow:
+        if args.mlflow and resume_checkpoint is None:
             mlflow.log_params(
                 {
                     **{key: str(value) for key, value in vars(args).items()},
@@ -709,6 +874,10 @@ def main(argv: list[str] | None = None) -> None:
                     "effective_batch_size": args.batch_size * args.grad_accum_steps,
                 }
             )
+        elif args.mlflow:
+            # The run already carries its parameters, and MLflow rejects
+            # re-logging one with a different value -- which --resume itself is.
+            mlflow.set_tag("resumed_from", str(resume_path))
 
         if args.run_zero_shot_baseline:
             baseline_metrics = coco_eval(
@@ -726,21 +895,108 @@ def main(argv: list[str] | None = None) -> None:
             if args.mlflow:
                 log_eval_metrics(baseline_metrics, "baseline/")
 
+        if args.eval_only:
+            metrics = coco_eval(
+                detector,
+                val_loader,
+                device,
+                confidence_threshold=args.confidence_threshold,
+                score_with_objectness=args.score_with_objectness,
+                top_k=args.eval_top_k,
+                output_format="standard",
+                title=f"Text-conditioned evaluation ({len(class_names)} classes)",
+                log_to_mlflow=args.mlflow,
+                max_batches=args.eval_max_batches,
+            )
+            if args.mlflow:
+                log_eval_metrics(metrics, "val/", step=0)
+            print(f"Evaluation mAP over {len(class_names)} classes: {float(metrics['map']):.4f}")
+            return
+
         output_dir = Path(args.output_dir)
         best_map = float("-inf")
         latest_map = None
         global_step = 0
         last_eval_step = None
         completed_epoch = 0
-        num_batches = len(train_loader)
-        if num_batches == 0:
-            raise RuntimeError("The training loader is empty")
+        start_epoch = 0
+        resume_batches_done = 0
         accum_steps = args.grad_accum_steps
-        steps_per_epoch = (num_batches + accum_steps - 1) // accum_steps
+        full_epoch_batches = len(train_indices) // args.batch_size
+        if full_epoch_batches == 0:
+            raise RuntimeError("The training loader is empty")
+        steps_per_epoch = (full_epoch_batches + accum_steps - 1) // accum_steps
+
+        if resume_checkpoint is not None:
+            state = resume_checkpoint["training_state"]
+            optimizer.load_state_dict(state["optimizer"])
+            scheduler.load_state_dict(state["scheduler"])
+            if state["scaler"]:
+                scaler.load_state_dict(state["scaler"])
+            global_step = state["global_step"]
+            start_epoch = state["epoch_index"]
+            resume_batches_done = state["epoch_batches_done"]
+            completed_epoch = start_epoch
+            best_map = state["best_map"]
+            latest_map = state["latest_map"]
+            last_eval_step = state["last_eval_step"]
+            torch.set_rng_state(state["torch_rng_state"])
+            if state["cuda_rng_state"] is not None and device.type == "cuda":
+                torch.cuda.set_rng_state_all(state["cuda_rng_state"])
+            random.setstate(state["python_rng_state"])
+            prompt_generator.setstate(state["prompt_rng_state"])
+            print(
+                f"Resumed at optimizer step {global_step}, epoch {start_epoch + 1}, "
+                f"{resume_batches_done}/{full_epoch_batches} batches into that epoch "
+                f"(best mAP so far {best_map:.4f})"
+            )
+            if args.max_steps is not None and global_step >= args.max_steps:
+                raise ValueError(
+                    f"Checkpoint is already at step {global_step} of "
+                    f"--max-steps {args.max_steps}; nothing left to run"
+                )
+
         if args.max_steps is None:
             epochs_to_run = args.epochs
         else:
-            epochs_to_run = (args.max_steps + steps_per_epoch - 1) // steps_per_epoch
+            # The resumed epoch is short, so it gets counted separately from the
+            # full epochs that follow it.
+            first_epoch_batches = full_epoch_batches - resume_batches_done
+            first_epoch_steps = (first_epoch_batches + accum_steps - 1) // accum_steps
+            remaining_steps = args.max_steps - global_step
+            if remaining_steps <= first_epoch_steps:
+                epochs_to_run = start_epoch + 1
+            else:
+                epochs_to_run = start_epoch + 1 + (
+                    remaining_steps - first_epoch_steps + steps_per_epoch - 1
+                ) // steps_per_epoch
+
+        # Position within the current epoch's permutation, so an interrupted run
+        # can pick the sample order back up where it stopped.
+        current_epoch_index = start_epoch
+        current_epoch_batches_done = resume_batches_done
+
+        def build_training_state() -> dict:
+            return {
+                "global_step": global_step,
+                "epoch_index": current_epoch_index,
+                "epoch_batches_done": current_epoch_batches_done,
+                "best_map": best_map,
+                "latest_map": latest_map,
+                "last_eval_step": last_eval_step,
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "scaler": scaler.state_dict(),
+                "torch_rng_state": torch.get_rng_state(),
+                "cuda_rng_state": (
+                    torch.cuda.get_rng_state_all() if device.type == "cuda" else None
+                ),
+                "python_rng_state": random.getstate(),
+                "prompt_rng_state": prompt_generator.getstate(),
+                "mlflow_run_id": (
+                    mlflow.active_run().info.run_id if args.mlflow else None
+                ),
+            }
 
         def run_validation(epoch_number: int, step: int) -> None:
             nonlocal best_map, latest_map, last_eval_step
@@ -762,15 +1018,6 @@ def main(argv: list[str] | None = None) -> None:
             last_eval_step = step
             if args.mlflow:
                 log_eval_metrics(metrics, "val/", step=step)
-            save_checkpoint(
-                output_dir / "last.pth",
-                model,
-                class_names,
-                eval_prompts,
-                args,
-                epoch=epoch_number,
-                map_value=latest_map,
-            )
             if latest_map > best_map:
                 best_map = latest_map
                 save_checkpoint(
@@ -783,8 +1030,25 @@ def main(argv: list[str] | None = None) -> None:
                     map_value=latest_map,
                 )
                 print(f"Saved new best checkpoint with mAP {best_map:.4f}")
+            # Written after best.pth so the resume state carries the updated
+            # best_map, and a resumed run does not re-save an inferior best.
+            save_checkpoint(
+                output_dir / "last.pth",
+                model,
+                class_names,
+                eval_prompts,
+                args,
+                epoch=epoch_number,
+                map_value=latest_map,
+                training_state=build_training_state(),
+            )
 
-        for epoch in range(epochs_to_run):
+        for epoch in range(start_epoch, epochs_to_run):
+            batch_offset = resume_batches_done if epoch == start_epoch else 0
+            train_loader = make_train_loader(epoch, batch_offset)
+            num_batches = len(train_loader)
+            current_epoch_index = epoch
+            current_epoch_batches_done = batch_offset
             detector.train()
             running_loss = 0.0
             epoch_steps = 0
@@ -803,6 +1067,7 @@ def main(argv: list[str] | None = None) -> None:
             window_size = 0
             window_losses: dict[str, float] = {}
             for batch_index, batch in enumerate(progress):
+                current_epoch_batches_done = batch_offset + batch_index + 1
                 if accumulated == 0:
                     # The last window of an epoch can be short, so normalise by the
                     # number of micro-batches it actually holds rather than by
@@ -883,6 +1148,11 @@ def main(argv: list[str] | None = None) -> None:
                 if args.max_steps is not None and global_step >= args.max_steps:
                     break
 
+            if not (args.max_steps is not None and global_step >= args.max_steps):
+                # The epoch was consumed rather than cut short, so a checkpoint
+                # written below should resume at the start of the next one.
+                current_epoch_index = epoch + 1
+                current_epoch_batches_done = 0
             completed_epoch = epoch + 1
             if args.max_steps is None:
                 scheduler.step()

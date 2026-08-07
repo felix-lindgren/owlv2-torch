@@ -617,8 +617,10 @@ validation ground truth, and the queries leave the prompt set.
 
 | run | change | status |
 |---|---|---|
-| **F1** | 34 classes, `--mosaic-prob 0`, `--max-steps 6600` | launched 21:02, GPU 0 |
-| **F2** | 34 classes, `--mosaic-prob 0.5 --mosaic-grid 2 2`, `--max-steps 6600` | launched 21:01, GPU 1 |
+| **F1** | 34 classes, `--mosaic-prob 0`, `--max-steps 6600` | **stopped at 4036/6600 (61%)**, GPU 0 |
+| **F2** | 34 classes, `--mosaic-prob 0.5 --mosaic-grid 2 2`, `--max-steps 6600` | **stopped at 3894/6600 (59%)**, GPU 1 |
+| **F1b** | clean rerun of F1 | **stopped at 4503/6600 (68%)**, GPU 0 — resumable |
+| **F2b** | clean rerun of F2 | **stopped at 4456/6600 (68%)**, GPU 1 — resumable |
 
 Everything else at the standard protocol with MAL γ1.5, `--vision-blocks 2`,
 `--vision-learning-rate 1e-5`, bs8, seed 0, `--compile --val-batch-size 16`,
@@ -633,6 +635,249 @@ and the class-set change itself. Depth was deliberately held at vb2 rather than
 taking finding 16's vb6 — changing the class set and the capacity in the same run
 is precisely the two-variables-at-once confound that produced finding 15's
 retraction.
+
+### F1/F2 partial results (2026-08-06)
+
+Both stopped by hand at ~60% for a server shutdown, after ~7 GPU-hours. Seven
+evals each. Numbers below are from MLflow, not the logs — stdout is block-buffered
+through the `nohup` redirect, so the last two evals of each run were still sitting
+unflushed in the buffer when the processes were killed. **Read `mlflow.db`, not
+the log tail, for anything time-sensitive.**
+
+| step | 550 | 1100 | 1650 | 2200 | 2750 | 3300 | 3850 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **F1** map | 0.3889 | 0.3961 | 0.3660 | 0.4176 | 0.3954 | **0.4326** | 0.4310 |
+| **F2** map | 0.3498 | 0.3674 | 0.3555 | 0.3574 | 0.3848 | 0.4103 | 0.4098 |
+| F2 − F1 | −0.0391 | −0.0287 | −0.0105 | −0.0602 | −0.0106 | −0.0223 | −0.0212 |
+
+| step | 550 | 1100 | 1650 | 2200 | 2750 | 3300 | 3850 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **F1** map_large | 0.4328 | 0.4381 | 0.4150 | 0.4631 | 0.4473 | **0.4784** | 0.4719 |
+| **F2** map_large | 0.3959 | 0.4115 | 0.3965 | 0.4011 | 0.4331 | 0.4507 | 0.4542 |
+
+Checkpoints: F1 `best.pth` = step 3300 (0.4326), `last.pth` = step 3850. F2 both
+at step 3850 (0.4098; its 3300 was 0.4103, so `best.pth` is the 3300 weights).
+
+**20. Mosaic trails at every single paired eval, but by ~0.02, not the ~0.06 one
+eval suggested.** The sign is negative 7 times out of 7, which is the robust part.
+The magnitude is not: the per-eval gap ranges −0.011 to −0.060, and it *narrows*
+over training (−0.039 → −0.022 across the run). Reading the −0.0602 at step 2200
+as the effect size was wrong — it is the widest of seven draws from a distribution
+whose mean is about −0.028. A regularizer starting behind and closing is exactly
+the expected shape, so **whether mosaic would have crossed over by step 6600 is
+genuinely unresolved**, and D2's mosaic-off tail was never tested at all. Do not
+record block D as decided.
+
+**21. Mid-training evals oscillate ±0.03–0.05 in this schedule — five times the
+annealed floor.** F1 went up, up, *down*, up, *down*, up, flat; the dips at 1650
+and 2750 are 0.03–0.05 below their neighbours. This is finding 14's "mid-training
+spread is not the floor" showing up again, and it kills a hypothesis raised while
+the runs were live: that the step-1650 dip shared by E1/F1/F2 pointed at a hard
+stretch of the seed-0 data order. F1 dips again at 2750 where F2 does not, so the
+dips are not aligned between arms and the data-order story does not hold. It also
+means **F1 and F2 sharing an epoch-1 sampler order does not make their comparison
+tighter than the cross-seed floor** — the oscillation is not common-mode.
+
+**22. The headline jump from 0.333 to 0.43 is mostly re-averaging, not learning.**
+mAP is a macro-average over classes, so deleting the worst classes raises it
+mechanically. The group means decompose C1 exactly —
+`(27×0.472 + 9×0.232 + 10×0.049)/46 = 0.3332` — and re-averaging those *same*
+per-class APs over the 36 classes left after dropping only the decorations gives
+`(27×0.472 + 9×0.232)/36 = 0.412`, with zero learning benefit assumed. Dropping
+neckline and epaulette (both below the parts mean) pushes the arithmetic baseline
+higher still. F1 peaked at 0.4326. **So the class cleanup has so far bought ≲0.02
+over the pure re-averaging, and possibly nothing.** That is not an argument against
+the cleanup — 34k inconsistent neckline boxes are worth removing on their own
+terms, and the metric now means something closer to the target — but it must not
+be recorded as an accuracy win.
+
+> **The de-confound is cheap and should be run first next session:** evaluate the
+> existing **C1 checkpoint** (46-class weights) against the **34-class query set**.
+> Same weights, new metric, ~3 minutes. That isolates the arithmetic component
+> exactly, and F1's margin over *that* number is the real gain from the cleanup.
+>
+> **Run 2026-08-06 — finding 24 below. Confirmed: the cleanup bought ~nothing.**
+
+### The de-confound — 46-class weights under the 34-class metric (2026-08-06)
+
+Two existing checkpoints re-scored against the 34-class query set with
+`--init-from ... --eval-only`, no training. Same weights, same eval code, same
+`--eval-top-k 100`, only the query set and the ground-truth class set change.
+~6 minutes each. C1 was the run finding 22 asked for; **A2 seed 0 was added
+because C1 is vb6 @ vlr 5e-6 while F1 is vb2 @ vlr 1e-5** — comparing F1 to C1
+alone would have swapped the depth confound back in for the metric one.
+
+| weights (all trained on 46 classes) | 46-class map | **34-class map** | 34-class map_large |
+|---|---:|---:|---:|
+| A2 seed 0 — vb2, vlr 1e-5, 2200 steps (F1's config) | 0.3268 | **0.4167** | 0.4616 |
+| C1 — vb6, vlr 5e-6, 2200 steps | 0.3332 | **0.4257** | 0.4704 |
+| F1 — *trained on 34 classes*, vb2, 3300/6600 steps | — | 0.4326 | 0.4784 |
+
+**24. Nine tenths of the headline jump is re-averaging, and what is left is not
+separable from budget.** Re-scoring alone moves A2 from 0.3268 to 0.4167 —
+**+0.0899 of F1's +0.1058 headline jump is pure arithmetic**, measured rather
+than estimated. The residual is +0.0159 at F1's peak (step 3300) and +0.0143 at
+step 3850. But F1 spent 3300 steps against A2's 2200, and finding 17 put budget
+2200 → 4400 at +0.0117 on its own; pro-rating that to F1's shorter extension
+leaves roughly **+0.004 to +0.010 attributable to the class-set change, from a
+single seed, against a ±0.006 floor.** That is not distinguishable from zero and
+is at most one sixth of the headline. Finding 22's "≲0.02 over pure re-averaging,
+and possibly nothing" holds, now with the arithmetic term pinned exactly.
+
+The cleanup is still justified — 34k inconsistent neckline boxes are worth
+removing and the metric now means something closer to the target — but it is a
+**metric change, not an accuracy win**, and the 0.43 number must never be quoted
+against a 46-class 0.33 without this decomposition attached. Note also that a
+clean attribution was never available from F1 alone: it changed the class set and
+the budget together, which is finding 15's two-variables-at-once trap in a new
+costume.
+
+**25. The vb6 depth gain reproduces under the new metric.** C1 beats A2 by
+**+0.0090 map** and **+0.0088 map_large** on the 34-class set, against the
++0.0080 / +0.0059 that finding 15 measured on the 46-class set at fixed vision
+LR. C1 carries the *handicapped* vision LR (5e-6, worth −0.0050 per finding 15)
+and still wins by more here. Two independent metrics now agree on depth, which
+makes finding 16's untested cell (vb6 @ vlr 1e-5) the best-motivated remaining
+config — and it should be run at the 34-class set, where the baseline is now
+measured rather than inferred.
+
+### F1b/F2b — the clean rerun pair, stopped at 4400 (2026-08-06, evening)
+
+F1 and F2 relaunched with byte-identical configs (lifted from F1's checkpoint,
+not retyped): MAL γ1.5, vb2 @ vlr 1e-5, head 5e-5, bs8, seed 0, 34 classes,
+`--compile --val-batch-size 16 --eval-every-steps 550 --max-steps 6600`, and
+`python -u` so the log tail is no longer swallowed by the `nohup` buffer.
+MLflow `owlv2_text_20260806_194207` (F1b, GPU 0, mosaic off) and
+`owlv2_text_20260806_194218` (F2b, GPU 1, mosaic 0.5). Checkpoints in
+`text_checkpoints/fashionpedia_large_F{1b,2b}_34cls_{nomosaic,mosaic}_20260806`.
+
+Both stopped by hand after 4h05, at steps 4503 and 4456, ~4 minutes past the
+step-4400 eval. **Both `last.pth` carry `training_state` at `global_step` 4400**
+(`best_map` 0.4484 / 0.4099), so unlike the F pair these two are resumable and
+the 2,200 steps still owed cost ~2h each rather than a restart.
+
+`val/map`:
+
+| step | 550 | 1100 | 1650 | 2200 | 2750 | 3300 | 3850 | 4400 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **F1b** no mosaic | 0.3632 | 0.3838 | 0.4056 | 0.3901 | 0.3974 | 0.4214 | 0.4268 | **0.4484** |
+| **F2b** mosaic | 0.2847 | 0.3496 | 0.3681 | 0.3782 | 0.3888 | 0.3991 | 0.4038 | 0.4099 |
+| F2b − F1b | −0.0785 | −0.0342 | −0.0375 | −0.0119 | −0.0086 | −0.0223 | −0.0230 | −0.0385 |
+
+`val/map_large`:
+
+| step | 550 | 1100 | 1650 | 2200 | 2750 | 3300 | 3850 | 4400 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **F1b** | 0.3997 | 0.4283 | 0.4496 | 0.4428 | 0.4508 | 0.4587 | 0.4700 | **0.4894** |
+| **F2b** | 0.3405 | 0.3894 | 0.4225 | 0.4253 | 0.4457 | 0.4387 | 0.4506 | 0.4544 |
+
+**26. The curve still has not flattened, and step 4400 produced the largest jump
+of the run.** F1b's 0.4484 is the best 34-class number recorded — +0.0158 over
+F1's 0.4326 peak — and it arrived as a **+0.0216 step** over 3850, the biggest
+single-eval gain anywhere in F1b's trajectory, at ×0.25 LR with 2,200 steps of
+annealing left. `map_large` did the same thing (0.4700 → 0.4894, +0.0194). There
+is still no evidence of a top. Finding 19's question is now unanswered after
+**four** attempts and ~26 GPU-hours (E1 73% crash, F1 61%, F2 59%, F1b/F2b 68%),
+but for the first time the answer is two resume-hours away rather than a full
+rerun.
+
+**27. Mosaic is behind at 15 of 15 paired evals and the gap is not closing.**
+F2b trails F1b at all eight, mean **−0.032** (−0.025 dropping the step-550 point,
+where mosaic's slow start is expected). Together with F1/F2's 7-for-7 that is
+15 paired evals, two independent runs, one sign. **Finding 20's "narrows over
+training" does not survive the repeat:** F1b/F2b's gap *widens* late, −0.0086 at
+2750 → −0.0230 at 3850 → −0.0385 at 4400, and the −0.028 mean magnitude that
+finding 20 estimated came back at −0.032. A crossover by 6600 now looks unlikely
+on the evidence, though the last third is still untested and D2's mosaic-off tail
+has never been run. Mosaic as shipped (`--mosaic-prob 0.5`, constant) should not
+be adopted.
+
+**28. F1b vs F1 is an accidental data-order repeat, and it re-measures the
+mid-training floor at ±0.04.** The two share a config *and* seed 0, but the
+resume work materialises the epoch permutation from a per-epoch seeded generator,
+so their sample order differs (documented in the resume section — pre-2026-08-06
+runs are not bit-reproducible). Per-eval F1b − F1: −0.026, −0.012, **+0.040**,
+−0.028, +0.002, −0.011, −0.004. So the pair swings ±0.04 mid-training and
+converges as it anneals (0.011 and 0.004 at the last two shared evals), which
+confirms finding 21's oscillation on a second pair and shows it is not a property
+of one data order. Practical consequence: **F1's 0.4326 peak was a favourable
+draw** — F1b at the same step 3300 is 0.4214 — and any effect smaller than ~0.04
+read off a single mid-training eval is unsupportable, which is most of what this
+document has been trying to measure.
+
+**Do not read F1b's step-2200 value against the re-scored baselines.** F1b at
+2200 is 0.3901 against A2's re-scored 0.4167 (finding 24), which looks like
+training on 34 classes being actively harmful. It is not readable: per finding 18
+`--max-steps` sets `T_max`, so F1b at 2200 is at ×0.76 LR and un-annealed while
+A2 finished its cosine there. The comparison only becomes meaningful at 6600.
+
+**23. Three consecutive long runs have now failed to reach their budget** — E1 at
+73% (MLflow lock), F1 at 61% and F2 at 59% (manual stop). That is ~15 GPU-hours
+spent on finding 19's question, "where does the curve flatten", which is still
+unanswered. Both F arms were still climbing at 3300 and flat-to-slightly-down at
+3850, at ×0.38 LR with 2,750 steps of annealing left, so neither is near converged.
+**Resume support is now the blocking infrastructure item, ahead of any further
+experiment.** `save_text_checkpoint` stores weights, class names, epoch and config
+but no optimizer/scaler/scheduler state; adding those three is roughly an hour and
+would have saved all three of these runs.
+
+> **Done 2026-08-06** — see "Infrastructure — resume" below. Note that neither F
+> arm can actually be resumed: their checkpoints predate the feature and carry no
+> optimizer state, so the 6600-step question still needs a run started from
+> scratch. What resume buys is that the *next* interruption is not another 7
+> GPU-hours.
+
+## Infrastructure — resume (2026-08-06)
+
+Closes finding 23. `--resume PATH` continues an interrupted run; `--init-from
+PATH` loads weights only and starts a fresh optimizer; `--eval-only` scores a
+checkpoint without training.
+
+`last.pth` now also carries a `training_state`: optimizer, scheduler, AMP scaler,
+`global_step`, the epoch index and position within it, `best_map`, and the torch /
+CUDA / python / prompt RNG states. `best.pth` and `final.pth` deliberately do not
+— the AdamW moments are twice the trainable delta, and only `--resume` reads them.
+**This means `last.pth` roughly triples**: 121 MB → 363 MB at vision-blocks 2,
+322 MB → ~950 MB at vision-blocks 6. The disk is at 92% (38 GB free as of
+2026-08-06 evening, up from 15 GB), so that is worth watching before launching
+two deep arms concurrently but is no longer close to binding.
+
+Two details that make a resume a genuine continuation rather than a restart:
+
+- **The epoch's sample order is fast-forwarded exactly.** `shuffle=True` draws
+  from the DataLoader's own RNG and cannot be positioned mid-epoch, so the epoch
+  permutation is now materialised from a per-epoch seeded generator and sliced at
+  the resume point. A resumed epoch sees precisely the samples the interrupted one
+  had left. The cost: the sample order for a given seed differs from any run
+  launched before this change, so pre-2026-08-06 runs are not bit-reproducible.
+- **The resumed process rejoins the original MLflow run**, so `val/map` stays one
+  series rather than being split across two runs that have to be stitched by hand.
+  Train metrics between the last checkpoint and the crash are logged twice at
+  those steps, once per attempt.
+
+A resume whose config differs from the run it continues is refused
+(`RESUME_CRITICAL_ARGS`), because the optimizer state is keyed by parameter
+position, the scheduler by step count, and the learning rates live inside the
+restored optimizer state — so a changed `--vision-learning-rate` would be silently
+ignored rather than applied. Resuming from `best.pth` is refused for the same
+reason it is small: no training state.
+
+Verified end to end on a 24-step run interrupted at step 12 and resumed:
+optimizer moments continued (AdamW's internal update counter went 5 → 17 rather
+than restarting), scheduler advanced 12 → 24, the resumed epoch had exactly
+11 − 1 = 10 batches left, and both negative cases (changed `--vision-blocks`,
+`best.pth`) were rejected.
+
+**Not restored:** dataloader-worker RNG. A worker re-seeded at the start of a
+truncated epoch reaches a given sample at a different point in its augmentation
+stream, so the augmentations after a resume differ from the uninterrupted run.
+That is noise-equivalent, not a bias, but it does mean a resumed run is not
+bit-identical to an uninterrupted one.
+
+Also worth carrying forward: launch with `python -u`. The block-buffered `nohup`
+stdout that hid F1/F2's last two evals is a buffering artifact, and `-u` removes
+it — the log tail becomes usable again, though `mlflow.db` remains the
+authoritative source.
 
 ## Infrastructure — mosaic was broken for every batch it did not fully cover (2026-08-05)
 
@@ -696,9 +941,9 @@ When querying `mlflow.db` while runs are active, connect read-only
 (`file:mlflow.db?mode=ro`) and keep polling minimal. Note `busy_timeout` is
 per-connection and does **not** persist in the file; only `journal_mode` does.
 
-**Still missing: resume support.** See finding 19. A crash at hour 5 of a 6-hour run
-currently means starting over. If block E runs become routine, checkpointing
-optimizer/scaler/scheduler state is worth the hour it would take to add.
+~~**Still missing: resume support.**~~ Added 2026-08-06; see "Infrastructure —
+resume" above. A crash at hour 5 of a 6-hour run now costs at most one
+`--eval-every-steps` interval, since `last.pth` is written at every eval.
 
 ## Schedule
 
@@ -713,11 +958,13 @@ Sequential by dependency, two GPUs in parallel within a block:
 | 3 | ~~C1~~ done (2026-08-03); C2 not run | — | — |
 | 3b | ~~C1 seed 1 + C4~~ done (2026-08-04, 4.7 GPU-h) | — | — |
 | 3c | ~~E1 (3x budget)~~ **crashed at 73%**, 4.5 GPU-h lost | — | — |
-| 4 | **F1 + F2** (34 classes, 6600 steps, mosaic off/on) ← running 2026-08-05 | ~10 | ~5h00 |
+| 4 | ~~F1 + F2~~ (34 classes, 6600 steps, mosaic off/on) **stopped at ~60%**, 2026-08-05, ~7 GPU-h | — | — |
+| 4b | ~~F1b + F2b~~ (clean rerun of the same pair) **stopped at 4400/6600**, 2026-08-06, 8.2 GPU-h | — | — |
+| 4c | **`--resume` F1b + F2b to 6600** ← the cheapest open question in the document | 4.0 | ~2h00 |
 | 5 | ~~B1/B2/B3~~ dropped | — | — |
 | 6 | C5 (vb6 @ vlr 1e-5) at the 34-class set and F's budget | 3.5 | ~3h30 |
-| 7 | D2 (mosaic-off tail) if F2 wins; D3 conditional on that | 2.2+ | ~2h20+ |
-| | | **~16 remaining** | **~11 h** |
+| 7 | ~~D2 (mosaic-off tail) if F2 wins~~ — finding 27 makes a mosaic win unlikely; demote | 2.2+ | ~2h20+ |
+| | | **~8 remaining** | **~5h30** |
 
 Phase 0's ~15% throughput win is not in those numbers; applying it first pays for
 itself several times over.
@@ -810,3 +1057,84 @@ are exactly the confound that produced the retraction.
 
 Still true from yesterday: block B stays dropped, and nothing below ~0.01 should be
 ranked from single-seed runs.
+
+### Revised again after 2026-08-06 (the de-confound + resume)
+
+No training ran today. Two ~6-minute evals and one infrastructure item.
+
+Updated lever table, now that the 34-class metric has a measured baseline:
+
+| lever | effect | status |
+|---|---:|---|
+| **Class-set 46 → 34, re-averaging only** | **+0.0899** | finding 24, exact — an artifact of the metric, not learning |
+| Budget 2200 → 4400 steps | +0.0117 | finding 17, still climbing when it died |
+| Unfreeze depth vb2 → vb6 | +0.0080 (46cls) / +0.0090 (34cls) | findings 15 and 25, now reproduced on two metrics |
+| Mosaic on vs off | −0.028 mean over 7 paired evals | finding 20, sign robust, magnitude not |
+| Class-set 46 → 34, *training* on it | +0.004 to +0.010 | finding 24, n=1, not separable from budget |
+| Seed, same config | ±0.0058 | finding 9 — the floor everything above is read against |
+
+**The ordering is unchanged but better supported: budget first, then depth.** What
+changed is that depth is now the *best-evidenced* lever (two metrics agree, and C1
+won while carrying a handicapped vision LR), while the class-set change has been
+demoted from "apparent +0.10" to "not measurable".
+
+Priority for the next session:
+
+1. **A clean 6600-step run at the 34-class set** (~6h). Still finding 19's
+   question — where the curve flattens — unanswered after three failed attempts
+   and ~15 GPU-hours. Resume now exists, so an interruption costs ≤550 steps
+   instead of the whole run. Launch with `python -u`.
+2. **C5: vb6 @ vision-lr 1e-5 at the 34-class set** (~3h, other GPU, findings 16
+   and 25). The last untested cell of the depth × LR 2x2, and now the
+   best-motivated config in the document. Its baseline is A2's re-scored 0.4167.
+3. **D2 (mosaic-off tail)** only if the long run leaves time — finding 20 leaves
+   mosaic genuinely unresolved, but it is the weakest of the three.
+
+Do not re-run the F arms as a pair to settle the class-set question; finding 24
+answers it as well as it can be answered without spending another 10 GPU-hours on
+a difference that is at most one noise unit.
+
+### Revised again after 2026-08-06 evening (F1b/F2b)
+
+Priority 1 above was launched and ran 4h05 on both GPUs before being stopped by
+hand at step 4400 of 6600 (68%). Unlike every earlier interruption, **this one is
+recoverable**: both `last.pth` hold optimizer, scheduler, scaler, RNG and step
+state, so `--resume` finishes the pair for ~2h per GPU.
+
+| lever | effect | status |
+|---|---:|---|
+| **Class-set 46 → 34, re-averaging only** | **+0.0899** | finding 24, exact — an artifact of the metric, not learning |
+| **Budget 2200 → 4400 steps** | **+0.0583** (34cls, F1b 0.3901 → 0.4484) | finding 26, biggest jump was the *last* eval; +0.0117 on 46cls per finding 17 |
+| Mosaic on vs off | **−0.032** mean over 8 paired evals, 15/15 negative across two pairs | finding 27, sign settled, and the gap widens late |
+| Unfreeze depth vb2 → vb6 | +0.0080 (46cls) / +0.0090 (34cls) | findings 15 and 25, two metrics agree |
+| Class-set 46 → 34, *training* on it | +0.004 to +0.010 | finding 24, n=1, not separable from budget |
+| Data order, same config + seed | ±0.04 mid-training, ~0.005 annealed | finding 28 — the floor everything above is read against |
+
+Two changes to how this table should be read. **Budget's number is inflated by
+the schedule, not just by learning** — F1b's 2200 sits mid-cosine at ×0.76 LR
+(finding 18), so +0.0583 is "annealed 4400 vs un-annealed 2200" and the honest
+statement is only that the curve was still climbing steeply at 68%. And **the
+noise row is now ±0.04, not ±0.006, for anything read before the anneal**
+(finding 28); the ±0.006 figure applies only to fully-annealed evals.
+
+Priority for the next session:
+
+1. **`--resume` F1b and F2b to 6600** (~2h each, both GPUs, in parallel). Four
+   attempts and ~26 GPU-hours have not reached a converged 34-class number; this
+   is the first time finishing costs two hours instead of six. It settles finding
+   19 (where the curve flattens), gives every future comparison an annealed
+   baseline, and closes block D properly by letting the mosaic arm anneal.
+   Command: `--resume text_checkpoints/fashionpedia_large_F1b_34cls_nomosaic_20260806`
+   with the launch config otherwise unchanged (`RESUME_CRITICAL_ARGS` refuses a
+   mismatch, and the LRs live inside the restored optimizer state).
+2. **C5: vb6 @ vision-lr 1e-5 at the 34-class set** (~3h, findings 16 and 25),
+   after the resumes free the GPUs — and now at the 6600-step budget, against
+   F1b's annealed number rather than A2's re-scored 0.4167.
+3. **D2 (mosaic-off tail)** — demoted. Finding 27 puts constant mosaic behind at
+   15 of 15 paired evals with a widening late gap, so the remaining question is
+   narrower than "does mosaic help": it is only whether a mosaic-off tail rescues
+   an arm that is otherwise losing. Not worth a GPU before C5.
+
+Also worth carrying forward from this pair: `python -u` worked — the log tail
+tracked the run in real time — but every number in the F1b/F2b tables was still
+read from `mlflow.db`, which remains the authoritative source.
