@@ -35,7 +35,9 @@ single-seed comparison in this document.
 ## Memory and step-time ceiling (measured today)
 
 `tools/probe_grad_ckpt_memory.py --model-type large --text-blocks 0
---num-queries 46`, large @1008px, AdamW + AMP, peak allocated:
+--num-queries 46`, large @1008px, AdamW + AMP, peak allocated. (That script was
+lost; `tools/probe_step_cost.py` replaces it and covers the same axes plus a
+`--compile` A/B — see `docs/lvmhp-findings.md` for the base-model numbers.)
 
 | vision-blocks | batch | ckpt off | ckpt on | step (ckpt on) |
 |---:|---:|---:|---:|---:|
@@ -619,8 +621,8 @@ validation ground truth, and the queries leave the prompt set.
 |---|---|---|
 | **F1** | 34 classes, `--mosaic-prob 0`, `--max-steps 6600` | **stopped at 4036/6600 (61%)**, GPU 0 |
 | **F2** | 34 classes, `--mosaic-prob 0.5 --mosaic-grid 2 2`, `--max-steps 6600` | **stopped at 3894/6600 (59%)**, GPU 1 |
-| **F1b** | clean rerun of F1 | **stopped at 4503/6600 (68%)**, GPU 0 — resumable |
-| **F2b** | clean rerun of F2 | **stopped at 4456/6600 (68%)**, GPU 1 — resumable |
+| **F1b** | clean rerun of F1 | stopped at 4503/6600, **resumed and completed 6600 (2026-08-07)** |
+| **F2b** | clean rerun of F2 | stopped at 4456/6600, **resumed and completed 6600 (2026-08-07)** |
 
 Everything else at the standard protocol with MAL γ1.5, `--vision-blocks 2`,
 `--vision-learning-rate 1e-5`, bs8, seed 0, `--compile --val-batch-size 16`,
@@ -781,6 +783,10 @@ is still no evidence of a top. Finding 19's question is now unanswered after
 but for the first time the answer is two resume-hours away rather than a full
 rerun.
 
+> **Answered 2026-08-07 (finding 29).** The resume ran both arms to 6600. That
+> +0.0216 jump at 4400 was the last real gain: F1b's 4400 → 6600 is **+0.0004**,
+> and the top this finding saw "no evidence" of was about one eval away.
+
 **27. Mosaic is behind at 15 of 15 paired evals and the gap is not closing.**
 F2b trails F1b at all eight, mean **−0.032** (−0.025 dropping the step-550 point,
 where mosaic's slow start is expected). Together with F1/F2's 7-for-7 that is
@@ -791,6 +797,12 @@ finding 20 estimated came back at −0.032. A crossover by 6600 now looks unlike
 on the evidence, though the last third is still untested and D2's mosaic-off tail
 has never been run. Mosaic as shipped (`--mosaic-prob 0.5`, constant) should not
 be adopted.
+
+> **Half superseded 2026-08-07 (finding 30).** The "should not be adopted"
+> conclusion holds and is now settled at 19/19 paired evals. The **"gap widens
+> late" reading does not** — it was read off the un-annealed stretch, and over the
+> final four evals the gap is stable at ~−0.024, ending at its narrowest (−0.0208).
+> Mosaic loses by a steady margin; it does not fall further behind.
 
 **28. F1b vs F1 is an accidental data-order repeat, and it re-measures the
 mid-training floor at ±0.04.** The two share a config *and* seed 0, but the
@@ -826,6 +838,86 @@ would have saved all three of these runs.
 > optimizer state, so the 6600-step question still needs a run started from
 > scratch. What resume buys is that the *next* interruption is not another 7
 > GPU-hours.
+
+### F1b/F2b resumed to 6600 — the first annealed 34-class pair (2026-08-07)
+
+Both arms resumed from their step-4400 `last.pth` and ran the remaining 2,200
+steps, ~2h05 each, concurrent on the two GPUs. Configs were lifted from the
+checkpoints rather than retyped.
+
+`--resume` did what it was built for. Both reported `Resumed at optimizer step
+4400, epoch 1, 4400/5702 batches into that epoch` with `best_map` carried over,
+both rejoined their original MLflow runs so `val/map` is a single 12-point series
+rather than two stitched ones, both crossed the epoch 1 → 2 boundary, and both
+exited cleanly with `final.pth` written and the run marked `FINISHED`. No lock
+tracebacks in either log. MLflow IDs are unchanged from the interrupted attempt:
+`owlv2_text_20260806_194207` (F1b) and `owlv2_text_20260806_194218` (F2b).
+
+`val/map`, all twelve evals — the last four are new:
+
+| step | 550 | 1100 | 1650 | 2200 | 2750 | 3300 | 3850 | 4400 | 4950 | 5500 | 6050 | 6600 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **F1b** no mosaic | 0.3632 | 0.3838 | 0.4056 | 0.3901 | 0.3974 | 0.4214 | 0.4268 | 0.4484 | 0.4409 | 0.4457 | **0.4517** | 0.4488 |
+| **F2b** mosaic | 0.2847 | 0.3496 | 0.3681 | 0.3782 | 0.3888 | 0.3991 | 0.4038 | 0.4099 | 0.4193 | 0.4187 | 0.4258 | **0.4280** |
+| F2b − F1b | −0.0785 | −0.0342 | −0.0374 | −0.0119 | −0.0086 | −0.0223 | −0.0230 | −0.0385 | −0.0216 | −0.0270 | −0.0258 | −0.0208 |
+
+`val/map_large`:
+
+| step | 550 | 1100 | 1650 | 2200 | 2750 | 3300 | 3850 | 4400 | 4950 | 5500 | 6050 | 6600 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **F1b** | 0.3997 | 0.4283 | 0.4496 | 0.4428 | 0.4508 | 0.4587 | 0.4700 | 0.4894 | 0.4818 | 0.4862 | **0.4930** | 0.4882 |
+| **F2b** | 0.3405 | 0.3894 | 0.4225 | 0.4253 | 0.4457 | 0.4387 | 0.4506 | 0.4544 | 0.4573 | 0.4608 | 0.4710 | **0.4736** |
+
+Final, at the 6600-step budget:
+
+| metric | F1b (no mosaic) | F2b (mosaic 0.5) | Δ |
+|---|---:|---:|---:|
+| map | **0.4488** | 0.4280 | −0.0208 |
+| map_50 | 0.5936 | 0.5702 | −0.0234 |
+| map_75 | 0.5015 | 0.4814 | −0.0201 |
+| map_small | 0.1766 | 0.1578 | −0.0188 |
+| map_medium | 0.3900 | 0.3747 | −0.0153 |
+| map_large | 0.4882 | 0.4736 | −0.0146 |
+
+Checkpoints: F1b `best.pth` = step 6050 (0.4517), `final.pth` = 6600 (0.4488).
+F2b's best and final coincide at 6600 (0.4280). Per the protocol the 6600 column
+is the number to quote; F1b's 6050 argmax is noise.
+
+**29. Finding 19 is answered after five attempts and ~30 GPU-hours: the curve
+flattens at about step 4400, and the last third of the run is worth +0.0004.**
+F1b ran 0.4484 → 0.4409 → 0.4457 → 0.4517 → 0.4488 across its last five evals —
+a ±0.005 band around ~0.447 with no trend, matching the annealed noise floor
+almost exactly. `map_large` agrees: 0.4894 at 4400 against 0.4882 at 6600,
+−0.0012. **Budget is no longer the binding constraint at this config**, which
+retires the lever that has topped the table since finding 17. The 2,200 steps
+this resume bought produced no measurable accuracy and one solid negative result.
+
+**Read this as a statement about the last third of a 6600-step cosine, not as
+"4400 steps is enough."** `--max-steps` sets `T_max` (finding 18), so a run
+launched with `--max-steps 4400` anneals on a different, faster schedule and is
+*untested*. What is established is that extending a 6600-step run past 4400 adds
+nothing — the same distinction that produced finding 18's warning in the first
+place, now cutting in the other direction.
+
+**30. Mosaic settles ~0.021 behind and never crosses over — but finding 27's
+"the gap widens late" does not survive the anneal.** Across all twelve paired
+evals the gap averages −0.029 and is negative every time; over the last four it
+is −0.0216, −0.0270, −0.0258, −0.0208, i.e. stable at ~−0.024 with the *narrowest*
+value of the four landing at the fully-annealed 6600. Together with F1/F2's seven,
+that is **19 paired evals, two independent run pairs, one sign**. The final gap is
+negative on all six sub-metrics as well. `--mosaic-prob 0.5` as shipped should not
+be adopted; block D's D1 is now decided, and decided against.
+
+**31. The arms converge at different times, and that is the only real argument
+mosaic has left.** F2b gained +0.0181 from 4400 → 6600 while F1b gained +0.0004,
+so the regularizer was still learning where the clean arm had stopped — exactly
+the shape a regularizer should have, and the reason letting it anneal was worth
+the GPU time. But F2b's own last increment was +0.0022, so it is converging too,
+and it runs out of budget 0.021 short. A crossover would need the gap to close at
+a rate its final eval no longer shows. **D2 (the mosaic-off tail) is the only
+version of the mosaic question still open**, and it is now a narrow one: whether
+disabling mosaic for the final ~40% rescues an arm that otherwise finishes 0.021
+behind. Note D3 was never implemented and D1 is answered.
 
 ## Infrastructure — resume (2026-08-06)
 
@@ -960,11 +1052,11 @@ Sequential by dependency, two GPUs in parallel within a block:
 | 3c | ~~E1 (3x budget)~~ **crashed at 73%**, 4.5 GPU-h lost | — | — |
 | 4 | ~~F1 + F2~~ (34 classes, 6600 steps, mosaic off/on) **stopped at ~60%**, 2026-08-05, ~7 GPU-h | — | — |
 | 4b | ~~F1b + F2b~~ (clean rerun of the same pair) **stopped at 4400/6600**, 2026-08-06, 8.2 GPU-h | — | — |
-| 4c | **`--resume` F1b + F2b to 6600** ← the cheapest open question in the document | 4.0 | ~2h00 |
+| 4c | ~~`--resume` F1b + F2b to 6600~~ **done (2026-08-07, 4.1 GPU-h, 2h05 wall)** — settles finding 19 and block D1 | — | — |
 | 5 | ~~B1/B2/B3~~ dropped | — | — |
 | 6 | C5 (vb6 @ vlr 1e-5) at the 34-class set and F's budget | 3.5 | ~3h30 |
-| 7 | ~~D2 (mosaic-off tail) if F2 wins~~ — finding 27 makes a mosaic win unlikely; demote | 2.2+ | ~2h20+ |
-| | | **~8 remaining** | **~5h30** |
+| 7 | ~~D2 (mosaic-off tail) if F2 wins~~ — finding 30 settles D1 against mosaic; D2 is all that remains of block D | 2.2+ | ~2h20+ |
+| | | **~3.5 remaining** | **~3h30** |
 
 Phase 0's ~15% throughput win is not in those numbers; applying it first pays for
 itself several times over.
@@ -1138,3 +1230,46 @@ Priority for the next session:
 Also worth carrying forward from this pair: `python -u` worked — the log tail
 tracked the run in real time — but every number in the F1b/F2b tables was still
 read from `mlflow.db`, which remains the authoritative source.
+
+### Revised again after 2026-08-07 (F1b/F2b resumed to 6600)
+
+The resume completed both arms. **Two of the three questions this document has
+been circling are now closed**, and the closure is negative in both cases.
+
+| lever | effect | status |
+|---|---:|---|
+| **Class-set 46 → 34, re-averaging only** | **+0.0899** | finding 24, exact — an artifact of the metric, not learning |
+| Budget 2200 → 4400 within a 6600-step cosine | +0.0583 | finding 26, but inflated by the anneal (finding 18) |
+| **Budget 4400 → 6600** | **+0.0004** | **finding 29 — the curve is flat; budget is no longer the binding constraint** |
+| Mosaic on vs off, annealed | **−0.0208** final, −0.029 mean over 12 paired evals, 19/19 negative | finding 30, settled; D1 decided against |
+| Unfreeze depth vb2 → vb6 | +0.0080 (46cls) / +0.0090 (34cls) | findings 15 and 25, two metrics agree — **now the only surviving positive lever** |
+| Class-set 46 → 34, *training* on it | +0.004 to +0.010 | finding 24, n=1, not separable from budget |
+| Seed / data order, same config | ±0.006 annealed, ±0.04 mid-training | findings 9 and 28 |
+
+**The best annealed 34-class number is F1b's 0.4488 at 6600** (`best.pth` 0.4517
+at 6050). Every future 34-class comparison should be read against 0.4488 at this
+budget, not against F1's old 0.4326 peak or A2's re-scored 0.4167.
+
+What changed strategically: budget was the top of this table for three days and
+is now exhausted, and mosaic is decided. **Depth is the only lever left that has
+ever produced a repeatable positive effect** (+0.008 / +0.009, agreeing across
+two metrics, with C1 winning while carrying a handicapped vision LR).
+
+Priority for the next session:
+
+1. **C5: vb6 @ vision-lr 1e-5, 34 classes, `--max-steps 6600`** (~3h30). Findings
+   16 and 25, now the clear top item rather than the second one. It is the last
+   untested cell of the depth × LR 2x2, it is the only remaining lever with a
+   positive track record, and it finally has a proper baseline to beat: F1b's
+   annealed 0.4488. Run it at F1b's config with only `--vision-blocks` and
+   `--vision-learning-rate` changed — one variable pair, not two, per finding 15.
+2. **D2 (mosaic-off tail)** (~2h20). All that survives of block D. Narrow question:
+   whether disabling mosaic for the final ~40% rescues an arm finishing 0.021
+   behind. Needs the step-based schedule flag, which is still the one unimplemented
+   item from phase 0.
+3. **A second seed of F1b** if 0.4488 is going to be quoted as *the* number. The
+   whole document rests on single seeds at differences near the floor, and this is
+   the value everything downstream will be measured against.
+
+Not worth running: any further budget extension at this config (finding 29), and
+`--mosaic-prob 0.5` in any arm (finding 30).

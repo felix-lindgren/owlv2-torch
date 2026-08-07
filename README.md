@@ -175,6 +175,45 @@ generally be used only after trying the frozen text tower. Comma-separated
 Fashionpedia class names are automatically expanded into prompt aliases and a
 different prompt variant is sampled for every class on each training step.
 
+LV-MHP-v1's per-person parsing masks can be converted to boxes for the same
+trainer. The converter preserves all 18 foreground categories and each person's
+instances, and creates a seeded 90/10 split from `train_list.txt` by default:
+
+```bash
+uv run python tools/convert_lv_mhp_coco.py \
+  --dataset-root /mnt/datasets/fashion/LV-MHP-v1 \
+  --output-dir /mnt/datasets/fashion/lv_mhp_coco
+```
+
+The output has the same `train/images`, `train/annotations.json`, `val/images`,
+and `val/annotations.json` layout shown above. Images are symlinked by default;
+use `--image-mode copy` for a self-contained output or `--image-mode none` to
+keep using `/mnt/datasets/fashion/LV-MHP-v1/images` directly. Add
+`--include-test` to convert the official test list separately, or
+`--val-source test` to train on all of `train_list.txt` and validate on that
+test list.
+
+LV-MHP labels six of its classes as lateral pairs (`left arm`/`right arm`,
+`left shoe`/`right shoe`, `left leg`/`right leg`), which a text query cannot
+distinguish. `--merge-class-names` collapses them into one query each:
+
+```bash
+uv run --extra train python prototype_train/train_text.py \
+  ...dataset arguments... \
+  --merge-class-names left_arm+right_arm=arm left_shoe+right_shoe=shoe \
+                      left_leg+right_leg=leg
+```
+
+Sources are matched against category names after the same cleaning applied to
+prompts, and `+` separates them because a comma already separates aliases inside
+one category name. Every box stays supervised under the merged label, which is
+why this is not the same as `--exclude-class-names left_arm`: dropping one side
+of a pair would leave visually identical objects labelled on one side and
+unlabelled on the other. Merging changes the class set, so the resulting mAP is
+not comparable to a run with a different one -- re-score the old weights with
+`--eval-only --init-from` on the new set before reading a difference as
+learning.
+
 For short configuration experiments, stop and evaluate by optimizer step rather
 than waiting for a complete epoch:
 

@@ -16,8 +16,16 @@ import mlflow
 import mlflow.pytorch
 from datetime import datetime
 from pathlib import Path
+from PIL import ImageFile
 import os
 import sys
+
+# LV-MHP-v1's 3492.jpg is 19 bytes short of a complete JPEG, and Pillow's default
+# is to raise on that -- which takes down a multi-hour run from a dataloader
+# worker the first time the sample comes up. Padding the missing scanline is the
+# right trade for one image in 3,600; the alternative is dropping ~25 boxes of
+# supervision over a few pixels at the bottom edge.
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:

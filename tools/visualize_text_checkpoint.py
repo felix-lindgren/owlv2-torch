@@ -1,9 +1,18 @@
-"""Visualise and score a ``train_text.py`` checkpoint on a COCO validation split.
+"""Visualise and score OWLv2 on a COCO validation split, fine-tuned or zero-shot.
 
 Written for the Fashionpedia runs in ``text_checkpoints/``, but nothing here is
 Fashionpedia-specific: the dataset paths, class names, evaluation prompts and
 scoring protocol all come out of the checkpoint's stored config, so any COCO-style
 run made by ``prototype_train/train_text.py`` works.
+
+Without ``--checkpoint`` it runs stock OWLv2 zero-shot, which is how you get a
+baseline for a dataset that has no run yet -- give it ``--val-annotations``,
+``--val-images`` and the class-set flags the run *would* use. The class set is
+built by the same ``build_label_space`` the trainer uses, so
+``--exclude-class-names`` / ``--merge-class-names`` produce exactly the label
+space a run made with those flags would score against. That matters more than it
+sounds: mAP is not comparable across class sets, so a zero-shot baseline for a
+merged run has to be scored on the merged set.
 
 Two outputs land in ``--output-dir``:
 
@@ -21,10 +30,18 @@ The panels use a different, much stricter set of thresholds — drawing 100 boxe
 per image at score 0.001 is unreadable — so panel counts will not reconcile with
 the mAP figure. That is intentional; they answer different questions.
 
-Example:
+Examples:
 
     uv run python tools/visualize_text_checkpoint.py \
         --checkpoint fashionpedia_large_C1_vb6_20260803 \
+        --select worst --num-images 12
+
+    uv run python tools/visualize_text_checkpoint.py \
+        --val-annotations data/lv_mhp_v1/annotations/val.json \
+        --val-images data/lv_mhp_v1/images \
+        --merge-class-names "left arm+right arm=arm" \
+        --merge-class-names "left shoe+right shoe=shoe" \
+        --merge-class-names "left leg+right leg=leg" \
         --select worst --num-images 12
 """
 
@@ -52,14 +69,17 @@ from OWLv2torch.torch_version.owlv2 import OwlV2
 from prototype_train.train import (
     OPENAI_CLIP_MEAN,
     OPENAI_CLIP_STD,
-    coco_class_names,
     coco_collate_fn,
 )
 from prototype_train.train_text import (
     TextQueryDetector,
+    build_label_space,
+    drop_categories_by_name,
     evaluation_prompts,
     load_text_checkpoint,
 )
+
+DEFAULT_EVAL_PROMPT_TEMPLATE = "a photo of {name}"
 
 
 # Status palette. Match status is also encoded by line style and by a glyph in
@@ -98,21 +118,35 @@ def resolve_checkpoint_path(raw: str, default_root: Path) -> Path:
     raise FileNotFoundError(f"No checkpoint at {raw} or {default_root / raw}")
 
 
+def split_slug(annotation_path: str) -> str:
+    """A directory-safe name for a split, for the zero-shot output directory.
+
+    Datasets that name the file after the split (``val.json``) get that name;
+    ones that put the split in the directory (``val/annotations.json``) get the
+    directory, since ``annotations`` alone identifies nothing.
+    """
+    path = Path(annotation_path)
+    if path.stem in ("annotations", "instances") and path.parent.name:
+        return f"{path.parent.parent.name}_{path.parent.name}".strip("_")
+    return path.stem
+
+
 def config_default(config: dict, key: str, fallback=None):
     value = config.get(key)
     return fallback if value is None else value
 
 
-def build_detector(
-    checkpoint: dict, class_names: list[str], prompt_template: str | None, device
-) -> tuple[TextQueryDetector, list[str]]:
-    model = OwlV2(checkpoint["model_type"])
-    load_text_checkpoint(model, checkpoint["_path"])
-    if prompt_template is None:
-        prompts = list(checkpoint["evaluation_prompts"])
-    else:
-        prompts = evaluation_prompts(class_names, prompt_template)
-    return TextQueryDetector(model, prompts).to(device).eval(), prompts
+def build_model(model_type: str, checkpoint_path: Path | None) -> OwlV2:
+    """Stock OWLv2 weights, with a checkpoint's trained delta over them if given.
+
+    The bare model rather than the detector, because the image transforms live on
+    it and the validation split has to be built before the class names -- and so
+    the prompts -- are known.
+    """
+    model = OwlV2(model_type)
+    if checkpoint_path is not None:
+        load_text_checkpoint(model, checkpoint_path)
+    return model
 
 
 def build_zero_shot_detector(
@@ -120,6 +154,53 @@ def build_zero_shot_detector(
 ) -> TextQueryDetector:
     """The same prompts against stock OWLv2 weights, for a before/after panel."""
     return TextQueryDetector(OwlV2(model_type), prompts).to(device).eval()
+
+
+def resolve_prompts(
+    class_names: list[str], checkpoint: dict | None, prompt_template: str | None
+) -> list[str]:
+    """Prefer the checkpoint's own prompts; a template overrides, zero-shot needs one."""
+    if prompt_template is None and checkpoint is not None:
+        return list(checkpoint["evaluation_prompts"])
+    return evaluation_prompts(
+        class_names, prompt_template or DEFAULT_EVAL_PROMPT_TEMPLATE
+    )
+
+
+def resolve_label_space(coco, config: dict, args) -> tuple[list[str], dict[int, int]]:
+    """Rebuild the run's label space against the validation split.
+
+    Command-line flags win over the checkpoint's config, which wins over "every
+    category in the split" -- so a zero-shot baseline for a run that has not
+    happened yet is specified with the same flags that run would take.
+
+    A run made with --exclude-class-names or --merge-class-names resolves those
+    to ids at launch but stores only the names, so they have to be replayed here.
+    Skipping the replay would silently score against a different class set, and
+    mAP across class sets is not comparable.
+    """
+    category_ids = (
+        args.category_ids
+        or config_default(config, "category_ids")
+        or sorted(coco.getCatIds())
+    )
+    excluded_names = args.exclude_class_names or config_default(
+        config, "exclude_class_names"
+    )
+    if excluded_names:
+        category_ids, dropped_names = drop_categories_by_name(
+            coco, category_ids, list(excluded_names)
+        )
+        print(f"Excluded {len(dropped_names)} classes: {', '.join(dropped_names)}")
+    merge_specs = (
+        args.merge_class_names or config_default(config, "merge_class_names") or []
+    )
+    class_names, category_id_to_label, merges = build_label_space(
+        coco, category_ids, list(merge_specs)
+    )
+    for sources, target in merges:
+        print(f"Merged {' + '.join(sources)} -> {target!r}")
+    return class_names, category_id_to_label
 
 
 def ground_truth_xyxy(target: dict, image_size: float) -> torch.Tensor:
@@ -424,6 +505,7 @@ def render_panels(
     device: torch.device,
     args,
     output_dir: Path,
+    run_label: str,
 ) -> list[dict]:
     import matplotlib
 
@@ -482,7 +564,7 @@ def render_panels(
             axes[-1],
             prediction,
             class_names,
-            title=f"checkpoint · image {image_id}",
+            title=f"{run_label} · image {image_id}",
             match_iou=args.match_iou,
             max_boxes=args.max_boxes,
             font_size=args.font_size,
@@ -723,10 +805,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--checkpoint",
-        required=True,
         help=(
             "Path to a .pth, a run directory (best.pth is preferred inside it), "
-            "or a bare run name under --checkpoint-root."
+            "or a bare run name under --checkpoint-root. Omit it to score stock "
+            "OWLv2 zero-shot, which then needs --val-annotations/--val-images."
         ),
     )
     parser.add_argument("--checkpoint-root", default="text_checkpoints")
@@ -737,6 +819,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--val-images",
         help="Defaults to the val_images recorded in the checkpoint config.",
+    )
+    parser.add_argument(
+        "--model-type",
+        choices=("base", "large"),
+        help="Zero-shot only; a checkpoint carries its own. Defaults to base.",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num-workers", type=int, default=4)
@@ -752,10 +839,34 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--prompt-template",
         help=(
             "Re-derive the evaluation prompts from this template instead of using "
-            "the ones stored in the checkpoint. Must contain {name}."
+            "the ones stored in the checkpoint. Must contain {name}. Zero-shot "
+            f"defaults to {DEFAULT_EVAL_PROMPT_TEMPLATE!r}."
         ),
     )
     parser.add_argument("--output-dir", default="eval_visualizations")
+    parser.add_argument(
+        "--run-name",
+        help="Names the output sub-directory. Defaults to the run or a zero-shot tag.",
+    )
+
+    # The class set: taken from the checkpoint config when there is one, and the
+    # whole point of the zero-shot mode when there is not. mAP is only comparable
+    # between two evaluations that agree on all three of these.
+    parser.add_argument("--category-ids", nargs="+", type=int)
+    parser.add_argument(
+        "--exclude-class-names",
+        nargs="+",
+        help="Drop these categories, matched on the full cleaned category name.",
+    )
+    parser.add_argument(
+        "--merge-class-names",
+        action="append",
+        metavar="SRC+SRC=TARGET",
+        help=(
+            "Score several categories as one query, e.g. "
+            "'left arm+right arm=arm'. Repeatable. Same syntax as train_text.py."
+        ),
+    )
 
     parser.add_argument(
         "--select",
@@ -803,7 +914,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--compare-zero-shot",
         action="store_true",
-        help="Add a stock-OWLv2 panel beside each checkpoint panel.",
+        help="Add a stock-OWLv2 panel beside each checkpoint panel. Needs --checkpoint.",
     )
 
     parser.add_argument("--metrics", action=argparse.BooleanOptionalAction, default=True)
@@ -826,24 +937,45 @@ def main(argv: list[str] | None = None) -> None:
     if args.num_images <= 0:
         raise ValueError("num_images must be positive")
 
-    checkpoint_path = resolve_checkpoint_path(args.checkpoint, Path(args.checkpoint_root))
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    checkpoint["_path"] = checkpoint_path
-    config = checkpoint.get("config", {})
-    print(
-        f"Checkpoint {checkpoint_path} ({checkpoint.get('format')}), "
-        f"epoch {checkpoint.get('epoch')}, recorded map {checkpoint.get('map')}"
-    )
+    if args.compare_zero_shot and not args.checkpoint:
+        raise ValueError("--compare-zero-shot needs a --checkpoint to compare against")
+
+    checkpoint_path = None
+    checkpoint = None
+    config: dict = {}
+    if args.checkpoint:
+        checkpoint_path = resolve_checkpoint_path(
+            args.checkpoint, Path(args.checkpoint_root)
+        )
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        config = checkpoint.get("config", {})
+        print(
+            f"Checkpoint {checkpoint_path} ({checkpoint.get('format')}), "
+            f"epoch {checkpoint.get('epoch')}, recorded map {checkpoint.get('map')}"
+        )
+    else:
+        print("No --checkpoint: scoring stock OWLv2 zero-shot")
 
     # Anything the caller did not override comes from the run that produced the
-    # checkpoint, so the defaults reproduce that run's evaluation exactly.
+    # checkpoint, so the defaults reproduce that run's evaluation exactly. With
+    # no checkpoint there is nothing to inherit and these fall back to the
+    # trainer's own defaults, which is what a future run would evaluate under.
     args.val_annotations = args.val_annotations or config_default(config, "val_annotations")
     args.val_images = args.val_images or config_default(config, "val_images")
     if not args.val_annotations or not args.val_images:
         raise ValueError(
-            "The checkpoint has no recorded validation paths; pass "
-            "--val-annotations and --val-images"
+            "No validation split: pass --val-annotations and --val-images "
+            "(a checkpoint supplies them only if the run recorded them)"
         )
+    if checkpoint is not None:
+        if args.model_type and args.model_type != checkpoint["model_type"]:
+            raise ValueError(
+                f"--model-type {args.model_type} contradicts the checkpoint, which "
+                f"was trained on {checkpoint['model_type']}"
+            )
+        args.model_type = checkpoint["model_type"]
+    else:
+        args.model_type = args.model_type or "base"
     args.val_transform = args.val_transform or config_default(config, "val_transform", "fast")
     if args.confidence_threshold is None:
         args.confidence_threshold = config_default(config, "confidence_threshold", 0.001)
@@ -858,40 +990,48 @@ def main(argv: list[str] | None = None) -> None:
     args._device = device
     args.amp = args.amp and device.type == "cuda"
 
-    class_names = list(checkpoint["class_names"])
-    detector, prompts = build_detector(checkpoint, class_names, args.prompt_template, device)
-    print(f"{len(class_names)} classes, first prompts: {prompts[:3]}")
-
+    model = build_model(args.model_type, checkpoint_path)
     val_dataset = CocoDetection(
         annFile=args.val_annotations,
         root=args.val_images,
         transform=(
-            detector.owl.image_transform_fast
+            model.image_transform_fast
             if args.val_transform == "fast"
-            else detector.owl.image_transform_accurate
+            else model.image_transform_accurate
         ),
     )
-    category_ids = config_default(config, "category_ids") or sorted(
-        val_dataset.coco.getCatIds()
+    class_names, args._category_id_to_label = resolve_label_space(
+        val_dataset.coco, config, args
     )
-    if len(category_ids) != len(class_names):
-        raise ValueError(
-            f"Checkpoint has {len(class_names)} classes but the validation split "
-            f"exposes {len(category_ids)} category ids"
-        )
-    val_names = coco_class_names(val_dataset.coco, category_ids)
-    if val_names != class_names:
+    if checkpoint is not None and list(checkpoint["class_names"]) != class_names:
+        saved = list(checkpoint["class_names"])
         differing = [
             f"{index}: {left!r} != {right!r}"
-            for index, (left, right) in enumerate(zip(class_names, val_names))
+            for index, (left, right) in enumerate(zip(saved, class_names))
             if left != right
         ]
-        raise ValueError(f"Class names disagree with the validation split: {differing[:5]}")
-    args._category_id_to_label = {
-        category_id: label for label, category_id in enumerate(category_ids)
-    }
+        raise ValueError(
+            f"Checkpoint has {len(saved)} classes, the validation split resolves to "
+            f"{len(class_names)}: {differing[:5]}"
+        )
 
-    output_dir = Path(args.output_dir) / checkpoint_path.parent.name
+    prompts = resolve_prompts(class_names, checkpoint, args.prompt_template)
+    detector = TextQueryDetector(model, prompts).to(device).eval()
+    print(f"{len(class_names)} classes, first prompts: {prompts[:3]}")
+
+    run_label = (
+        checkpoint_path.parent.name
+        if checkpoint_path is not None
+        else f"zero-shot {args.model_type}"
+    )
+    output_dir = Path(args.output_dir) / (
+        args.run_name
+        or (
+            checkpoint_path.parent.name
+            if checkpoint_path is not None
+            else f"zeroshot_{args.model_type}_{split_slug(args.val_annotations)}"
+        )
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.metrics:
@@ -900,7 +1040,9 @@ def main(argv: list[str] | None = None) -> None:
         report = format_metrics(metrics, rows, absent)
         print(f"\n{report}")
         (output_dir / "metrics.txt").write_text(
-            f"checkpoint: {checkpoint_path}\n"
+            f"weights: {checkpoint_path or f'stock OWLv2 {args.model_type} (zero-shot)'}\n"
+            f"split: {args.val_annotations}\n"
+            f"classes ({len(class_names)}): {', '.join(class_names)}\n"
             f"prompts: {prompts[0] if prompts else ''} ...\n"
             f"protocol: threshold {args.confidence_threshold}, top-k {args.eval_top_k}, "
             f"objectness {args.score_with_objectness}, no NMS\n\n{report}\n"
@@ -914,7 +1056,7 @@ def main(argv: list[str] | None = None) -> None:
         if not indices:
             raise RuntimeError("No validation images were selected")
         zero_shot_detector = (
-            build_zero_shot_detector(checkpoint["model_type"], prompts, device)
+            build_zero_shot_detector(args.model_type, prompts, device)
             if args.compare_zero_shot
             else None
         )
@@ -927,6 +1069,7 @@ def main(argv: list[str] | None = None) -> None:
             device,
             args,
             output_dir / "panels",
+            run_label,
         )
         (output_dir / "panels.json").write_text(json.dumps(summaries, indent=2))
         print(

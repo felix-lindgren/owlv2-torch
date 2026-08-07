@@ -37,7 +37,6 @@ from prototype_train.gpu_augment import BatchAugmentor
 from prototype_train.train import (
     AugmentedDetectionDataset,
     aug_collate_fn,
-    coco_class_names,
     coco_collate_fn,
     coco_eval,
     configure_mlflow_tracking,
@@ -124,6 +123,82 @@ def drop_categories_by_name(
         if cleaned_by_id[category_id] in wanted
     ]
     return kept, dropped
+
+
+def build_label_space(
+    coco, category_ids: list[int], merge_specs: list[str]
+) -> tuple[list[str], dict[int, int], list[tuple[list[str], str]]]:
+    """Map category ids onto query indices, optionally merging groups of categories.
+
+    Without ``merge_specs`` this is the identity: one query per category, in the
+    order of ``category_ids``. Each spec is ``source+source[+...]=target``, whose
+    sources are matched against cleaned category names exactly as
+    ``--exclude-class-names`` does. ``+`` separates sources rather than ``,``
+    because a comma is already the alias separator inside a single category name
+    (Fashionpedia's ``"shirt, blouse"``).
+
+    Merging maps several category ids onto one query index. Unlike dropping a
+    category, every box stays supervised -- which is the whole point for a lateral
+    pair, where dropping one side would leave visually identical objects labelled
+    on one side and unlabelled on the other.
+
+    The merged class takes the position of its first source, and a target naming
+    a category that is being kept merges into that category rather than creating
+    a second query with the same text.
+    """
+    cleaned_by_id = {
+        category_id: _clean_query_text(coco.cats[category_id]["name"])
+        for category_id in category_ids
+    }
+    available = set(cleaned_by_id.values())
+
+    target_by_source: dict[str, str] = {}
+    merges: list[tuple[list[str], str]] = []
+    for spec in merge_specs:
+        sources_text, separator, target = spec.partition("=")
+        target = target.strip()
+        if not separator or not target:
+            raise ValueError(
+                f"--merge-class-names entry {spec!r} is not of the form "
+                "'source+source=target'"
+            )
+        sources = [
+            cleaned
+            for cleaned in (_clean_query_text(part) for part in sources_text.split("+"))
+            if cleaned
+        ]
+        if len(sources) < 2:
+            raise ValueError(
+                f"--merge-class-names entry {spec!r} needs at least two source "
+                "classes separated by '+'"
+            )
+        for source in sources:
+            if source not in available:
+                raise ValueError(
+                    f"--merge-class-names source {source!r} did not match any "
+                    f"category. Available: {', '.join(sorted(available))}"
+                )
+            if source in target_by_source:
+                raise ValueError(
+                    f"--merge-class-names maps {source!r} into both "
+                    f"{target_by_source[source]!r} and {target!r}"
+                )
+            target_by_source[source] = target
+        merges.append((sources, target))
+
+    class_names: list[str] = []
+    label_by_name: dict[str, int] = {}
+    category_id_to_label: dict[int, int] = {}
+    for category_id in category_ids:
+        name = target_by_source.get(
+            cleaned_by_id[category_id], coco.cats[category_id]["name"]
+        )
+        key = _clean_query_text(name)
+        if key not in label_by_name:
+            label_by_name[key] = len(class_names)
+            class_names.append(name)
+        category_id_to_label[category_id] = label_by_name[key]
+    return class_names, category_id_to_label, merges
 
 
 def sample_prompt_set(
@@ -385,6 +460,21 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "a run with a different class set."
         ),
     )
+    parser.add_argument(
+        "--merge-class-names",
+        nargs="+",
+        metavar="SOURCE+SOURCE=TARGET",
+        help=(
+            "Collapse groups of COCO categories into one query, e.g. "
+            "'left_arm+right_arm=arm'. Sources are matched like "
+            "--exclude-class-names; '+' separates them because a comma already "
+            "separates aliases within one category name. Every box stays "
+            "supervised under the merged label, unlike --exclude-class-names, "
+            "which would leave one side of a lateral pair unlabelled. This is a "
+            "metric change: mAP over the merged set is NOT comparable to a run "
+            "with a different class set."
+        ),
+    )
     parser.add_argument("--shots-per-class", type=int)
     parser.add_argument("--seed", type=int, default=0)
 
@@ -614,6 +704,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-full-model", action="store_true")
     parser.add_argument("--mlflow", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--mlflow-experiment", default="OwlV2-Text-Training")
+    parser.add_argument(
+        "--mlflow-run-name",
+        help="Run name in MLflow. Defaults to a timestamp.",
+    )
     return parser
 
 
@@ -681,7 +775,10 @@ def main(argv: list[str] | None = None) -> None:
             run_context = mlflow.start_run(run_id=resumed_run_id)
         else:
             run_context = mlflow.start_run(
-                run_name=f"owlv2_text_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                run_name=(
+                    args.mlflow_run_name
+                    or f"owlv2_text_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                )
             )
     else:
         run_context = nullcontext()
@@ -716,10 +813,11 @@ def main(argv: list[str] | None = None) -> None:
         missing_val_ids = set(category_ids) - set(val_dataset.coco.getCatIds())
         if missing_val_ids:
             raise ValueError(f"Validation annotations are missing category ids {sorted(missing_val_ids)}")
-        category_id_to_label = {
-            category_id: label for label, category_id in enumerate(category_ids)
-        }
-        class_names = coco_class_names(train_dataset.coco, category_ids)
+        class_names, category_id_to_label, merges = build_label_space(
+            train_dataset.coco, category_ids, args.merge_class_names or []
+        )
+        for sources, target in merges:
+            print(f"Merged {' + '.join(sources)} -> {target}")
 
         if resume_checkpoint is not None:
             check_resume_compatibility(resume_checkpoint, args, class_names)
