@@ -65,12 +65,21 @@ diluting the class term 46x — it was 0.8% of the gradient. The fix was correct
 and moved mAP +0.0030, i.e. nothing. A genuine bug is not automatically a
 performance opportunity.
 
-**3. Mosaic (`--mosaic-prob 0.5`) — settled negative.** Behind at **19 of 19
-paired evals** across two independent run pairs, −0.0208 at the annealed 6600
-and negative on all six sub-metrics. Note the caveat: at 0.39–1.16 epochs a
-regularizer has almost no room to pay, so this verdict is specific to a
-budget-starved regime and does **not** transfer to a small dataset trained for
-many epochs.
+**3. Mosaic (`--mosaic-prob 0.5`) — RETRACTED 2026-08-08, the arms were buggy.**
+Behind at **19 of 19 paired evals** across two independent run pairs, −0.0208 at
+the annealed 6600 and negative on all six sub-metrics.
+
+**This comparison is invalid.** kornia's `RandomMosaic` mistranslates boxes on a
+partially mosaicked batch, and at `--mosaic-prob 0.5 --batch-size 8` ~99% of
+batches are partial. `F2_34cls_mosaic` and `F2b_34cls_mosaic` both ran that
+configuration with `--gpu-augment`, so roughly half of every batch carried boxes
+at the wrong offsets. The measured cost was **706 of 1,932 retained boxes wrong**
+at `p=0.5` versus 0 of 2,286 at `p=1.0`. F1/F1b at `mosaic_prob=0` are unaffected,
+so what the 19 evals actually compared was *mosaic-with-corrupted-boxes* against
+*no mosaic*. See `docs/lvmhp-findings.md` for the diagnosis and fix.
+
+The original caveat also still stands: at 0.39–1.16 epochs a regularizer has
+almost no room to pay. **Mosaic is an open question, not a settled negative.**
 
 **4. The class-set cleanup, as an accuracy win.** Dropping 12 weak classes moved
 the headline 0.3332 → 0.43, but **+0.0899 of that +0.1058 was pure re-averaging**,

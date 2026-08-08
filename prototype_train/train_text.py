@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import re
 import sys
 from contextlib import nullcontext
 from datetime import datetime
@@ -309,6 +310,29 @@ def log_eval_metrics(metrics, prefix: str, step: int | None = None) -> None:
     log_metrics(scalars, step=step)
 
 
+def log_per_class_ap(
+    metrics, class_names: list[str], prefix: str, step: int | None = None
+) -> None:
+    """Log per-class AP and AR@100 under ``<prefix>ap/<class>``.
+
+    A no-op unless the evaluation was run with class metrics enabled, in which
+    case ``map_per_class`` is a scalar -1 rather than a per-class tensor.
+    """
+    per_class = metrics.get("map_per_class")
+    if per_class is None or per_class.numel() <= 1:
+        return
+    scalars = {}
+    for label, ap, recall in zip(
+        metrics["classes"].tolist(), per_class, metrics["mar_100_per_class"]
+    ):
+        label = int(label)
+        name = class_names[label] if label < len(class_names) else f"label {label}"
+        key = re.sub(r"[^0-9A-Za-z_.-]+", "_", name)
+        scalars[f"{prefix}ap/{key}"] = float(ap)
+        scalars[f"{prefix}ar_100/{key}"] = float(recall)
+    log_metrics(scalars, step=step)
+
+
 def evaluation_prompts(class_names: list[str], template: str) -> list[str]:
     if "{name}" not in template:
         raise ValueError("The evaluation prompt template must contain a '{name}' placeholder")
@@ -403,6 +427,8 @@ RESUME_CRITICAL_ARGS = (
     "seed",
     "shots_per_class",
     "amp",
+    "mosaic_no_aug_steps",
+    "mosaic_mode",
 )
 
 
@@ -520,6 +546,28 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help=(
             "Per-image probability of replacing the image with a mosaic of "
             "--mosaic-grid images drawn from the same batch. 0 disables it."
+        ),
+    )
+    parser.add_argument(
+        "--mosaic-mode",
+        choices=("crop", "downscale"),
+        default="crop",
+        help=(
+            "'crop' concatenates sources at original scale and cuts an "
+            "input-sized window out, so it removes context and never shrinks an "
+            "object. 'downscale' resizes a whole source into each grid cell, "
+            "the conventional DEIM/YOLO mosaic, which keeps every box and "
+            "manufactures small objects."
+        ),
+    )
+    parser.add_argument(
+        "--mosaic-no-aug-steps",
+        type=int,
+        default=0,
+        help=(
+            "Disable mosaic for the final N optimizer steps of --max-steps, "
+            "while keeping the other augmentations enabled. This is the "
+            "step-based equivalent of DEIM's no_aug_epoch. 0 disables the schedule."
         ),
     )
     parser.add_argument(
@@ -700,6 +748,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "existing weights against a different query set."
         ),
     )
+    parser.add_argument(
+        "--per-class-ap",
+        action="store_true",
+        help=(
+            "Report AP and AR@100 for every class, printed and logged as "
+            "val/ap/<class>. Costs an extra COCOeval pass per class, so it "
+            "applies to every evaluation in the run -- intended for --eval-only."
+        ),
+    )
     parser.add_argument("--output-dir", default="text_checkpoints")
     parser.add_argument("--save-full-model", action="store_true")
     parser.add_argument("--mlflow", action=argparse.BooleanOptionalAction, default=False)
@@ -731,6 +788,15 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("grad_accum_steps must be at least 1")
     if not 0.0 <= args.mosaic_prob <= 1.0:
         raise ValueError("mosaic_prob must be in [0, 1]")
+    if args.mosaic_no_aug_steps < 0:
+        raise ValueError("mosaic_no_aug_steps must be non-negative")
+    if args.mosaic_no_aug_steps > 0 and args.max_steps is None:
+        raise ValueError("--mosaic-no-aug-steps requires --max-steps")
+    if (
+        args.max_steps is not None
+        and args.mosaic_no_aug_steps > args.max_steps
+    ):
+        raise ValueError("mosaic_no_aug_steps cannot exceed max_steps")
     gpu_augment = args.augment and args.gpu_augment
     if args.mosaic_prob > 0 and not gpu_augment:
         raise ValueError("--mosaic-prob requires --augment and --gpu-augment")
@@ -863,6 +929,7 @@ def main(argv: list[str] | None = None) -> None:
             BatchAugmentor(
                 model.image_size,
                 mosaic_prob=args.mosaic_prob,
+                mosaic_mode=args.mosaic_mode,
                 mosaic_grid=tuple(args.mosaic_grid),
                 mosaic_start_ratio_range=tuple(args.mosaic_start_ratio),
                 min_box_visibility=args.mosaic_min_visibility,
@@ -870,6 +937,17 @@ def main(argv: list[str] | None = None) -> None:
             if gpu_augment
             else None
         )
+        mosaic_stop_step = (
+            args.max_steps - args.mosaic_no_aug_steps
+            if args.mosaic_no_aug_steps > 0
+            else None
+        )
+        if mosaic_stop_step is not None and args.mosaic_prob > 0:
+            print(
+                f"Mosaic will be disabled after optimizer step {mosaic_stop_step} "
+                f"for the final {args.mosaic_no_aug_steps} steps"
+            )
+
         def make_train_loader(epoch: int, skip_batches: int = 0) -> DataLoader:
             """Build one epoch's loader over an explicit, resumable sample order.
 
@@ -989,9 +1067,11 @@ def main(argv: list[str] | None = None) -> None:
                 title="Text-conditioned baseline",
                 log_to_mlflow=args.mlflow,
                 max_batches=args.eval_max_batches,
+                class_names=class_names if args.per_class_ap else None,
             )
             if args.mlflow:
                 log_eval_metrics(baseline_metrics, "baseline/")
+                log_per_class_ap(baseline_metrics, class_names, "baseline/")
 
         if args.eval_only:
             metrics = coco_eval(
@@ -1005,9 +1085,11 @@ def main(argv: list[str] | None = None) -> None:
                 title=f"Text-conditioned evaluation ({len(class_names)} classes)",
                 log_to_mlflow=args.mlflow,
                 max_batches=args.eval_max_batches,
+                class_names=class_names if args.per_class_ap else None,
             )
             if args.mlflow:
                 log_eval_metrics(metrics, "val/", step=0)
+                log_per_class_ap(metrics, class_names, "val/", step=0)
             print(f"Evaluation mAP over {len(class_names)} classes: {float(metrics['map']):.4f}")
             return
 
@@ -1111,11 +1193,13 @@ def main(argv: list[str] | None = None) -> None:
                 ),
                 log_to_mlflow=args.mlflow,
                 max_batches=args.eval_max_batches,
+                class_names=class_names if args.per_class_ap else None,
             )
             latest_map = float(metrics["map"])
             last_eval_step = step
             if args.mlflow:
                 log_eval_metrics(metrics, "val/", step=step)
+                log_per_class_ap(metrics, class_names, "val/", step=step)
             if latest_map > best_map:
                 best_map = latest_map
                 save_checkpoint(
@@ -1175,7 +1259,12 @@ def main(argv: list[str] | None = None) -> None:
                 images = batch["images"].to(device, non_blocking=True)
                 targets = batch["targets"]
                 if batch_augmentor is not None:
-                    images, targets = batch_augmentor(images, targets)
+                    mosaic_enabled = (
+                        mosaic_stop_step is None or global_step < mosaic_stop_step
+                    )
+                    images, targets = batch_augmentor(
+                        images, targets, apply_mosaic=mosaic_enabled
+                    )
                 prompts = sample_prompt_set(prompt_pools, prompt_generator)
                 with torch.autocast(device_type=device.type, enabled=amp_enabled):
                     outputs = detector(images, prompts=prompts)

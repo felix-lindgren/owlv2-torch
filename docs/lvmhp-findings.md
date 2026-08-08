@@ -205,3 +205,323 @@ Ranking from here is unchanged except that L1/L1b are already answered: **L2
 per-class AP → L3b (mosaic tail) → L4 (capacity)**. Two runs fit on the two GPUs
 concurrently with zero MLflow lock contention and no measurable slowdown, so each
 phase is one ~70 min wall-clock block rather than two.
+
+## Phase 2 — laterality
+
+**L2a needed no training run.** Its configuration — the protocol block, 18
+classes, 4,500 steps — is exactly L0c's, so L0c seeds 0 and 1 *are* L2a, at
+0.3605 and 0.3593 annealed. Phase 2 therefore reduces to two ~40 s `--eval-only`
+passes over those weights plus one new training arm.
+
+Per-class AP required an implementation change: `class_metrics` was hardcoded
+`False` in `coco_eval`, so `val/map_per_class` had been logging a constant −1 for
+every run in the project. `coco_eval` now takes `class_names` and enables class
+metrics when it is supplied, and `train_text.py` exposes it as `--per-class-ap`
+(printed, and logged as `val/ap/<class>` and `val/ar_100/<class>`). It is off by
+default because it costs an extra COCOeval accumulate per class on *every* eval
+in a run; the intended use is `--eval-only`.
+
+### L2a per-class AP — the six lateral classes (2026-08-08)
+
+`--eval-only --per-class-ap --init-from text_checkpoints/lvmhp_L0c_seed{0,1}/final.pth`.
+
+| class | AP seed 0 | AP seed 1 | | class | AP seed 0 | AP seed 1 |
+|---|---:|---:|---|---|---:|---:|
+| upper clothes | 0.7339 | 0.7328 | | scarf | 0.2424 | 0.2493 |
+| hat | 0.6959 | 0.6859 | | belt | 0.1975 | 0.2066 |
+| hair | 0.6826 | 0.6821 | | **right shoe** | **0.1612** | **0.1533** |
+| pants | 0.6817 | 0.6801 | | **left shoe** | **0.1326** | **0.1356** |
+| face | 0.5622 | 0.5609 | | torso skin | 0.1182 | 0.1276 |
+| dress | 0.5181 | 0.5199 | | **left leg** | **0.1220** | **0.1063** |
+| sunglasses | 0.4708 | 0.4618 | | **right arm** | **0.1176** | **0.0984** |
+| skirt | 0.4226 | 0.4272 | | **left arm** | **0.1137** | **0.1216** |
+| bag | 0.4226 | 0.4216 | | **right leg** | **0.0971** | **0.0995** |
+
+**Risk A is confirmed as strongly as the evidence allows.** The six lateral
+classes occupy six of the bottom seven places in both seeds, all between 0.097
+and 0.161, against 0.42–0.73 for every non-lateral class except `torso skin`,
+`belt` and `scarf`. The run plan's prediction — that "left arm" and "right arm"
+differ by one token while being visually near-identical, and that the real
+distinction is image-relative geometry a text query cannot express — is what the
+numbers show.
+
+### L2a re-scored on the 15-class set (2026-08-08)
+
+Same weights, `--merge-class-names left_arm+right_arm=arm
+left_shoe+right_shoe=shoe left_leg+right_leg=leg`. This is the *only* legitimate
+baseline for any 15-class number.
+
+| | 18 classes | 15 classes, re-scored | Δ |
+|---|---:|---:|---:|
+| seed 0 | 0.3605 | **0.4683** | +0.1078 |
+| seed 1 | 0.3593 | **0.4689** | +0.1096 |
+
+The class-set arithmetic is **+0.108 on trained weights**, nearly twice the
++0.060 it was worth zero-shot at L0b. The seed spread at 15 classes is 0.0006,
+consistent with the ±0.001 annealed floor, so the merged metric is no noisier
+than the 18-class one.
+
+**The merge is not just re-averaging — the model already knows where the parts
+are and is only guessing the side.** Merging each pair produces an AP far above
+either member, not the average of the two:
+
+| pair | left | right | merged | AR@100 left / right / merged |
+|---|---:|---:|---:|---|
+| shoe | 0.1326 | 0.1612 | **0.5226** | 0.352 / 0.376 / 0.653 |
+| arm | 0.1137 | 0.1176 | **0.3890** | 0.329 / 0.353 / 0.572 |
+| leg | 0.1220 | 0.0971 | **0.3664** | 0.422 / 0.243 / 0.548 |
+
+(seed 0; seed 1 agrees to ±0.003). Shoe AP more than triples. A pure
+re-averaging effect would land the merged class near the mean of its members;
+landing at 3–4x means most of the loss was side assignment — a correct box scored
+as the wrong side is a false positive *and* a false negative, and merging
+converts both into one true positive.
+
+### L2b — native 15-class training (2026-08-08)
+
+Seeds 0 and 1, one per GPU, protocol unchanged from L0c except
+`--merge-class-names`, so the class set is the single variable. 61 and 57 min.
+
+| | L2a re-scored | L2b native | Δ |
+|---|---:|---:|---:|
+| seed 0 | 0.4683 | 0.4706 | **+0.0023** |
+| seed 1 | 0.4689 | 0.4704 | **+0.0015** |
+
+**Training on the merged labels is worth +0.002 — a tie by the project's own
+bar.** Both seeds move the same direction, but the plan's threshold is ~0.003
+and this is below it. Set against the +0.108 the merge is worth for free, L2b
+adds nothing that would justify its 60 minutes.
+
+The per-class breakdown says the effect is real but narrow, and explains exactly
+why the headline barely moves. Only two classes move beyond the noise, and they
+are merged ones:
+
+| class | Δ seed 0 | Δ seed 1 |
+|---|---:|---:|
+| **arm** | **+0.0146** | **+0.0115** |
+| **leg** | **+0.0087** | **+0.0125** |
+| shoe | +0.0009 | +0.0011 |
+| belt | +0.0156 | −0.0046 |
+| all 11 others | −0.0039 … +0.0036 | −0.0056 … +0.0029 |
+
+Native training helps `arm` and `leg` by ~0.012 in both seeds and does nothing
+for `shoe`, which was already the strongest of the three at 0.52. `belt` swings
++0.016 / −0.005 and is noise, as an 85-box class should be. Two classes gaining
+0.012 in a 15-class macro-average is 2 x 0.012 / 15 = **0.0016** — which is the
+headline Δ, arithmetic that closes exactly.
+
+The reading: merging removes an unlearnable side distinction, and the model
+converts that freed capacity into better `arm` and `leg` detection. But the
+metric is a macro-average over 15 classes, so a real gain on two of them is
+diluted to the noise floor. **Adopt the 15-class set; do not treat native
+training on it as a separate lever.**
+
+The curve reproduces L0c on the new class set: rise, flatten at ~3,375, flat
+tail (3375 → 4500 buys 0.0017 and 0.0042), no turnover at 10 epochs. Mid-run
+spread peaks at **0.0140 at step 1,125** against **0.0002 annealed** — an
+independent replication of L0c's central warning, now at 70x rather than 10x.
+
+### Mosaic was corrupt at fractional `--mosaic-prob` (found 2026-08-08)
+
+The first Phase 3 attempt was killed at ~step 2,100 of 4,500 and discarded.
+kornia's `RandomMosaic` builds a *partial* batch's images indexed by rank among
+the applied samples, but transforms the boxes by original batch position. Below
+`p=1.0` the boxes therefore come back at the wrong offsets. The wrapper's
+existing repair only rescued the **labels** (`gpu_augment.py`'s permutation
+scatter); the box coordinates were already wrong by then.
+
+Measured with a probe that fills each source image black except for one marked
+rectangle — its own box — and then checks that the pixels inside each returned
+box still carry that source's colour:
+
+| `mosaic_prob` | misplaced boxes | note |
+|---|---|---|
+| 0.5 | **706 / 1,932** | 199 of 200 batches partially mosaicked |
+| 1.0 | 0 / 2,286 | never takes the partial path |
+
+At `--batch-size 8 --mosaic-prob 0.5`, ~99% of batches are partial, so
+essentially every mosaic batch was affected.
+
+**Why the existing tests passed.** They asserted with *full-image* boxes
+(`[0.5, 0.5, 1.0, 1.0]`), which cover the whole tile no matter where they are
+translated to — a box in the right tile at the wrong offset is indistinguishable
+from a correct one. A first probe of mine repeated the same mistake with
+constant-colour images and also reported 0 errors. Only sub-image boxes over
+spatially varying content expose it.
+
+**Fix:** drive kornia at `p=1.0` so it only ever sees a full batch, and apply the
+per-sample probability in the wrapper afterwards, keeping the original image and
+targets for unselected samples. The partial-batch path is now unreachable, and a
+hard `RuntimeError` fires if kornia ever returns less than a full batch. Selected
+fraction still tracks the requested rate (0.240 / 0.484 / 0.742 measured at
+0.25 / 0.5 / 0.75).
+
+`tests/test_gpu_augment.py` gains `marked_box_batch` plus a regression test that
+fails on the pre-fix code (9 failures) and passes after (15 pass). Test
+appliedness is now read from pass-through *identity* rather than by comparing
+images: a mosaic whose cells all come from one source is pixel-identical to that
+source, which silently misreports it as skipped.
+
+**Scope — this invalidates two Fashionpedia runs.** Only fractional
+`--mosaic-prob` with `--gpu-augment` is affected. Checking `mosaic_prob` across
+every logged run:
+
+- Every LV-MHP training result above (L0c, L2b) ran at `--mosaic-prob 0`. **No
+  number in this document changes.** The `--eval-only` runs log `mosaic_prob 0.5`
+  from the default but never train, so they are untouched.
+- **`F2_34cls_mosaic` and `F2b_34cls_mosaic` ran at `mosaic_prob=0.5` with
+  `gpu_augment=True`** — both trained on corrupted mosaic boxes for the ~50% of
+  each batch that was mosaicked. Their paired partners F1/F1b ran at
+  `mosaic_prob=0` and are unaffected.
+
+So Fashionpedia's mosaic-vs-no-mosaic comparison was **mosaic-with-broken-boxes
+vs no mosaic**, which is not the experiment it was read as. Its verdict that
+mosaic loses is confounded: some of that deficit is corrupted supervision rather
+than the regularizer. `docs/fashionpedia-findings.md` needs this caveat, and it
+raises the prior that Phase 3 here — the first fair test of mosaic in the
+project — could come out differently.
+
+## Phase 2 verdict
+
+| question | answer |
+|---|---|
+| Are the lateral classes weak? | Yes — 6 of the bottom 7, AP 0.097–0.161 vs 0.42–0.73 for most others |
+| Is merging worth it? | **+0.108 on trained weights**, free, no retraining |
+| Is it just re-averaging? | **No** — merged AP is 3–4x either member, so most of the loss was side assignment |
+| Does training on 15 classes help? | **+0.002, a tie.** Real +0.012 on `arm` and `leg`, diluted by the macro-average |
+| Did L2a need a run? | No — L0c *is* L2a |
+
+**New reference point for phases 3–5: 0.4706 (L2b seed 0, 15 classes, annealed
+4,500).** Phase 3 onward should run on the 15-class set, since it is strictly
+better and costs nothing, and every number must be quoted against a 15-class
+baseline. Phase 2 cost ~60 min of GPU time instead of the budgeted ~2 h, because
+L2a was already in hand and the per-class question needed only a 40 s eval.
+
+## Phase 3 — regularization (2026-08-08)
+
+Both arms on the 15-class set, seed 0, protocol otherwise identical to L2b, on
+the **fixed** mosaic. Baseline is L2b seed 0 = 0.4706. 68 and 62 min.
+
+| run | mosaic | annealed 4,500 | vs. L2b | evals behind baseline |
+|---|---|---:|---:|---:|
+| L2b | none | **0.4706** | — | — |
+| **L3a** | `p=0.5` throughout | 0.4640 | **−0.0065** | **20 of 20** |
+| **L3b** | `p=0.5`, off for final 1,800 | 0.4675 | **−0.0030** | 16 of 20 |
+
+**Mosaic loses on LV-MHP even when implemented correctly.** L3a is behind at
+every one of its 20 evals and −0.0065 annealed, well past the ~0.003 tie bar.
+This is the run plan's most promising direction and the one Fashionpedia's budget
+starvation was blamed for; at 10 epochs on 3,600 images, with correct boxes, it
+still does not pay.
+
+**The no-aug tail is worth +0.0035 and is the one thing here that works.** L3b
+beats L3a at the annealed eval, and the curve shows why: mosaic stops at step
+2,700 and L3b closes to **+0.0009 / +0.0006 above baseline at 2,925 / 3,150** —
+briefly reaching parity — before settling at −0.0030. So the tail recovers about
+half the deficit, and implementation item 2 is validated as doing what DEIM's
+`no_aug_epoch` claims. It just is not enough to make mosaic worth turning on.
+At −0.0030 L3b sits exactly on the tie bar, so the honest reading is that
+**L3b ties with no-mosaic** while L3a clearly loses.
+
+Sub-metrics say the damage is concentrated where this mosaic variant is weakest:
+
+| | map | small | medium | large |
+|---|---:|---:|---:|---:|
+| L2b (none) | 0.4706 | 0.1884 | 0.3854 | 0.4809 |
+| L3a | 0.4640 | **0.1515** | 0.3792 | 0.4723 |
+| L3b | 0.4675 | 0.1639 | 0.3871 | 0.4774 |
+
+`map_small` drops **−0.037** under mosaic, over 3x its ±0.011 noise floor, while
+medium and large lose only −0.006 and −0.009. This is consistent with the variant
+in use: kornia's is a **crop-style** mosaic — original-scale images are
+concatenated and an input-sized window is cropped — so unlike the conventional
+four-image *downscaled* mosaic it never manufactures small objects. It only
+removes context and clips objects at tile seams, which costs the smallest boxes
+the most. The plan's D3 ("DEIM-style downscaling mosaic") is therefore still
+untested and is a different question from the one L3a answers.
+
+### Phase 3 verdict
+
+| question | answer |
+|---|---|
+| Does mosaic pay at 10 epochs? | **No.** −0.0065, behind at 20 of 20 evals |
+| Does the mosaic-off tail help? | **Yes, +0.0035** over L3a, and visibly at the switch |
+| Is mosaic+tail worth running? | No — 0.4675 still ties/loses against 0.4706 for free |
+| Was Fashionpedia's verdict right after all? | Directionally yes, but it was reached on corrupted arms and could not have known |
+
+**Reference point is unchanged: 0.4706 (L2b seed 0).** Keep `--mosaic-prob 0`.
+Both Phase 3 arms are single-seed; L3a's margin is 6x the annealed floor and
+20-of-20 consistent, so it needs no confirmation, while a seed-1 L3b would sharpen
+a result that currently sits on the tie bar. Neither changes the recommendation.
+
+### L3c / D3 — the DEIM-style downscaling mosaic (2026-08-08)
+
+The run plan's D3 was never implemented; only kornia's crop-style mosaic existed.
+`--mosaic-mode {crop,downscale}` now selects between them, defaulting to `crop`
+so nothing existing changes. The downscale path resizes a whole source image into
+each grid cell instead of concatenating at original scale and cropping, so
+nothing is discarded, every box survives, and a 2x2 grid halves every object's
+linear size. It is written in plain tensor ops rather than kornia: there is no
+partial-batch path to get wrong, and boxes map by a pure affine rescale in
+normalised coordinates, so no clipping or visibility filter is possible.
+
+L3c is L3a with only the mosaic type changed.
+
+| run | mosaic | annealed 4,500 | vs. L2b | vs. L3a |
+|---|---|---:|---:|---:|
+| L2b | none | 0.4706 | — | — |
+| L3a | crop, `p=0.5` | 0.4640 | −0.0065 | — |
+| **L3c** | **downscale, `p=0.5`** | **0.4711** | **+0.0005** | **+0.0071** |
+
+**The mosaic *variant* was the whole story.** L3c beats L3a at **19 of 20 evals**
+and recovers the entire crop deficit, landing in a dead tie with no mosaic
+(+0.0005, far inside the ~0.003 bar, and ahead at only 11 of 20 evals). The
+sub-metric that motivated the hypothesis confirms it:
+
+| | map | small | medium | large |
+|---|---:|---:|---:|---:|
+| L2b (none) | 0.4706 | 0.1884 | 0.3854 | 0.4809 |
+| L3a (crop) | 0.4640 | **0.1515** | 0.3792 | 0.4723 |
+| L3c (downscale) | 0.4711 | **0.1833** | 0.3864 | 0.4795 |
+
+Crop mosaic cost `map_small` −0.037; downscale costs −0.005, inside its ±0.011
+floor. The diagnosis in the Phase 3 verdict was right — the damage was context
+removal and seam clipping, not mosaicking as such — but fixing it buys parity,
+not a win.
+
+**So mosaic is now genuinely settled on this dataset, in a way Fashionpedia's
+retracted result never was: the good variant ties, the bad one loses.** Keep
+`--mosaic-prob 0` as the default recipe, since a tie is not worth the extra
+complexity. The one live thread is that L3c carries ~4x the boxes per mosaicked
+sample (79 vs 20), so it trains on a materially different positive/negative
+balance and still keeps pace; pairing it with the `--mosaic-no-aug-steps` tail
+that was worth +0.0035 on the crop variant is the obvious next probe if mosaic is
+revisited.
+
+## Phase 4 — capacity (partial)
+
+| run | vision blocks | annealed 4,500 | vs. L2b |
+|---|---|---:|---:|
+| L2b | 2 (protocol) | **0.4706** | — |
+| **L4a** | **0 (head only)** | **0.4303** | **−0.0403** |
+
+**The run plan's central Phase 4 hypothesis is wrong.** It argued that at ~254
+samples per trainable million, "more capacity is a plausible *liability* here"
+and that "the interesting hypothesis is that vb0 wins". vb0 does not win; it
+loses by **−0.0403**, 40x the annealed noise floor and the largest effect
+measured anywhere in this project. Unfreezing two vision blocks is worth more
+than the entire lateral-merge training question, the mosaic question and the
+class-set question combined.
+
+L4a is also behind at every one of its 20 evals and its curve flattens early
+(0.4251 at step 2,700 to 0.4303 at 4,500), so it is capacity-limited rather than
+budget-limited. The head alone cannot adapt OWLv2 to this dataset; the vision
+tower has to move.
+
+This makes **L4b (`--vision-blocks 6`) the interesting run**, and it now has a
+real prior behind it: if 0 → 2 is worth +0.040, the 2 → 6 slope is the question,
+against the plan's fear that 42.5M trainable parameters on 3,600 images overfits.
+Note L0a measured vb6 at 1,051 ms/step against vb2's 751, so L4b costs ~85 min.
+
+Remaining: **L4b (vb6)** and **phase 5 (transfer to large)**, both at 15 classes
+against 0.4706.

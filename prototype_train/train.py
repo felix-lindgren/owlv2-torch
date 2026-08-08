@@ -577,12 +577,17 @@ def coco_eval(
     output_format: str = "prototype",
     title: str = "COCO Evaluation Results",
     max_batches: int | None = None,
+    class_names: list[str] | None = None,
 ):
     model.eval()
     device_type = torch.device(device).type
     if max_batches is not None and max_batches <= 0:
         raise ValueError(f"max_batches must be positive or None, got {max_batches}")
-    
+
+    # Per-class AP costs an extra COCOeval accumulate per class, so it is only
+    # computed when the caller names the classes it wants reported.
+    per_class = class_names is not None
+
     # Initialize torchmetrics mAP
     metric = MeanAveragePrecision(
         box_format='xyxy',
@@ -590,7 +595,7 @@ def coco_eval(
         iou_thresholds=None,
         rec_thresholds=None,
         max_detection_thresholds=[1, 10, 100],
-        class_metrics=False,
+        class_metrics=per_class,
         backend='faster_coco_eval'
     )
     metric.warn_on_many_detections = False
@@ -711,6 +716,22 @@ def coco_eval(
     print(f"mAP (small): {metrics['map_small']:.4f}")
     print(f"mAP (medium): {metrics['map_medium']:.4f}")
     print(f"mAP (large): {metrics['map_large']:.4f}")
+    if per_class:
+        print(f"\n--- {title}: per-class AP @[.5:.95] ---")
+        labels = [int(label) for label in metrics["classes"].tolist()]
+        rows = [
+            (
+                class_names[label] if label < len(class_names) else f"label {label}",
+                float(ap),
+                float(recall),
+            )
+            for label, ap, recall in zip(
+                labels, metrics["map_per_class"], metrics["mar_100_per_class"]
+            )
+        ]
+        width = max(len(name) for name, _, _ in rows)
+        for name, ap, recall in sorted(rows, key=lambda row: row[1], reverse=True):
+            print(f"  {name:<{width}}  AP {ap:.4f}  AR@100 {recall:.4f}")
     if debug and sample_output_dir is not None:
         print(f"Saved {drawn} evaluation samples to {sample_output_dir}")
         if log_to_mlflow and drawn:
