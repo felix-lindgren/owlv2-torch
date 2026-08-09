@@ -93,7 +93,11 @@ def _greedy_assignment(cost: torch.Tensor, device: torch.device) -> tuple[torch.
     )
 
 
-def _focal_class_loss(logits: torch.Tensor, class_targets: torch.Tensor) -> torch.Tensor:
+def _focal_class_loss(
+    logits: torch.Tensor,
+    class_targets: torch.Tensor,
+    class_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Focal loss summed over classes, averaged over predictions.
 
     Note the deliberate ``sum`` over the class dimension. A plain
@@ -106,6 +110,10 @@ def _focal_class_loss(logits: torch.Tensor, class_targets: torch.Tensor) -> torc
     per_element = sigmoid_focal_loss(
         logits, class_targets, alpha=0.25, gamma=2.0, reduction="none"
     )
+    if class_weights is not None:
+        per_element = per_element * class_weights.to(
+            device=per_element.device, dtype=per_element.dtype
+        )
     return per_element.sum(dim=-1).mean()
 
 
@@ -118,6 +126,7 @@ def _quality_class_loss(
     variant: str,
     gamma: float,
     alpha: float | None,
+    class_weights: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """IoU-aware dense classification loss: MAL (DEIM) or VFL (VarifocalNet).
 
@@ -177,6 +186,8 @@ def _quality_class_loss(
     loss = F.binary_cross_entropy_with_logits(
         class_logits, target_score, weight=weight, reduction="none"
     )
+    if class_weights is not None:
+        loss = loss * class_weights.to(device=loss.device, dtype=loss.dtype).view(1, 1, -1)
     return (loss * one_hot).sum() / num_boxes, (
         loss * (1.0 - one_hot)
     ).sum() / num_boxes
@@ -201,6 +212,7 @@ def compute_text_query_losses(
     class_loss: str = "focal",
     class_loss_gamma: float = 1.5,
     class_loss_alpha: float | None = None,
+    class_weights: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute detection losses where each class index denotes a text query.
 
@@ -226,6 +238,14 @@ def compute_text_query_losses(
             f"class_loss must be one of {CLASS_LOSS_CHOICES}, got {class_loss!r}"
         )
     class_logits, objectness_logits, pred_boxes = outputs[:3]
+    if class_weights is not None:
+        if class_weights.ndim != 1 or class_weights.numel() != class_logits.shape[-1]:
+            raise ValueError(
+                "class_weights must have one entry per text query; got "
+                f"{tuple(class_weights.shape)} for {class_logits.shape[-1]} queries"
+            )
+        if (class_weights < 0).any():
+            raise ValueError("class_weights must be non-negative")
     if len(targets) != class_logits.shape[0]:
         raise ValueError(
             f"Received {len(targets)} targets for a batch of {class_logits.shape[0]}"
@@ -266,7 +286,7 @@ def compute_text_query_losses(
                 positive_targets = torch.zeros_like(logits[pred_indices])
                 positive_targets.scatter_(1, target_labels[:, None], 1.0)
                 positive_class_losses.append(
-                    _focal_class_loss(logits[pred_indices], positive_targets)
+                    _focal_class_loss(logits[pred_indices], positive_targets, class_weights)
                 )
 
             matched_boxes = pred_boxes[batch_index][pred_indices]
@@ -285,6 +305,7 @@ def compute_text_query_losses(
                 _focal_class_loss(
                     logits[negative_indices],
                     torch.zeros_like(logits[negative_indices]),
+                    class_weights,
                 )
             )
 
@@ -309,6 +330,7 @@ def compute_text_query_losses(
             variant=class_loss,
             gamma=class_loss_gamma,
             alpha=class_loss_alpha,
+            class_weights=class_weights,
         )
         loss_cls = loss_cls_pos + loss_cls_neg
     loss_l1 = _mean_or_zero(l1_losses, zero)

@@ -48,6 +48,7 @@ from OWLv2torch.torch_version.owlv2 import OwlV2
 from OWLv2torch.torch_version.text_loss import compute_text_query_losses
 from prototype_train.gpu_augment import BatchAugmentor
 from prototype_train.train_text import (
+    AERIAL_PROMPT_TEMPLATES,
     DEFAULT_PROMPT_TEMPLATES,
     TextQueryDetector,
     build_prompt_pools,
@@ -61,7 +62,9 @@ GIB = 1024 ** 3
 
 
 def load_target_pool(
-    annotations_path: str, max_images: int
+    annotations_path: str,
+    max_images: int,
+    density_quantiles: list[float] | None = None,
 ) -> tuple[list[dict[str, torch.Tensor]], list[str]]:
     """Read per-image targets in the trainer's format: normalised cxcywh, square-padded.
 
@@ -79,12 +82,31 @@ def load_target_pool(
     for annotation in data["annotations"]:
         by_image.setdefault(annotation["image_id"], []).append(annotation)
 
+    image_ids = list(sizes)
+    if density_quantiles:
+        invalid = [value for value in density_quantiles if not 0.0 <= value <= 1.0]
+        if invalid:
+            raise ValueError(f"density quantiles must be in [0, 1], got {invalid}")
+        ranked = sorted(image_ids, key=lambda image_id: (len(by_image.get(image_id, [])), image_id))
+        image_ids = list(dict.fromkeys(
+            ranked[round(quantile * (len(ranked) - 1))]
+            for quantile in density_quantiles
+        ))
+        selected = [len(by_image.get(image_id, [])) for image_id in image_ids]
+        print(
+            f"Density-quantile target crops: q={density_quantiles}, "
+            f"boxes={selected}",
+            flush=True,
+        )
+    else:
+        image_ids = image_ids[:max_images]
+
     pool = []
-    for image_id, annotations in list(by_image.items())[:max_images]:
+    for image_id in image_ids:
+        annotations = by_image.get(image_id, [])
         width, height = sizes[image_id]
         side = float(max(width, height))
-        boxes = torch.tensor(
-            [
+        box_values = [
                 [
                     (annotation["bbox"][0] + annotation["bbox"][2] * 0.5) / side,
                     (annotation["bbox"][1] + annotation["bbox"][3] * 0.5) / side,
@@ -92,8 +114,10 @@ def load_target_pool(
                     annotation["bbox"][3] / side,
                 ]
                 for annotation in annotations
-            ],
-            dtype=torch.float32,
+            ]
+        boxes = (
+            torch.tensor(box_values, dtype=torch.float32)
+            if box_values else torch.zeros((0, 4), dtype=torch.float32)
         )
         labels = torch.tensor(
             [label_of[annotation["category_id"]] for annotation in annotations],
@@ -132,7 +156,9 @@ def run_cell(args) -> dict:
     generator = random.Random(args.seed)
 
     if args.annotations:
-        target_pool, class_names = load_target_pool(args.annotations, args.target_images)
+        target_pool, class_names = load_target_pool(
+            args.annotations, args.target_images, args.density_quantiles
+        )
     else:
         target_pool, class_names = synthetic_target_pool(
             args.boxes_per_image, args.num_classes, 256, args.seed
@@ -155,9 +181,20 @@ def run_cell(args) -> dict:
     if args.grad_checkpointing:
         model.set_gradient_checkpointing(True)
 
-    prompt_pools = build_prompt_pools(class_names, list(DEFAULT_PROMPT_TEMPLATES))
+    prompt_templates = (
+        AERIAL_PROMPT_TEMPLATES
+        if args.prompt_profile == "aerial"
+        else DEFAULT_PROMPT_TEMPLATES
+    )
+    prompt_pools = build_prompt_pools(class_names, list(prompt_templates))
     detector = TextQueryDetector(
-        model, evaluation_prompts(class_names, "a photo of {name}")
+        model,
+        evaluation_prompts(
+            class_names,
+            "a satellite photo of {name}"
+            if args.prompt_profile == "aerial"
+            else "a photo of {name}",
+        ),
     ).to(device)
     if args.compile:
         model.vision_model.encoder.compile()
@@ -317,6 +354,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=256,
         help="Images read from --annotations to cycle through as target sets.",
     )
+    parser.add_argument(
+        "--density-quantiles",
+        type=float,
+        nargs="+",
+        help=(
+            "Select representative crops nearest these box-count quantiles "
+            "instead of the first --target-images, e.g. 0.5 0.9 0.99."
+        ),
+    )
     parser.add_argument("--boxes-per-image", type=float, default=25.0)
     parser.add_argument("--num-classes", type=int, default=18)
     parser.add_argument("--vision-blocks", type=int, nargs="+", default=[0, 2, 6])
@@ -336,6 +382,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="A/B for --grad-checkpointing.",
     )
     parser.add_argument("--class-loss", default="mal")
+    parser.add_argument("--prompt-profile", choices=("generic", "aerial"), default="generic")
     parser.add_argument("--mosaic-prob", type=float, default=0.0)
     parser.add_argument("--mosaic-grid", type=int, nargs=2, default=(2, 2))
     parser.add_argument("--gpu-augment", action=argparse.BooleanOptionalAction, default=True)
@@ -376,6 +423,7 @@ def cell_command(args, vision_blocks: int, batch_size: int, compiled: bool, ckpt
         "--vision-blocks", str(vision_blocks),
         "--batch-size", str(batch_size),
         "--class-loss", args.class_loss,
+        "--prompt-profile", args.prompt_profile,
         "--mosaic-prob", str(args.mosaic_prob),
         "--warmup", str(args.warmup),
         "--steps", str(args.steps),
@@ -384,6 +432,8 @@ def cell_command(args, vision_blocks: int, batch_size: int, compiled: bool, ckpt
         "--boxes-per-image", str(args.boxes_per_image),
         "--num-classes", str(args.num_classes),
     ]
+    if args.density_quantiles:
+        command += ["--density-quantiles", *map(str, args.density_quantiles)]
     if args.annotations:
         command += ["--annotations", args.annotations]
     command += ["--gpu-augment"] if args.gpu_augment else ["--no-gpu-augment"]

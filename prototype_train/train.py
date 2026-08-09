@@ -135,6 +135,7 @@ class AugmentedDetectionDataset(Dataset):
         horizontal_flip_prob=0.5,
         vertical_flip_prob=0.5,
         photometric=True,
+        scale_augment=True,
     ):
         self.base = base
         self.image_transform = image_transform
@@ -144,18 +145,21 @@ class AugmentedDetectionDataset(Dataset):
         self.horizontal_flip_prob = horizontal_flip_prob
         self.vertical_flip_prob = vertical_flip_prob
         if augment:
-            self.geom = Tv2.Compose([
-                Tv2.RandomZoomOut(fill=0, side_range=(1.0, zoom_out_max), p=zoom_out_prob),
-                Tv2.RandomIoUCrop(
-                    min_scale=iou_crop_min_scale,
-                    max_scale=iou_crop_max_scale,
-                    min_aspect_ratio=0.7,
-                    max_aspect_ratio=1.3,
-                    sampler_options=[0.0, 0.3, 0.5, 0.7, 0.9, 1.0],
-                    trials=20,
-                ),
-                Tv2.SanitizeBoundingBoxes(min_size=sanitize_min_size),
-            ])
+            geometry = []
+            if scale_augment:
+                geometry.extend([
+                    Tv2.RandomZoomOut(fill=0, side_range=(1.0, zoom_out_max), p=zoom_out_prob),
+                    Tv2.RandomIoUCrop(
+                        min_scale=iou_crop_min_scale,
+                        max_scale=iou_crop_max_scale,
+                        min_aspect_ratio=0.7,
+                        max_aspect_ratio=1.3,
+                        sampler_options=[0.0, 0.3, 0.5, 0.7, 0.9, 1.0],
+                        trials=20,
+                    ),
+                ])
+            geometry.append(Tv2.SanitizeBoundingBoxes(min_size=sanitize_min_size))
+            self.geom = Tv2.Compose(geometry)
             self.photo = (
                 Tv2.ColorJitter(
                     brightness=color_jitter_brightness,

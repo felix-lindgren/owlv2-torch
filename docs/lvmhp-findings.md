@@ -521,7 +521,176 @@ tower has to move.
 This makes **L4b (`--vision-blocks 6`) the interesting run**, and it now has a
 real prior behind it: if 0 → 2 is worth +0.040, the 2 → 6 slope is the question,
 against the plan's fear that 42.5M trainable parameters on 3,600 images overfits.
-Note L0a measured vb6 at 1,051 ms/step against vb2's 751, so L4b costs ~85 min.
 
-Remaining: **L4b (vb6)** and **phase 5 (transfer to large)**, both at 15 classes
-against 0.4706.
+### L4b — vb6, and the depth ladder (2026-08-08)
+
+Vision LR held at 1e-5 across all three, so depth is the only variable — the
+discipline the Fashionpedia retraction forced. 89 min.
+
+| vision blocks | trainable | annealed 4,500 | vs. vb2 | step |
+|---|---:|---:|---:|---:|
+| 0 | 2.8M | 0.4303 | −0.0403 | 585 ms |
+| 2 (protocol) | 16.9M | 0.4706 | — | 751 ms |
+| **6** | **45.3M** | **0.4865** | **+0.0159** | 1,051 ms |
+
+**Depth is the dominant lever on this dataset, and it has not saturated at vb6.**
+The ladder is +0.0403 for 0 → 2 and **+0.0159 for 2 → 6** — diminishing, but the
+second step is still 16x the annealed noise floor and larger than every other
+effect in phases 2–3 combined. `map_small` moves 0.1436 → 0.1884 → 0.2024 and
+`map_75` 0.4525 → 0.4935 → 0.5437, so this is better localisation, not just
+better ranking.
+
+**The run plan's overfitting prediction is refuted twice over.** It argued 42.5M
+trainable parameters against 3,600 images (~85 samples per trainable million)
+made capacity "a plausible liability". Instead vb6 wins, and its curve shows no
+turnover: it is still climbing into the anneal (0.4780 at 2,925 → 0.4865 at
+4,500) and its best (0.4868 at step 4,050) is 0.0003 off the annealed value.
+
+One caveat worth recording. vb6 is **behind vb2 for the first ~2,400 steps** and
+only pulls ahead after step 2,475, ending ahead at just 13 of 20 evals. A deeper
+tower is slower to converge, so any budget-truncated comparison would have
+reported the opposite result — a direct instance of the "only compare annealed
+evals" rule, and a reason the Fashionpedia depth work was so hard to read.
+
+### L3c seed 1 — confirmation (2026-08-08)
+
+| | seed 0 | seed 1 | \|Δ\| |
+|---|---:|---:|---:|
+| L3c annealed | 0.4711 | 0.4711 | **0.0000** |
+
+An exact tie between seeds, against a no-mosaic baseline of 0.4706. Mid-run
+spread averages 0.0030 and peaks at 0.0180 — again over 5x the annealed floor,
+reproducing the pattern from L0c and L2b for a third time.
+
+**The DEIM mosaic verdict is confirmed: it ties.** Two seeds landing on the same
+four decimal places, 0.0005 above baseline, is as clean a null as this setup can
+produce. The new `--mosaic-mode downscale` implementation is validated
+end-to-end, and the mosaic question is closed: the crop variant loses, the
+downscale variant ties, neither is worth turning on.
+
+### L4c — vb12, the full tower (2026-08-08)
+
+Base has 12 vision blocks, so this unfreezes all of them. Needs
+`--grad-checkpointing`: vb12/bs8 OOMs at 11.6 GiB otherwise (probed before
+launch, 1,737 ms/step and 4.23 GiB with it).
+
+| vision blocks | trainable | annealed 4,500 | vs. vb6 |
+|---|---:|---:|---:|
+| 0 | 2.8M | 0.4303 | −0.0562 |
+| 2 | 16.9M | 0.4706 | −0.0159 |
+| **6** | **45.3M** | **0.4865** | — |
+| 12 (all) | 87.8M | **0.4431** | **−0.0434** |
+
+**Depth peaks at vb6 and reverses hard.** vb12 gives back almost exactly the gain
+that vb2 → vb6 bought and lands nearer vb0 than vb6. The ladder is an inverted U
+with the optimum at half the tower.
+
+**But this is not the overfitting the run plan predicted, and the distinction
+matters.** Overfitting looks like a rise, a peak, then a monotone decline. vb12
+does the opposite:
+
+| step | 225 | 900 | 1575 | 2250 | 3150 | 4050 | 4500 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| vb12 | 0.3635 | 0.4168 | **0.3591** | 0.4289 | 0.4418 | 0.4425 | **0.4431** |
+
+It climbs to 0.4168 by step 900, **collapses to 0.3591 at 1,575** — below its own
+step-225 value — then recovers erratically and is **still improving at the final
+step**, where its peak sits. A model that is still climbing into the anneal is not
+overfitting; it is a model that was destabilised and spent the run recovering.
+
+The likely mechanism is that the earliest blocks hold generic low-level features,
+and updating them at the same 1e-5 that suits the last six damages the pretrained
+representation. That makes this an **optimisation failure, not a capacity
+failure**, and it leaves the plan's overfitting prediction still unconfirmed at
+every depth tested. The open question is whether vb12 with a lower vision LR (or
+a per-block decay) recovers vb6's number — worth one run, and the first place a
+vision-LR change is justified rather than confounding.
+
+**Confound to record:** vb12 ran with `--grad-checkpointing` and vb0/vb2/vb6 did
+not, because vb12 does not otherwise fit. Checkpointing recomputes activations
+and is mathematically neutral — identical gradients, and `preserve_rng_state` is
+on by default — so the comparison should hold, but it is a second variable in a
+one-variable comparison. A vb6 + checkpointing run (~1.4 h) would close it.
+
+## Phase 4 verdict
+
+| question | answer |
+|---|---|
+| Does head-only (vb0) win on 3,600 images? | **No — −0.0403**, the plan's prediction inverted |
+| Does vb6 overfit? | **No.** +0.0159 over vb2, no turnover, still climbing at 4,500 |
+| Is depth saturated? | **Yes, at vb6.** vb12 is −0.0434 |
+| Is vb12's failure overfitting? | **No** — it destabilises at step ~1,575 and is still climbing at 4,500 |
+| Does depth need annealing to read? | **Yes** — vb6 trails vb2 until step ~2,475 |
+
+**Best on LV-MHP: 0.4865 (L4b, vb6, 15 classes, annealed 4,500).** The chain from
+zero-shot is 0.2348 → 0.2950 (merge) → 0.4706 (vb2) → 0.4865 (vb6), and
+**`--vision-blocks 6` is the single most valuable setting found in this project.**
+
+## Phase 5 — transfer to large (2026-08-09)
+
+The winning recipe at `--model-type large`: 15 classes, vb6, vision LR 1e-5,
+4,500 steps, no mosaic. Needs `--grad-checkpointing` (large/vb6/bs8 OOMs at
+11.6 GiB; 3,819 ms/step and 7.09 GiB with it). **5.49 h**, against base vb6's
+1.5 h.
+
+| | base vb6 | large vb6 | Δ |
+|---|---:|---:|---:|
+| **mAP** | **0.4865** | **0.4903** | **+0.0038** |
+| map_50 | 0.7215 | 0.7498 | +0.0283 |
+| map_75 | 0.5437 | 0.5370 | −0.0067 |
+| map_small | 0.2024 | 0.1875 | −0.0149 |
+| map_medium | 0.4061 | 0.3966 | −0.0095 |
+| map_large | 0.5001 | 0.5202 | +0.0201 |
+
+**The conclusions transfer, and that is almost all large buys.** +0.0038 is
+barely past the ~0.003 tie bar, for **3.6x the step time and 3.7x the wall
+clock**. Large leads at 18 of 20 evals, so the direction is consistent rather
+than a coin flip, but the magnitude is a rounding error next to `--vision-blocks
+6`'s +0.0159 on base — which cost nothing.
+
+The sub-metrics say the two models are good at different things rather than one
+dominating: large is **+0.028 at map_50 and +0.020 on large boxes** but **−0.015
+on small and −0.007 at map_75**. It finds more objects at loose IoU and localises
+worse at tight IoU. Net, those nearly cancel.
+
+**Two caveats, both pushing the same way.** vb6 on large is 6 of **24** blocks —
+a quarter of the tower, where vb6 on base was half. Since depth was the dominant
+lever on base, large is plausibly under-unfrozen at the setting it was handed,
+and a large vb12 (matching the 50% ratio) is the honest version of this test. It
+was not run: it OOMs well past checkpointed vb6's 7.09 GiB and would take ~8 h.
+Second, large's curve is **flat-to-declining in the tail** (peak 0.4906 at step
+3,375, then −0.0003 to the anneal) while base is still climbing (+0.0028 over the
+same span), so large is closer to saturated at this budget and extra steps would
+not obviously help it.
+
+### Phase 5 verdict
+
+| question | answer |
+|---|---|
+| Do base conclusions hold on large? | **Yes** — same direction, large ahead at 18 of 20 evals |
+| Is base "an iteration tool only"? | **No.** It is within 0.004 of large at 27% of the cost |
+| Is large worth it? | **Not on this dataset** — +0.0038 for 3.7x wall clock |
+| Was the recipe fair to large? | **Not entirely** — vb6 is 25% of large's tower vs 50% of base's |
+
+## Where the project stands
+
+Best on LV-MHP: **0.4903 (large vb6)**, and **0.4865 (base vb6)** at a quarter of
+the cost, which is the number to build on.
+
+The full chain on base: **0.2348** zero-shot (18 cls) → **0.2950** lateral merge
+→ **0.4706** trained at vb2 → **0.4865** at vb6. Training is worth +0.19 over
+zero-shot on the merged class set, and of the levers actually tested, exactly two
+mattered: the **class-set merge** (+0.060 free, and it is a metric change, not
+learning) and **vision depth** (+0.056 from vb0 to vb6). Mosaic, native merged
+training, batch size and model scale were each worth ≤0.004.
+
+Open, in rough order of expected value:
+
+1. **vb12 at a reduced vision LR**, or per-block LR decay — L4c's collapse is
+   instability, not capacity, so the depth optimum may not really be vb6.
+2. **large at vb12** — the fair version of phase 5, ~8 h and needs a memory plan.
+3. **vb6 + `--grad-checkpointing`** (~1.4 h) to close the L4c confound.
+4. The downscale-mosaic + no-aug-tail cell, to complete the 2x2.
+5. A final confirmation on the **official test list** (`--val-source test`), which
+   the run plan reserved and which nothing has been tuned on. Everything above is
+   measured on the seeded 400-image val slice.

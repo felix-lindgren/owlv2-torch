@@ -1,0 +1,108 @@
+{
+  "version": 1,
+  "status": "frozen-before-training",
+  "evaluation_vocabulary": "DIOR-20",
+  "evaluation_prompt_template": "a satellite photo of {name}",
+  "buckets": {
+    "direct_label_overlap": [
+      "Airplane",
+      "Ship",
+      "Storage tank",
+      "Vehicle"
+    ],
+    "context_related": [
+      "Airport",
+      "Harbor"
+    ],
+    "unseen": [
+      "Baseball field",
+      "Basketball court",
+      "Bridge",
+      "Chimney",
+      "Dam",
+      "Expressway service area",
+      "Expressway toll station",
+      "Golf course",
+      "Ground track field",
+      "Overpass",
+      "Stadium",
+      "Tennis court",
+      "Train station",
+      "Wind mill"
+    ]
+  },
+  "query_aliases": {
+    "Airplane": [
+      "airplane",
+      "fixed wing aircraft",
+      "small aircraft",
+      "cargo plane"
+    ],
+    "Ship": [
+      "ship",
+      "maritime vessel",
+      "motorboat",
+      "sailboat",
+      "tugboat",
+      "barge",
+      "fishing vessel",
+      "ferry",
+      "yacht",
+      "container ship",
+      "oil tanker"
+    ],
+    "Storage tank": [
+      "storage tank"
+    ],
+    "Vehicle": [
+      "vehicle",
+      "passenger vehicle",
+      "small car",
+      "bus",
+      "pickup truck",
+      "utility truck",
+      "truck",
+      "cargo truck",
+      "truck tractor",
+      "trailer",
+      "engineering vehicle",
+      "dump truck",
+      "haul truck",
+      "scraper tractor",
+      "front loader bulldozer",
+      "excavator",
+      "cement mixer",
+      "ground grader"
+    ]
+  },
+  "training_support": {
+    "Airplane": {
+      "kind": "direct",
+      "xview_type_ids": [11, 12, 13]
+    },
+    "Ship": {
+      "kind": "direct",
+      "xview_type_ids": [40, 41, 42, 44, 45, 47, 49, 50, 51, 52]
+    },
+    "Storage tank": {
+      "kind": "direct",
+      "xview_type_ids": [86]
+    },
+    "Vehicle": {
+      "kind": "direct",
+      "xview_type_ids": [17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 32, 53, 60, 61, 62, 63, 64, 65, 66]
+    },
+    "Airport": {
+      "kind": "context",
+      "reason": "aircraft and hangar context, but no airport label"
+    },
+    "Harbor": {
+      "kind": "context",
+      "reason": "ships, cranes and container context, but no harbor label"
+    },
+    "Bridge": {
+      "kind": "unseen",
+      "reason": "xView has no bridge category"
+    }
+  }
+}

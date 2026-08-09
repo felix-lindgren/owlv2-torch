@@ -8,9 +8,11 @@ usable with arbitrary text queries at inference time.
 from __future__ import annotations
 
 import argparse
+import math
 import random
 import re
 import sys
+from collections import Counter, defaultdict
 from contextlib import nullcontext
 from datetime import datetime
 from functools import partial
@@ -19,6 +21,8 @@ from pathlib import Path
 import mlflow
 import torch
 from mlflow.exceptions import MlflowException
+from peft import LoraConfig, inject_adapter_in_model
+from peft.tuners.lora import LoraLayer
 from torch import nn
 from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import CocoDetection
@@ -49,8 +53,22 @@ from prototype_train.train import (
 DEFAULT_PROMPT_TEMPLATES = (
     "{name}",
     "a photo of {name}",
-    "a person wearing {name}",
 )
+AERIAL_PROMPT_TEMPLATES = (
+    "{name}",
+    "a satellite photo of {name}",
+    "an aerial photo of {name}",
+)
+
+VISION_LORA_TARGETS = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "out_proj",
+    "mlp.0",
+    "mlp.2",
+)
+PEFT_ADAPTER_NAME = "default"
 
 
 def _clean_query_text(text: str) -> str:
@@ -209,6 +227,34 @@ def sample_prompt_set(
     return [generator.choice(pool) for pool in prompt_pools]
 
 
+def build_classification_weights(
+    class_names: list[str], specs: list[str]
+) -> torch.Tensor:
+    """Resolve repeatable ``NAME=WEIGHT`` entries against the training queries."""
+    weights = torch.ones(len(class_names), dtype=torch.float32)
+    label_by_name = {_clean_query_text(name): index for index, name in enumerate(class_names)}
+    for spec in specs:
+        name, separator, raw_weight = spec.rpartition("=")
+        cleaned = _clean_query_text(name)
+        if not separator or not cleaned:
+            raise ValueError(
+                f"--classification-class-weight {spec!r} must be NAME=WEIGHT"
+            )
+        if cleaned not in label_by_name:
+            raise ValueError(
+                f"Classification weight name {name!r} did not match a training "
+                f"class. Available: {', '.join(class_names)}"
+            )
+        try:
+            weight = float(raw_weight)
+        except ValueError as exc:
+            raise ValueError(f"Invalid class weight in {spec!r}") from exc
+        if weight < 0:
+            raise ValueError(f"Class weight must be non-negative, got {weight}")
+        weights[label_by_name[cleaned]] = weight
+    return weights
+
+
 class TextQueryDetector(nn.Module):
     """OWLv2 wrapper with fixed evaluation prompts and variable training prompts."""
 
@@ -236,8 +282,261 @@ class TextQueryDetector(nn.Module):
         return self.owl.forward_object_detection(pixel_values, token_ids, attention_mask)
 
 
+def _vision_lora_target_name(layer_index: int, target: str) -> str:
+    path = f"self_attn.{target}" if target in VISION_LORA_TARGETS[:4] else target
+    return f"vision_model.encoder.layers.{layer_index}.{path}"
+
+
+def _vision_lora_target_names(config: dict) -> list[str]:
+    """Expand the checkpoint topology to exact PEFT target-module names."""
+    return [
+        _vision_lora_target_name(layer_index, target)
+        for layer_index in config["layer_indices"]
+        for target in config["targets"]
+    ]
+
+
+def _get_vision_lora_layer(model: OwlV2, target_name: str) -> LoraLayer:
+    layer = model.get_submodule(target_name)
+    if not isinstance(layer, LoraLayer) or PEFT_ADAPTER_NAME not in layer.lora_A:
+        raise RuntimeError(f"Vision target {target_name!r} has no PEFT LoRA adapter")
+    return layer
+
+
+def _vision_lora_parameters(model: OwlV2, config: dict) -> list[nn.Parameter]:
+    parameters = []
+    for target_name in _vision_lora_target_names(config):
+        layer = _get_vision_lora_layer(model, target_name)
+        parameters.extend(layer.lora_A[PEFT_ADAPTER_NAME].parameters())
+        parameters.extend(layer.lora_B[PEFT_ADAPTER_NAME].parameters())
+    return parameters
+
+
+def _lora_signature(config: dict) -> tuple:
+    """Fields that determine the adapter modules and checkpoint key order."""
+    return (
+        tuple(config["layer_indices"]),
+        tuple(config["targets"]),
+        int(config["rank"]),
+        float(config["alpha"]),
+        float(config["dropout"]),
+    )
+
+
+def vision_lora_config_from_args(model: OwlV2, args) -> dict | None:
+    """Resolve CLI placement/count settings to exact vision layer indices."""
+    block_count = getattr(args, "vision_lora_blocks", 0)
+    if block_count < 0:
+        raise ValueError("vision_lora_blocks must be non-negative")
+    if block_count == 0:
+        return None
+
+    layers = model.vision_model.encoder.layers
+    if block_count > len(layers):
+        raise ValueError(
+            f"vision_lora_blocks must be in [0, {len(layers)}], got {block_count}"
+        )
+    placement = getattr(args, "vision_lora_placement", "last")
+    if placement not in {"first", "last"}:
+        raise ValueError(f"Unsupported vision LoRA placement {placement!r}")
+    targets = list(getattr(args, "vision_lora_targets", ("q_proj", "v_proj")))
+    if not targets:
+        raise ValueError("vision_lora_targets must not be empty when LoRA is enabled")
+    invalid_targets = sorted(set(targets) - set(VISION_LORA_TARGETS))
+    if invalid_targets:
+        raise ValueError(
+            f"Unsupported vision LoRA targets {invalid_targets}; "
+            f"choose from {list(VISION_LORA_TARGETS)}"
+        )
+    if len(set(targets)) != len(targets):
+        raise ValueError(f"vision_lora_targets contains duplicates: {targets}")
+
+    rank = getattr(args, "vision_lora_rank", 8)
+    alpha = getattr(args, "vision_lora_alpha", 8.0)
+    dropout = getattr(args, "vision_lora_dropout", 0.0)
+    learning_rate = getattr(args, "vision_lora_learning_rate", 1e-4)
+    if rank <= 0:
+        raise ValueError("vision_lora_rank must be positive when LoRA is enabled")
+    if not math.isfinite(alpha) or alpha <= 0:
+        raise ValueError("vision_lora_alpha must be positive when LoRA is enabled")
+    if not math.isfinite(dropout) or not 0.0 <= dropout < 1.0:
+        raise ValueError("vision_lora_dropout must be in [0, 1) when LoRA is enabled")
+    if not math.isfinite(learning_rate) or learning_rate <= 0:
+        raise ValueError(
+            "vision_lora_learning_rate must be positive when LoRA is enabled"
+        )
+
+    if placement == "first":
+        layer_indices = list(range(block_count))
+    else:
+        layer_indices = list(range(len(layers) - block_count, len(layers)))
+    return {
+        "placement": placement,
+        "block_count": block_count,
+        "layer_indices": layer_indices,
+        "targets": targets,
+        "rank": rank,
+        "alpha": float(alpha),
+        "dropout": float(dropout),
+        "learning_rate": float(learning_rate),
+        "full_vision_blocks": getattr(args, "vision_blocks", 0),
+    }
+
+
+def get_vision_lora_config(model: OwlV2) -> dict | None:
+    """Return the active adapter topology, if this model has one."""
+    config = getattr(model, "_vision_lora_config", None)
+    return dict(config) if config is not None else None
+
+
+def inject_vision_lora(model: OwlV2, config: dict) -> dict:
+    """Inject the exact adapter topology stored in ``config`` with PEFT."""
+    layers = model.vision_model.encoder.layers
+    layer_indices = list(config.get("layer_indices") or [])
+    targets = list(config.get("targets") or [])
+    rank = int(config.get("rank", 0))
+    alpha = float(config.get("alpha", 0.0))
+    dropout = float(config.get("dropout", 0.0))
+    invalid_indices = [index for index in layer_indices if not 0 <= index < len(layers)]
+    invalid_targets = sorted(set(targets) - set(VISION_LORA_TARGETS))
+    if (
+        not layer_indices
+        or invalid_indices
+        or len(set(layer_indices)) != len(layer_indices)
+    ):
+        raise ValueError(f"Invalid vision LoRA layer indices: {layer_indices}")
+    if not targets or invalid_targets or len(set(targets)) != len(targets):
+        raise ValueError(f"Invalid vision LoRA targets: {targets}")
+    if (
+        rank <= 0
+        or not math.isfinite(alpha)
+        or alpha <= 0
+        or not math.isfinite(dropout)
+        or not 0.0 <= dropout < 1.0
+    ):
+        raise ValueError(
+            f"Invalid vision LoRA rank/alpha/dropout: {rank}/{alpha}/{dropout}"
+        )
+
+    active = get_vision_lora_config(model)
+    if active is not None:
+        if _lora_signature(active) != _lora_signature(config):
+            raise ValueError(
+                "Model already has a different vision LoRA topology: "
+                f"active={active}, requested={config}"
+            )
+        return active
+
+    target_names = _vision_lora_target_names(
+        {"layer_indices": layer_indices, "targets": targets}
+    )
+    for target_name in target_names:
+        target_module = model.get_submodule(target_name)
+        if not isinstance(target_module, nn.Linear):
+            raise TypeError(
+                f"Vision target {target_name!r} is {type(target_module).__name__}, "
+                "expected nn.Linear"
+            )
+    injected = inject_adapter_in_model(
+        LoraConfig(
+            r=rank,
+            lora_alpha=alpha,
+            lora_dropout=dropout,
+            bias="none",
+            target_modules=target_names,
+        ),
+        model,
+        adapter_name=PEFT_ADAPTER_NAME,
+    )
+    if injected is not model:
+        raise RuntimeError("PEFT adapter injection unexpectedly replaced the OwlV2 model")
+
+    resolved = {
+        "placement": config.get("placement", "custom"),
+        "block_count": int(config.get("block_count", len(layer_indices))),
+        "layer_indices": layer_indices,
+        "targets": targets,
+        "rank": rank,
+        "alpha": alpha,
+        "dropout": dropout,
+        "learning_rate": config.get("learning_rate"),
+        "full_vision_blocks": int(config.get("full_vision_blocks", 0)),
+    }
+    model._vision_lora_config = resolved
+    return dict(resolved)
+
+
+def merge_vision_lora(model: OwlV2) -> dict:
+    """Safely merge every PEFT adapter and restore plain linear layers."""
+    config = get_vision_lora_config(model)
+    if config is None:
+        raise ValueError("Model has no vision LoRA adapters to merge")
+    for target_name in _vision_lora_target_names(config):
+        adapted = _get_vision_lora_layer(model, target_name)
+        adapted.merge(safe_merge=True, adapter_names=[PEFT_ADAPTER_NAME])
+        parent_name, child_name = target_name.rsplit(".", 1)
+        setattr(model.get_submodule(parent_name), child_name, adapted.get_base_layer())
+    delattr(model, "_vision_lora_config")
+    delattr(model, "peft_config")
+    return config
+
+
+def vision_lora_delta_ratios(model: OwlV2) -> dict[str, float]:
+    """Compute ``||delta W|| / ||W||`` for each active adapter target."""
+    config = get_vision_lora_config(model)
+    if config is None:
+        return {}
+    ratios = {}
+    with torch.no_grad():
+        for layer_index in config["layer_indices"]:
+            for target in config["targets"]:
+                adapted = _get_vision_lora_layer(
+                    model, _vision_lora_target_name(layer_index, target)
+                )
+                delta_norm = adapted.get_delta_weight(PEFT_ADAPTER_NAME).float().norm()
+                base_norm = adapted.get_base_layer().weight.float().norm().clamp_min(
+                    torch.finfo(torch.float32).tiny
+                )
+                ratios[f"layer_{layer_index}/{target}"] = float(
+                    delta_norm / base_norm
+                )
+    return ratios
+
+
 def configure_trainable_parameter_groups(model: OwlV2, args) -> list[dict]:
     """Freeze the base model, then enable the requested domain-adaptation modules."""
+    vision_layers = model.vision_model.encoder.layers
+    requested_lora = vision_lora_config_from_args(model, args)
+    active_lora = get_vision_lora_config(model)
+    if requested_lora is not None:
+        if active_lora is None:
+            active_lora = inject_vision_lora(model, requested_lora)
+        elif _lora_signature(active_lora) != _lora_signature(requested_lora):
+            raise ValueError(
+                "The checkpoint and requested vision LoRA topologies differ: "
+                f"checkpoint={active_lora}, requested={requested_lora}"
+            )
+        active_lora.update(
+            learning_rate=requested_lora["learning_rate"],
+            full_vision_blocks=requested_lora["full_vision_blocks"],
+        )
+        model._vision_lora_config = active_lora
+
+    if not 0 <= args.vision_blocks <= len(vision_layers):
+        raise ValueError(
+            f"vision_blocks must be in [0, {len(vision_layers)}], got {args.vision_blocks}"
+        )
+    full_layer_indices = set(
+        range(len(vision_layers) - args.vision_blocks, len(vision_layers))
+    )
+    lora_layer_indices = set((active_lora or {}).get("layer_indices", []))
+    overlap = sorted(full_layer_indices & lora_layer_indices)
+    if overlap:
+        raise ValueError(
+            "Full vision tuning and LoRA cannot target the same blocks in this phase; "
+            f"overlapping layer indices: {overlap}"
+        )
+
     for parameter in model.parameters():
         parameter.requires_grad_(False)
 
@@ -250,25 +549,39 @@ def configure_trainable_parameter_groups(model: OwlV2, args) -> list[dict]:
         if parameters:
             groups.append({"params": parameters, "lr": learning_rate, "name": name})
 
+    def add_parameters(name: str, parameters, learning_rate: float):
+        parameters = list(parameters)
+        for parameter in parameters:
+            parameter.requires_grad_(True)
+        if parameters:
+            groups.append({"params": parameters, "lr": learning_rate, "name": name})
+
     add_group("class_head", model.class_head, args.head_learning_rate)
     if args.train_box_head:
         add_group("box_head", model.box_head, args.head_learning_rate)
     if args.train_objectness_head:
         add_group("objectness_head", model.objectness_head, args.head_learning_rate)
 
-    vision_layers = model.vision_model.encoder.layers
-    if not 0 <= args.vision_blocks <= len(vision_layers):
-        raise ValueError(
-            f"vision_blocks must be in [0, {len(vision_layers)}], got {args.vision_blocks}"
-        )
     if args.vision_blocks:
         add_group(
             "vision_blocks",
             nn.ModuleList(vision_layers[-args.vision_blocks :]),
             args.vision_learning_rate,
         )
-        add_group("vision_post_norm", model.vision_model.post_layernorm, args.vision_learning_rate)
+    if args.vision_blocks or requested_lora is not None:
+        add_group(
+            "vision_post_norm",
+            model.vision_model.post_layernorm,
+            args.vision_learning_rate,
+        )
         add_group("detection_layer_norm", model.layer_norm, args.vision_learning_rate)
+
+    if requested_lora is not None:
+        add_parameters(
+            "vision_lora",
+            _vision_lora_parameters(model, requested_lora),
+            requested_lora["learning_rate"],
+        )
 
     text_layers = model.text_model.encoder.layers
     if not 0 <= args.text_blocks <= len(text_layers):
@@ -349,6 +662,7 @@ def save_checkpoint(
     epoch: int,
     map_value: float | None,
     training_state: dict | None = None,
+    ontology_metadata: dict | None = None,
 ) -> None:
     """Save a small trainable-parameter delta unless ``--save-full-model`` is set.
 
@@ -357,19 +671,38 @@ def save_checkpoint(
     the trainable delta, and nothing but ``--resume`` ever reads them.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    vision_lora = get_vision_lora_config(model)
     if args.save_full_model:
         model_state = {name: value.detach().cpu() for name, value in model.state_dict().items()}
-        checkpoint_format = "owlv2-text-finetune-full-v1"
+        checkpoint_format = (
+            "owlv2-text-finetune-lora-full-v1"
+            if vision_lora is not None
+            else "owlv2-text-finetune-full-v1"
+        )
     else:
         trainable_names = {
             name for name, parameter in model.named_parameters() if parameter.requires_grad
         }
+        if vision_lora is not None:
+            lora_parameter_ids = {
+                id(parameter)
+                for parameter in _vision_lora_parameters(model, vision_lora)
+            }
+            trainable_names.update(
+                name
+                for name, parameter in model.named_parameters()
+                if id(parameter) in lora_parameter_ids
+            )
         model_state = {
             name: value.detach().cpu()
             for name, value in model.state_dict().items()
             if name in trainable_names
         }
-        checkpoint_format = "owlv2-text-finetune-delta-v1"
+        checkpoint_format = (
+            "owlv2-text-finetune-lora-delta-v1"
+            if vision_lora is not None
+            else "owlv2-text-finetune-delta-v1"
+        )
     torch.save(
         {
             "format": checkpoint_format,
@@ -380,6 +713,8 @@ def save_checkpoint(
             "epoch": epoch,
             "map": map_value,
             "config": vars(args),
+            "vision_lora": vision_lora,
+            "training_ontology": ontology_metadata,
             "training_state": training_state,
         },
         path,
@@ -388,11 +723,37 @@ def save_checkpoint(
 
 def apply_text_checkpoint(model: OwlV2, checkpoint: dict) -> dict:
     """Load an already-read checkpoint's weights into ``model``."""
+    checkpoint_format = checkpoint.get("format")
+    full_formats = {
+        "owlv2-text-finetune-full-v1",
+        "owlv2-text-finetune-lora-full-v1",
+    }
+    delta_formats = {
+        "owlv2-text-finetune-delta-v1",
+        "owlv2-text-finetune-lora-delta-v1",
+    }
+    if checkpoint_format not in full_formats | delta_formats:
+        raise ValueError(
+            f"Unsupported checkpoint format {checkpoint_format!r}; expected one of "
+            f"{sorted(full_formats | delta_formats)}"
+        )
+    vision_lora = checkpoint.get("vision_lora")
+    if checkpoint_format.startswith("owlv2-text-finetune-lora-"):
+        if not isinstance(vision_lora, dict):
+            raise ValueError(
+                f"Adapter checkpoint {checkpoint_format!r} has no vision_lora config"
+            )
+        inject_vision_lora(model, vision_lora)
+    elif vision_lora is not None:
+        # Accept transitional checkpoints that stored adapter metadata before
+        # adopting the explicit LoRA format names.
+        inject_vision_lora(model, vision_lora)
+
     incompatible = model.load_state_dict(
         checkpoint["model_state_dict"],
-        strict=checkpoint.get("format") == "owlv2-text-finetune-full-v1",
+        strict=checkpoint_format in full_formats,
     )
-    if checkpoint.get("format") != "owlv2-text-finetune-full-v1" and incompatible.unexpected_keys:
+    if checkpoint_format in delta_formats and incompatible.unexpected_keys:
         raise RuntimeError(f"Unexpected checkpoint keys: {incompatible.unexpected_keys}")
     return checkpoint
 
@@ -404,6 +765,44 @@ def load_text_checkpoint(model: OwlV2, checkpoint_path: str | Path) -> dict:
     )
 
 
+def export_merged_lora_checkpoint(
+    checkpoint_path: str | Path, output_path: str | Path
+) -> dict:
+    """Export an adapter checkpoint as a full checkpoint with plain linear layers."""
+    checkpoint_path = Path(checkpoint_path)
+    output_path = Path(output_path)
+    if checkpoint_path.resolve() == output_path.resolve():
+        raise ValueError("The merged output must not overwrite its source checkpoint")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    model_type = checkpoint.get("model_type")
+    if model_type not in {"base", "large"}:
+        raise ValueError(f"Checkpoint has invalid model_type={model_type!r}")
+
+    model = OwlV2(model_type)
+    apply_text_checkpoint(model, checkpoint)
+    merged_lora = merge_vision_lora(model)
+    merged_checkpoint = dict(checkpoint)
+    merged_checkpoint.update(
+        {
+            "format": "owlv2-text-finetune-full-v1",
+            "model_state_dict": {
+                name: value.detach().cpu()
+                for name, value in model.state_dict().items()
+            },
+            "vision_lora": None,
+            "merged_vision_lora": merged_lora,
+            "training_state": None,
+        }
+    )
+    merged_config = dict(checkpoint.get("config") or {})
+    merged_config["vision_lora_blocks"] = 0
+    merged_config["save_full_model"] = True
+    merged_checkpoint["config"] = merged_config
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(merged_checkpoint, output_path)
+    return merged_checkpoint
+
+
 # Changing any of these makes a resumed run neither a continuation of the old one
 # nor a clean new one, and the failure is silent: the optimizer state is keyed by
 # parameter position, the scheduler by step count, and the learning rates live in
@@ -412,6 +811,13 @@ def load_text_checkpoint(model: OwlV2, checkpoint_path: str | Path) -> dict:
 RESUME_CRITICAL_ARGS = (
     "model_type",
     "vision_blocks",
+    "vision_lora_blocks",
+    "vision_lora_placement",
+    "vision_lora_targets",
+    "vision_lora_rank",
+    "vision_lora_alpha",
+    "vision_lora_dropout",
+    "vision_lora_learning_rate",
     "text_blocks",
     "train_box_head",
     "train_objectness_head",
@@ -429,6 +835,15 @@ RESUME_CRITICAL_ARGS = (
     "amp",
     "mosaic_no_aug_steps",
     "mosaic_mode",
+    "scale_augment",
+    "right_angle_rotations",
+    "horizontal_flip_prob",
+    "vertical_flip_prob",
+    "category_stream_fraction",
+    "prompt_profile",
+    "prompt_templates",
+    "eval_prompt_template",
+    "classification_class_weights",
 )
 
 
@@ -467,12 +882,25 @@ def check_resume_compatibility(
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--train-annotations", required=True)
-    parser.add_argument("--train-images", required=True)
-    parser.add_argument("--val-annotations", required=True)
-    parser.add_argument("--val-images", required=True)
+    parser.add_argument("--train-annotations")
+    parser.add_argument("--train-images")
+    parser.add_argument("--val-annotations")
+    parser.add_argument("--val-images")
     parser.add_argument("--model-type", choices=("base", "large"), default="base")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--merge-lora-checkpoint",
+        type=Path,
+        help=(
+            "Standalone export mode: load this adapter checkpoint, fold every "
+            "LoRA delta into its base weight, and write --merge-lora-output."
+        ),
+    )
+    parser.add_argument(
+        "--merge-lora-output",
+        type=Path,
+        help="Full plain-model checkpoint written by --merge-lora-checkpoint.",
+    )
     parser.add_argument("--category-ids", nargs="+", type=int)
     parser.add_argument(
         "--exclude-class-names",
@@ -496,9 +924,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "--exclude-class-names; '+' separates them because a comma already "
             "separates aliases within one category name. Every box stays "
             "supervised under the merged label, unlike --exclude-class-names, "
-            "which would leave one side of a lateral pair unlabelled. This is a "
-            "metric change: mAP over the merged set is NOT comparable to a run "
-            "with a different class set."
+            "which would leave one side of a lateral pair unlabelled. This changes "
+            "the trainer's source-side validation metric, but an independently "
+            "specified external evaluation vocabulary remains unchanged."
         ),
     )
     parser.add_argument("--shots-per-class", type=int)
@@ -529,6 +957,26 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Use at most this many validation batches per evaluation.",
     )
     parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--right-angle-rotations",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Randomly rotate by 0/90/180/270 degrees (enable for aerial imagery).",
+    )
+    parser.add_argument("--horizontal-flip-prob", type=float, default=0.5)
+    parser.add_argument(
+        "--vertical-flip-prob", type=float, default=0.0,
+        help="Set to 0.5 for orientation-invariant aerial imagery.",
+    )
+    parser.add_argument(
+        "--scale-augment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable RandomZoomOut and RandomIoUCrop independently of other "
+            "augmentation. Disable for controlled tile-scale comparisons."
+        ),
+    )
     parser.add_argument(
         "--gpu-augment",
         action=argparse.BooleanOptionalAction,
@@ -629,7 +1077,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "storing them. Roughly halves activation memory (allowing larger "
             "--batch-size) at about a 20%% step-time cost. Blocks that are frozen and fed a "
             "detached input are skipped, so this is a no-op with --vision-blocks 0 "
-            "--text-blocks 0."
+            "--vision-lora-blocks 0 --text-blocks 0."
         ),
     )
     parser.add_argument(
@@ -656,6 +1104,32 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text-learning-rate", type=float, default=1e-7)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--vision-blocks", type=int, default=0)
+    parser.add_argument(
+        "--vision-lora-blocks",
+        type=int,
+        default=0,
+        help="Number of vision encoder blocks receiving LoRA; 0 disables LoRA.",
+    )
+    parser.add_argument(
+        "--vision-lora-placement",
+        choices=("first", "last"),
+        default="last",
+    )
+    parser.add_argument(
+        "--vision-lora-targets",
+        nargs="+",
+        choices=VISION_LORA_TARGETS,
+        default=["q_proj", "v_proj"],
+        metavar="TARGET",
+        help=(
+            "Linear projections adapted in each selected block. Attention targets "
+            "use their module names; the MLP targets are mlp.0 and mlp.2."
+        ),
+    )
+    parser.add_argument("--vision-lora-rank", type=int, default=8)
+    parser.add_argument("--vision-lora-alpha", type=float, default=8.0)
+    parser.add_argument("--vision-lora-dropout", type=float, default=0.0)
+    parser.add_argument("--vision-lora-learning-rate", type=float, default=1e-4)
     parser.add_argument("--text-blocks", type=int, default=0)
     parser.add_argument(
         "--train-box-head", action=argparse.BooleanOptionalAction, default=True
@@ -670,7 +1144,35 @@ def build_argument_parser() -> argparse.ArgumentParser:
         dest="prompt_templates",
         help="Repeat for prompt augmentation; must contain {name}",
     )
-    parser.add_argument("--eval-prompt-template", default="a photo of {name}")
+    parser.add_argument(
+        "--prompt-profile", choices=("generic", "aerial"), default="generic",
+        help="Default training/evaluation prompts when explicit templates are omitted.",
+    )
+    parser.add_argument(
+        "--eval-prompt-template",
+        default=None,
+        help="Fixed checkpoint-evaluation prompt; defaults from --prompt-profile.",
+    )
+    parser.add_argument(
+        "--classification-class-weight",
+        action="append",
+        dest="classification_class_weights",
+        default=[],
+        metavar="NAME=WEIGHT",
+        help=(
+            "Repeat to down-weight classification for a query while retaining "
+            "that class's box and objectness supervision, e.g. 'Building=0'."
+        ),
+    )
+    parser.add_argument(
+        "--category-stream-fraction",
+        type=float,
+        help=(
+            "Exact expected fraction of each epoch drawn from converter images "
+            "marked stream=category_centered. Both streams are sampled "
+            "reproducibly; omit to use ordinary uniform shuffling."
+        ),
+    )
     parser.add_argument(
         "--class-loss",
         choices=CLASS_LOSS_CHOICES,
@@ -769,7 +1271,36 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = build_argument_parser().parse_args(argv)
+    parser = build_argument_parser()
+    args = parser.parse_args(argv)
+    if args.merge_lora_checkpoint is not None or args.merge_lora_output is not None:
+        if args.merge_lora_checkpoint is None or args.merge_lora_output is None:
+            parser.error(
+                "--merge-lora-checkpoint and --merge-lora-output must be used together"
+            )
+        export_merged_lora_checkpoint(
+            args.merge_lora_checkpoint,
+            args.merge_lora_output,
+        )
+        print(f"Saved merged full checkpoint to {args.merge_lora_output}")
+        return
+
+    required_dataset_args = (
+        "train_annotations",
+        "train_images",
+        "val_annotations",
+        "val_images",
+    )
+    missing_dataset_args = [
+        f"--{name.replace('_', '-')}"
+        for name in required_dataset_args
+        if getattr(args, name) is None
+    ]
+    if missing_dataset_args:
+        parser.error(
+            "the following arguments are required for training/evaluation: "
+            + ", ".join(missing_dataset_args)
+        )
     if args.epochs <= 0:
         raise ValueError("epochs must be positive")
     if args.val_batch_size is not None and args.val_batch_size <= 0:
@@ -786,6 +1317,13 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("warmup_steps must be non-negative")
     if args.grad_accum_steps < 1:
         raise ValueError("grad_accum_steps must be at least 1")
+    if args.vision_lora_blocks < 0:
+        raise ValueError("vision_lora_blocks must be non-negative")
+    for name in ("horizontal_flip_prob", "vertical_flip_prob"):
+        if not 0.0 <= getattr(args, name) <= 1.0:
+            raise ValueError(f"{name} must be in [0, 1]")
+    if args.category_stream_fraction is not None and not 0.0 <= args.category_stream_fraction <= 1.0:
+        raise ValueError("category_stream_fraction must be in [0, 1]")
     if not 0.0 <= args.mosaic_prob <= 1.0:
         raise ValueError("mosaic_prob must be in [0, 1]")
     if args.mosaic_no_aug_steps < 0:
@@ -800,6 +1338,8 @@ def main(argv: list[str] | None = None) -> None:
     gpu_augment = args.augment and args.gpu_augment
     if args.mosaic_prob > 0 and not gpu_augment:
         raise ValueError("--mosaic-prob requires --augment and --gpu-augment")
+    if not args.scale_augment and args.mosaic_prob > 0 and args.mosaic_mode == "downscale":
+        raise ValueError("--no-scale-augment is incompatible with downscale mosaic")
     if args.resume and args.init_from:
         raise ValueError("--resume and --init-from are mutually exclusive")
 
@@ -851,6 +1391,31 @@ def main(argv: list[str] | None = None) -> None:
 
     with run_context:
         model = OwlV2(args.model_type)
+        initial_checkpoint = None
+        if resume_checkpoint is not None:
+            apply_text_checkpoint(model, resume_checkpoint)
+            print(f"Loaded resume weights from {resume_path}")
+        elif args.init_from:
+            initial_checkpoint = load_text_checkpoint(model, args.init_from)
+            print(f"Initialised weights from {args.init_from}")
+            initial_lora = get_vision_lora_config(model)
+            if initial_lora is not None and not args.eval_only:
+                requested_lora = vision_lora_config_from_args(model, args)
+                if requested_lora is None:
+                    raise ValueError(
+                        "Training from a LoRA --init-from checkpoint requires "
+                        "restating its --vision-lora-* topology, or merging the "
+                        "checkpoint first. Adapter reconstruction without LoRA "
+                        "flags is supported for --eval-only."
+                    )
+                if initial_lora.get("full_vision_blocks", 0) != args.vision_blocks:
+                    raise ValueError(
+                        "Training from a LoRA --init-from checkpoint must keep its "
+                        "full vision-block topology so the next delta remains "
+                        "self-contained: checkpoint has "
+                        f"{initial_lora.get('full_vision_blocks', 0)}, requested "
+                        f"{args.vision_blocks}"
+                    )
         parameter_groups = configure_trainable_parameter_groups(model, args)
         if not parameter_groups:
             raise RuntimeError("No trainable parameter groups were configured")
@@ -887,11 +1452,8 @@ def main(argv: list[str] | None = None) -> None:
 
         if resume_checkpoint is not None:
             check_resume_compatibility(resume_checkpoint, args, class_names)
-            apply_text_checkpoint(model, resume_checkpoint)
             print(f"Resuming from {resume_path}")
-        elif args.init_from:
-            initial_checkpoint = load_text_checkpoint(model, args.init_from)
-            print(f"Initialised weights from {args.init_from}")
+        elif initial_checkpoint is not None:
             initial_classes = initial_checkpoint.get("class_names") or []
             if list(initial_classes) != list(class_names):
                 print(
@@ -899,9 +1461,51 @@ def main(argv: list[str] | None = None) -> None:
                     f"this run uses {len(class_names)}"
                 )
 
-        prompt_templates = args.prompt_templates or list(DEFAULT_PROMPT_TEMPLATES)
+        default_prompt_templates = (
+            AERIAL_PROMPT_TEMPLATES
+            if args.prompt_profile == "aerial"
+            else DEFAULT_PROMPT_TEMPLATES
+        )
+        prompt_templates = args.prompt_templates or list(default_prompt_templates)
+        eval_prompt_template = args.eval_prompt_template or (
+            "a satellite photo of {name}"
+            if args.prompt_profile == "aerial"
+            else "a photo of {name}"
+        )
         prompt_pools = build_prompt_pools(class_names, prompt_templates)
-        eval_prompts = evaluation_prompts(class_names, args.eval_prompt_template)
+        eval_prompts = evaluation_prompts(class_names, eval_prompt_template)
+        classification_weights = build_classification_weights(
+            class_names, args.classification_class_weights
+        ).to(device)
+        weighted_classes = [
+            f"{name}={float(weight):g}"
+            for name, weight in zip(class_names, classification_weights.cpu())
+            if float(weight) != 1.0
+        ]
+        if weighted_classes:
+            print("Classification-only weights: " + ", ".join(weighted_classes))
+        ontology_metadata = {
+            "class_names": list(class_names),
+            "source_categories": {
+                str(category_id): train_dataset.coco.cats[category_id]["name"]
+                for category_id in category_ids
+            },
+            "category_id_to_query_index": {
+                str(category_id): label
+                for category_id, label in sorted(category_id_to_label.items())
+            },
+            "resolved_merges": [
+                {"sources": sources, "target": target}
+                for sources, target in merges
+            ],
+            "excluded_class_names": list(args.exclude_class_names or []),
+            "classification_weights": {
+                name: float(weight)
+                for name, weight in zip(class_names, classification_weights.cpu())
+            },
+            "training_prompt_templates": list(prompt_templates),
+            "evaluation_prompt_template": eval_prompt_template,
+        }
         detector = TextQueryDetector(model, eval_prompts).to(device)
         if args.compile:
             model.vision_model.encoder.compile()
@@ -920,10 +1524,11 @@ def main(argv: list[str] | None = None) -> None:
             model.image_transform_unnormed if gpu_augment else model.image_transform_fast,
             category_id_to_label,
             augment=args.augment,
-            random_right_angle_rotation=False,
-            horizontal_flip_prob=0.5,
-            vertical_flip_prob=0.0,
+            random_right_angle_rotation=args.right_angle_rotations,
+            horizontal_flip_prob=args.horizontal_flip_prob,
+            vertical_flip_prob=args.vertical_flip_prob,
             photometric=not gpu_augment,
+            scale_augment=args.scale_augment,
         )
         batch_augmentor = (
             BatchAugmentor(
@@ -948,6 +1553,69 @@ def main(argv: list[str] | None = None) -> None:
                 f"for the final {args.mosaic_no_aug_steps} steps"
             )
 
+        stream_indices: dict[str, list[int]] = defaultdict(list)
+        for dataset_index in train_indices:
+            image_id = train_dataset.ids[dataset_index]
+            stream = train_dataset.coco.imgs[image_id].get("stream", "uniform")
+            stream_indices[stream].append(dataset_index)
+        if args.category_stream_fraction is not None:
+            missing_streams = {
+                stream for stream in ("uniform", "category_centered")
+                if not stream_indices.get(stream)
+            }
+            if missing_streams:
+                raise ValueError(
+                    "--category-stream-fraction requires both converter streams; "
+                    f"missing {sorted(missing_streams)}"
+                )
+            print(
+                "Training stream mixture: "
+                f"uniform={1.0 - args.category_stream_fraction:.3f}, "
+                f"category_centered={args.category_stream_fraction:.3f}; "
+                f"available crops={dict((key, len(value)) for key, value in stream_indices.items())}"
+            )
+            stream_by_image_id = {
+                image_id: train_dataset.coco.imgs[image_id].get("stream", "uniform")
+                for image_id in train_dataset.ids
+            }
+            positives_by_stream: dict[str, Counter[str]] = defaultdict(Counter)
+            selected_image_ids = {train_dataset.ids[index] for index in train_indices}
+            for annotation in train_dataset.coco.dataset.get("annotations", []):
+                if int(annotation["image_id"]) not in selected_image_ids:
+                    continue
+                superclass = annotation.get("mapped_superclass")
+                if superclass:
+                    positives_by_stream[
+                        stream_by_image_id[int(annotation["image_id"])]
+                    ][superclass] += 1
+            if positives_by_stream:
+                epoch_crops = len(train_indices)
+                stream_draws = {
+                    "category_centered": round(
+                        epoch_crops * args.category_stream_fraction
+                    ),
+                }
+                stream_draws["uniform"] = epoch_crops - stream_draws["category_centered"]
+                expected_positives: Counter[str] = Counter()
+                for stream, draws in stream_draws.items():
+                    available = len(stream_indices[stream])
+                    for superclass, positives in positives_by_stream[stream].items():
+                        expected_positives[superclass] += draws * positives / available
+                print(
+                    "Expected mapped positive boxes per sampled epoch: "
+                    + ", ".join(
+                        f"{name}={count:.1f}"
+                        for name, count in sorted(expected_positives.items())
+                    )
+                )
+
+        def _sample_stream(pool: list[int], count: int, generator: torch.Generator) -> list[int]:
+            if count <= len(pool):
+                positions = torch.randperm(len(pool), generator=generator)[:count]
+            else:
+                positions = torch.randint(len(pool), (count,), generator=generator)
+            return [pool[int(position)] for position in positions]
+
         def make_train_loader(epoch: int, skip_batches: int = 0) -> DataLoader:
             """Build one epoch's loader over an explicit, resumable sample order.
 
@@ -965,11 +1633,20 @@ def main(argv: list[str] | None = None) -> None:
             a given sample at a different point in its stream.
             """
             generator = torch.Generator().manual_seed(args.seed * 1_000_003 + epoch)
-            order = torch.randperm(len(train_indices), generator=generator).tolist()
-            epoch_indices = [
-                train_indices[position]
-                for position in order[skip_batches * args.batch_size :]
-            ]
+            if args.category_stream_fraction is None:
+                order = torch.randperm(len(train_indices), generator=generator).tolist()
+                full_epoch_indices = [train_indices[position] for position in order]
+            else:
+                category_count = round(len(train_indices) * args.category_stream_fraction)
+                uniform_count = len(train_indices) - category_count
+                full_epoch_indices = _sample_stream(
+                    stream_indices["uniform"], uniform_count, generator
+                ) + _sample_stream(
+                    stream_indices["category_centered"], category_count, generator
+                )
+                order = torch.randperm(len(full_epoch_indices), generator=generator).tolist()
+                full_epoch_indices = [full_epoch_indices[position] for position in order]
+            epoch_indices = full_epoch_indices[skip_batches * args.batch_size :]
             return DataLoader(
                 Subset(train_augmented, epoch_indices),
                 batch_size=args.batch_size,
@@ -1028,6 +1705,16 @@ def main(argv: list[str] | None = None) -> None:
         trainable_count = sum(
             parameter.numel() for parameter in model.parameters() if parameter.requires_grad
         )
+        active_lora = get_vision_lora_config(model)
+        lora_count = (
+            sum(
+                parameter.numel()
+                for parameter in _vision_lora_parameters(model, active_lora)
+                if parameter.requires_grad
+            )
+            if active_lora is not None
+            else 0
+        )
         print(f"Classes: {len(class_names)}")
         print(f"Training images: {len(train_indices)}")
         print(
@@ -1035,6 +1722,7 @@ def main(argv: list[str] | None = None) -> None:
             f"({args.batch_size} x {args.grad_accum_steps} accumulated)"
         )
         print(f"Trainable parameters: {trainable_count:,}")
+        print(f"LoRA trainable parameters: {lora_count:,}")
         for group in parameter_groups:
             count = sum(parameter.numel() for parameter in group["params"])
             print(f"  {group['name']}: {count:,} parameters at lr={group['lr']:.2g}")
@@ -1047,6 +1735,7 @@ def main(argv: list[str] | None = None) -> None:
                     "class_names": str(class_names),
                     "train_images_selected": len(train_indices),
                     "trainable_parameters": trainable_count,
+                    "vision_lora_parameters": lora_count,
                     "effective_batch_size": args.batch_size * args.grad_accum_steps,
                 }
             )
@@ -1210,6 +1899,7 @@ def main(argv: list[str] | None = None) -> None:
                     args,
                     epoch=epoch_number,
                     map_value=latest_map,
+                    ontology_metadata=ontology_metadata,
                 )
                 print(f"Saved new best checkpoint with mAP {best_map:.4f}")
             # Written after best.pth so the resume state carries the updated
@@ -1223,6 +1913,7 @@ def main(argv: list[str] | None = None) -> None:
                 epoch=epoch_number,
                 map_value=latest_map,
                 training_state=build_training_state(),
+                ontology_metadata=ontology_metadata,
             )
 
         for epoch in range(start_epoch, epochs_to_run):
@@ -1281,6 +1972,7 @@ def main(argv: list[str] | None = None) -> None:
                         class_loss=args.class_loss,
                         class_loss_gamma=args.class_loss_gamma,
                         class_loss_alpha=args.class_loss_alpha,
+                        class_weights=classification_weights,
                     )
                 scaler.scale(losses["loss"] / window_size).backward()
                 for name, value in losses.items():
@@ -1373,16 +2065,51 @@ def main(argv: list[str] | None = None) -> None:
         if last_eval_step != global_step:
             run_validation(completed_epoch, global_step)
 
+        lora_delta_ratios = vision_lora_delta_ratios(model)
+        if lora_delta_ratios:
+            print("Final LoRA relative weight deltas:")
+            for name, ratio in lora_delta_ratios.items():
+                print(f"  {name}: {ratio:.6g}")
+            if args.mlflow:
+                log_metrics(
+                    {
+                        f"lora/delta_ratio/{name}": ratio
+                        for name, ratio in lora_delta_ratios.items()
+                    },
+                    step=global_step,
+                )
+
+        final_path = output_dir / "final.pth"
         save_checkpoint(
-            output_dir / "final.pth",
+            final_path,
             model,
             class_names,
             eval_prompts,
             args,
             epoch=completed_epoch,
             map_value=latest_map,
+            ontology_metadata=ontology_metadata,
         )
-        print(f"Saved final checkpoint to {output_dir / 'final.pth'}")
+        print(f"Saved final checkpoint to {final_path}")
+        checkpoint_sizes = {"final": final_path.stat().st_size / (1024 ** 2)}
+        last_path = output_dir / "last.pth"
+        if last_path.exists():
+            checkpoint_sizes["last"] = last_path.stat().st_size / (1024 ** 2)
+        print(
+            "Checkpoint sizes: "
+            + ", ".join(
+                f"{name}.pth={size:.1f} MiB"
+                for name, size in checkpoint_sizes.items()
+            )
+        )
+        if args.mlflow:
+            log_metrics(
+                {
+                    f"checkpoint/{name}_mib": size
+                    for name, size in checkpoint_sizes.items()
+                },
+                step=global_step,
+            )
         if best_map != float("-inf"):
             print(f"Best validation mAP: {best_map:.4f}")
 

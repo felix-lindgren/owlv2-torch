@@ -47,6 +47,7 @@ DOTA_V1_5_CLASSES: list[str] = [
 FASHIONPEDIA_DATASET_ID = "detection-datasets/fashionpedia"
 SATELLITE_QUERY_TEMPLATE = "a satellite photo of a {name}"
 PHOTO_QUERY_TEMPLATE = "a photo of {name}"
+DEFAULT_XVIEW_EVAL_SPEC = Path(__file__).resolve().parents[1] / "docs" / "xview-eval-spec.json"
 
 
 def class_name_to_query(name: str, template: str = SATELLITE_QUERY_TEMPLATE) -> str:
@@ -100,10 +101,12 @@ def detect(
     """Run OWLv2 open-vocabulary detection."""
     batch_size = pixel_values.shape[0]
 
-    if token_ids.shape[0] != batch_size:
-        token_ids = token_ids.repeat(batch_size, 1)
-        if attention_mask is not None:
-            attention_mask = attention_mask.repeat(batch_size, 1)
+    # This evaluator accepts one unbatched query bank and expands it for every
+    # image. Do this unconditionally: query count can coincidentally equal batch
+    # size, which made the old shape heuristic collapse evaluation to one query.
+    token_ids = token_ids.repeat(batch_size, 1)
+    if attention_mask is not None:
+        attention_mask = attention_mask.repeat(batch_size, 1)
     num_queries = token_ids.shape[0] // batch_size
 
     image_feats, _ = model._image_grid_features(pixel_values)
@@ -116,6 +119,74 @@ def detect(
     objectness_logits = model.objectness_head(image_feats)[..., 0]
     pred_boxes = torch.sigmoid(model.box_head(image_feats) + model.box_bias)
     return pred_logits, objectness_logits, pred_boxes
+
+
+def load_eval_spec(path: str | Path | None) -> dict | None:
+    if path is None:
+        return None
+    with Path(path).open(encoding="utf-8") as handle:
+        spec = json.load(handle)
+    buckets = spec.get("buckets")
+    if not isinstance(buckets, dict) or not buckets:
+        raise ValueError(f"Evaluation spec {path} has no buckets")
+    assigned = [class_name_key(name) for names in buckets.values() for name in names]
+    duplicates = sorted(name for name in set(assigned) if assigned.count(name) > 1)
+    if duplicates:
+        raise ValueError(f"Evaluation spec assigns classes to multiple buckets: {duplicates}")
+    return spec
+
+
+def apply_text_checkpoint(model: OwlV2, checkpoint_path: str | Path | dict) -> dict:
+    """Load a full or delta checkpoint written by train_text.py."""
+    checkpoint = (
+        checkpoint_path
+        if isinstance(checkpoint_path, dict)
+        else torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    )
+    checkpoint_format = checkpoint.get("format")
+    valid_formats = {"owlv2-text-finetune-full-v1", "owlv2-text-finetune-delta-v1"}
+    if checkpoint_format not in valid_formats:
+        raise ValueError(
+            f"Unsupported checkpoint format {checkpoint_format!r}; expected one of {sorted(valid_formats)}"
+        )
+    incompatible = model.load_state_dict(
+        checkpoint["model_state_dict"],
+        strict=checkpoint_format == "owlv2-text-finetune-full-v1",
+    )
+    if checkpoint_format.endswith("delta-v1") and incompatible.unexpected_keys:
+        raise RuntimeError(f"Unexpected checkpoint keys: {incompatible.unexpected_keys}")
+    return checkpoint
+
+
+def build_query_plan(
+    class_names: list[str], query_template: str, aliases: dict[str, list[str]] | None,
+) -> tuple[list[str], list[list[int]]]:
+    if "{name}" not in query_template:
+        raise ValueError("query_template must contain a '{name}' placeholder")
+    aliases_by_key = {
+        class_name_key(name): values for name, values in (aliases or {}).items()
+    }
+    queries: list[str] = []
+    indices_by_class: list[list[int]] = []
+    for class_name in class_names:
+        names = aliases_by_key.get(class_name_key(class_name), [class_name])
+        if not names:
+            raise ValueError(f"Alias list for {class_name!r} is empty")
+        indices = []
+        for name in names:
+            indices.append(len(queries))
+            queries.append(class_name_to_query(name, query_template))
+        indices_by_class.append(indices)
+    return queries, indices_by_class
+
+
+def pool_query_logits(
+    logits: torch.Tensor, indices_by_class: list[list[int]]
+) -> torch.Tensor:
+    """Max-pool alias logits into the fixed evaluation class space."""
+    return torch.stack(
+        [logits[..., indices].amax(dim=-1) for indices in indices_by_class], dim=-1
+    )
 
 
 class CocoFileDetectionDataset(Dataset):
@@ -132,13 +203,17 @@ class CocoFileDetectionDataset(Dataset):
 
         categories = sorted(coco.get("categories", []), key=lambda c: int(c["id"]))
         self.class_names = [str(c["name"]) for c in categories]
-        self.coco_gt = {
+        raw_coco_gt = {
             "info": coco.get("info", {}),
             "licenses": coco.get("licenses", []),
             "images": list(coco.get("images", [])),
             "annotations": list(coco.get("annotations", [])),
             "categories": list(coco.get("categories", [])),
         }
+        # Inference labels are contiguous query positions. COCO files such as
+        # xView retain sparse source category IDs, so remap their ground truth
+        # once rather than silently comparing query 0 against category 11.
+        self.coco_gt = filter_coco_gt_to_class_names(raw_coco_gt, self.class_names)
 
         images = list(self.coco_gt["images"])
         if limit is not None:
@@ -519,10 +594,22 @@ def run_owlv2_inference(
     num_workers: int,
     desc: str,
     query_template: str = SATELLITE_QUERY_TEMPLATE,
+    query_aliases: dict[str, list[str]] | None = None,
 ) -> list[dict]:
-    queries = [class_name_to_query(c, query_template) for c in class_names]
+    queries, indices_by_class = build_query_plan(
+        class_names, query_template, query_aliases
+    )
+    if query_aliases:
+        print(
+            f"Alias pooling: {len(queries)} text queries -> "
+            f"{len(class_names)} fixed evaluation classes"
+        )
     text_inputs = tokenize(queries, context_length=16, truncate=True).to(device)
     attention_mask = (text_inputs == 0).to(device)
+    def _predict(m, pixels):
+        logits, objectness, boxes = detect(m, pixels, text_inputs, attention_mask)
+        return pool_query_logits(logits, indices_by_class), objectness, boxes
+
     return run_detection_inference(
         model=model,
         dataset=dataset,
@@ -534,7 +621,7 @@ def run_owlv2_inference(
         use_autocast=use_autocast,
         num_workers=num_workers,
         desc=desc,
-        predict_fn=lambda m, pixels: detect(m, pixels, text_inputs, attention_mask),
+        predict_fn=_predict,
         postprocess_model=model,
     )
 
@@ -666,6 +753,7 @@ def coco_eval_with_custom_sizes(
     detections: list[dict],
     class_names: list[str],
     title: str,
+    max_detections: int = 100,
 ) -> dict[str, float]:
     from faster_coco_eval import COCO, COCOeval_faster
 
@@ -682,7 +770,9 @@ def coco_eval_with_custom_sizes(
     cocoeval = COCOeval_faster(coco_gt, coco_dt, iouType="bbox")
     cocoeval.params.areaRng = [list(r) for _, r in AREA_RANGES]
     cocoeval.params.areaRngLbl = [lbl for lbl, _ in AREA_RANGES]
-    cocoeval.params.maxDets = [1, 10, 100]
+    if max_detections <= 10:
+        raise ValueError("max_detections must be greater than 10")
+    cocoeval.params.maxDets = [1, 10, max_detections]
     cocoeval.evaluate()
     cocoeval.accumulate()
 
@@ -727,6 +817,56 @@ def coco_eval_with_custom_sizes(
         per_cls = _mean(precision[:, :, k, all_idx, last_md_idx])
         print(f"  {name:30s} {per_cls:.4f}")
     return metrics
+
+
+def evaluate_fixed_buckets(
+    coco_gt: dict,
+    detections: list[dict],
+    class_names: list[str],
+    buckets: dict[str, list[str]],
+    title: str,
+    max_detections: int,
+) -> dict[str, dict[str, float]]:
+    """Re-average the same detections in frozen, disjoint class buckets."""
+    dataset_keys = {class_name_key(name) for name in class_names}
+    assigned_keys = {
+        class_name_key(name) for names in buckets.values() for name in names
+    }
+    missing = sorted(assigned_keys - dataset_keys)
+    unassigned = sorted(dataset_keys - assigned_keys)
+    if missing or unassigned:
+        raise ValueError(
+            "Frozen buckets must partition the evaluation vocabulary exactly; "
+            f"missing_from_dataset={missing}, unassigned_dataset_classes={unassigned}"
+        )
+    old_label_by_key = {
+        class_name_key(name): label for label, name in enumerate(class_names)
+    }
+    results = {}
+    for bucket_name, bucket_classes in buckets.items():
+        gt = filter_coco_gt_to_class_names(coco_gt, bucket_classes)
+        new_label_by_key = {
+            class_name_key(name): label for label, name in enumerate(bucket_classes)
+        }
+        old_to_new = {
+            old_label_by_key[key]: new_label_by_key[key]
+            for key in new_label_by_key
+        }
+        bucket_detections = []
+        for detection in detections:
+            old_label = int(detection["category_id"])
+            if old_label in old_to_new:
+                remapped = dict(detection)
+                remapped["category_id"] = old_to_new[old_label]
+                bucket_detections.append(remapped)
+        results[bucket_name] = coco_eval_with_custom_sizes(
+            gt,
+            bucket_detections,
+            bucket_classes,
+            title=f"{title} / {bucket_name} ({len(bucket_classes)} classes)",
+            max_detections=max_detections,
+        )
+    return results
 
 
 def save_detections(path: str, detections: list[dict]) -> None:
@@ -782,7 +922,11 @@ def main() -> None:
         choices=["coco", "dior", "dota", "fashionpedia"],
         required=True,
     )
-    parser.add_argument("--model-size", default="large", choices=["base", "large"])
+    parser.add_argument("--model-size", default=None, choices=["base", "large"])
+    parser.add_argument(
+        "--checkpoint", type=Path,
+        help="Full or delta checkpoint written by prototype_train/train_text.py.",
+    )
     parser.add_argument("--ann-file", type=Path, default=None, help="COCO annotation JSON.")
     parser.add_argument("--image-root", type=Path, default=None, help="COCO image root.")
     parser.add_argument(
@@ -798,23 +942,67 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--score-threshold", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=300)
+    parser.add_argument(
+        "--eval-max-detections", type=int, default=100,
+        help=(
+            "COCO maxDets ceiling. 100 is standard COCO AP; values above 100 "
+            "produce an explicitly non-standard dense-source metric."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--fast-preprocess", action="store_true")
     parser.add_argument("--no-autocast", dest="autocast", action="store_false")
     parser.set_defaults(autocast=True)
     parser.add_argument("--save-detections", default=None)
+    parser.add_argument("--save-metrics", default=None)
     parser.add_argument("--title", default=None)
     parser.add_argument(
         "--query-template",
         default=None,
         help="Text prompt template containing {name}; defaults by dataset type.",
     )
+    parser.add_argument(
+        "--eval-spec", type=Path,
+        help=(
+            "Frozen bucket/alias JSON. DIOR defaults to docs/xview-eval-spec.json; "
+            "pass --no-buckets to disable bucket reporting."
+        ),
+    )
+    parser.add_argument("--no-buckets", action="store_true")
+    parser.add_argument(
+        "--alias-pooling", action="store_true",
+        help="Pool the eval spec's fine-grained aliases into each fixed target class.",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
+    checkpoint = None
+    if args.checkpoint:
+        checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        checkpoint_model_size = checkpoint.get("model_type")
+        if checkpoint_model_size not in {"base", "large"}:
+            raise ValueError(
+                f"Checkpoint has invalid model_type={checkpoint_model_size!r}"
+            )
+        if args.model_size is not None and checkpoint_model_size != args.model_size:
+            raise ValueError(
+                f"Checkpoint model_type={checkpoint_model_size!r}, "
+                f"but --model-size={args.model_size!r}"
+            )
+        args.model_size = args.model_size or checkpoint_model_size
+    args.model_size = args.model_size or "large"
     if args.batch_size is None:
         args.batch_size = 32 if args.model_size == "base" else 8
+    if args.top_k is not None and args.top_k < args.eval_max_detections:
+        raise ValueError("--top-k cannot be smaller than --eval-max-detections")
+
+    eval_spec_path = args.eval_spec
+    if eval_spec_path is None and args.dataset == "dior":
+        eval_spec_path = DEFAULT_XVIEW_EVAL_SPEC
+    eval_spec = load_eval_spec(eval_spec_path)
+    if args.alias_pooling and eval_spec is None:
+        raise ValueError("--alias-pooling requires --eval-spec")
 
     dataset, title = build_eval_dataset(args)
     print(f"Loaded {args.dataset}: {len(dataset)} samples/crops")
@@ -822,13 +1010,23 @@ def main() -> None:
 
     print(f"Loading OwlV2 ({args.model_size}) on {args.device}...")
     model = OwlV2(args.model_size).eval().to(args.device)
+    if checkpoint is not None:
+        apply_text_checkpoint(model, checkpoint)
+        print(f"Loaded fine-tuned weights from {args.checkpoint}")
     query_template = args.query_template
     if query_template is None:
         query_template = (
-            SATELLITE_QUERY_TEMPLATE
-            if args.dataset in {"dior", "dota"}
+            eval_spec.get("evaluation_prompt_template")
+            if eval_spec is not None
+            else SATELLITE_QUERY_TEMPLATE if args.dataset in {"dior", "dota"}
             else PHOTO_QUERY_TEMPLATE
         )
+    print(f"Evaluation prompt: {query_template!r}")
+    print(
+        f"Detection policy: inference top_k={args.top_k}; "
+        f"COCO maxDets={args.eval_max_detections}"
+        + (" (standard)" if args.eval_max_detections == 100 else " (non-standard dense metric)")
+    )
     detections = run_owlv2_inference(
         model,
         dataset,
@@ -842,18 +1040,52 @@ def main() -> None:
         num_workers=args.num_workers,
         desc=f"{title} inference",
         query_template=query_template,
+        query_aliases=(eval_spec.get("query_aliases") if args.alias_pooling else None),
     )
 
     if args.save_detections:
         save_detections(args.save_detections, detections)
         print(f"Wrote {len(detections)} detections to {args.save_detections}")
 
-    coco_eval_with_custom_sizes(
-        dataset.build_coco_gt(),
+    coco_gt = dataset.build_coco_gt()
+    full_metrics = coco_eval_with_custom_sizes(
+        coco_gt,
         detections,
         dataset.class_names,
         title=title,
+        max_detections=args.eval_max_detections,
     )
+    bucket_metrics = {}
+    if eval_spec is not None and not args.no_buckets:
+        bucket_metrics = evaluate_fixed_buckets(
+            coco_gt,
+            detections,
+            dataset.class_names,
+            eval_spec["buckets"],
+            title,
+            args.eval_max_detections,
+        )
+    if args.save_metrics:
+        payload = {
+            "dataset": args.dataset,
+            "model_size": args.model_size,
+            "checkpoint": str(args.checkpoint) if args.checkpoint else None,
+            "query_template": query_template,
+            "alias_pooling": args.alias_pooling,
+            "eval_spec": str(eval_spec_path) if eval_spec_path else None,
+            "eval_spec_version": eval_spec.get("version") if eval_spec else None,
+            "buckets_definition": eval_spec.get("buckets") if eval_spec else None,
+            "inference_top_k": args.top_k,
+            "eval_max_detections": args.eval_max_detections,
+            "full": full_metrics,
+            "buckets": bucket_metrics,
+        }
+        path = Path(args.save_metrics)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+        print(f"Wrote metrics to {path}")
 
 
 if __name__ == "__main__":
