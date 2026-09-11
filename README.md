@@ -131,8 +131,7 @@ Run the zero-shot baseline:
 
 ```bash
 uv run --extra train python tools/test_fashionpedia.py \
-  --model-size base \
-  --fast-preprocess
+  --model-size base
 ```
 
 Train FLAME refiners from Fashionpedia `train` support images and compare them
@@ -143,8 +142,7 @@ uv run --extra train python tools/test_fashionpedia_flame.py \
   --model-size base \
   --classes "shirt, blouse" "shoe" \
   --shots 30 \
-  --support-images 8 \
-  --fast-preprocess
+  --support-images 8
 ```
 
 Omit `--classes` to run all 46 categories. Use `--limit` for a validation-set

@@ -45,7 +45,7 @@ def main() -> None:
         help="Image/tile crops per forward pass. Default: 32 for base, 8 for large.",
     )
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--fast-preprocess", action="store_true")
+    parser.add_argument("--fast-preprocess", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--no-autocast", dest="autocast", action="store_false")
     parser.set_defaults(autocast=True)
     parser.add_argument(
@@ -67,7 +67,7 @@ def main() -> None:
     if str(args.device).startswith("cuda") and not args.fast_preprocess:
         print(
             "[WARN] Using exact scipy image preprocessing. This is CPU-bound and can "
-            "make GPU utilization look bursty/low. Add --fast-preprocess for higher throughput."
+            "make GPU utilization look bursty/low. Drop --no-fast-preprocess for higher throughput."
         )
     print(
         f"Inference settings: batch_size={args.batch_size}, "

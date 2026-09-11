@@ -706,8 +706,9 @@ def main(default_dataset: str = "dior", description: Optional[str] = None) -> No
                         help="Images per DataLoader batch while materialising the test split.")
     parser.add_argument("--num-workers", type=int, default=4,
                         help="DataLoader workers for test image decoding.")
-    parser.add_argument("--fast-preprocess", action="store_true",
-                        help="Use torchvision resize instead of scipy exact resize.")
+    parser.add_argument("--fast-preprocess", action=argparse.BooleanOptionalAction, default=True,
+                        help="Torch image preprocessing; --no-fast-preprocess runs the "
+                             "scipy original (same output, CPU-bound).")
     parser.add_argument("--no-autocast", dest="autocast", action="store_false",
                         help="Disable CUDA autocast during OWLv2 inference.")
     parser.set_defaults(autocast=True)
@@ -733,7 +734,7 @@ def main(default_dataset: str = "dior", description: Optional[str] = None) -> No
     if str(args.device).startswith("cuda") and not args.fast_preprocess:
         print(
             "[WARN] Using exact scipy image preprocessing. This is CPU-bound and can "
-            "make GPU utilization look bursty/low. Add --fast-preprocess for higher throughput."
+            "make GPU utilization look bursty/low. Drop --no-fast-preprocess for higher throughput."
         )
     print(
         f"Inference settings: detect_batch_size={args.detect_batch_size}, "

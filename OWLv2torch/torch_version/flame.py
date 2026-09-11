@@ -58,7 +58,7 @@ class FlameConfig:
     verbose: bool = True                    # set False to silence per-call FLAME prints
 
     # Preprocessing
-    fast_image_preprocess: bool = False     # use torchvision resize instead of scipy exact resize
+    fast_image_preprocess: bool = True      # torch reimplementation of the scipy resize (same output, faster)
 
     # Inference precision
     use_autocast: bool = True               # use CUDA autocast for OWLv2 inference

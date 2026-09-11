@@ -951,7 +951,7 @@ def main() -> None:
     )
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--fast-preprocess", action="store_true")
+    parser.add_argument("--fast-preprocess", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--no-autocast", dest="autocast", action="store_false")
     parser.set_defaults(autocast=True)
     parser.add_argument("--save-detections", default=None)

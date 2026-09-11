@@ -11,5 +11,4 @@ uv run python tools/test_dior_flame.py \
     --svm-kernel rbf \
     --seed 456 \
     --image-loader-batch-size 128 \
-    --fast-preprocess \
     --detect-batch-size 16

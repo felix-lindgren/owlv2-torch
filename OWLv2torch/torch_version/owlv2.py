@@ -1,3 +1,6 @@
+import functools
+import warnings
+
 from huggingface_hub.file_download import hf_hub_download
 import torch
 import torch.nn as nn
@@ -96,6 +99,104 @@ class ScipyResize:
         out = ndi.zoom(filtered, zoom_factors, order=1, mode="mirror", cval=0, grid_mode=True)
         out = np.clip(out, arr.min(), arr.max())
         return torch.from_numpy(out).permute(2, 0, 1)  # back to (C, H, W)
+
+
+def _mirror_index(idx, n):
+    """Fold indices into ``[0, n)`` with scipy.ndimage's 'mirror' boundary (d c b | a b c d | c b a)."""
+    if n == 1:
+        return np.zeros_like(idx)
+    period = 2 * n - 2
+    idx = np.abs(idx) % period
+    return np.where(idx >= n, period - idx, idx)
+
+
+def _scipy_resize_axis(content, padded, out, scale):
+    """One axis of ScipyResize as an ``(out, content)`` sparse CSR operator.
+
+    The axis is ``padded`` samples long after SquarePad, of which the first
+    ``content`` are image and the rest the 0.5 fill. Each output sample is
+    ndi.zoom's order-1 interpolation (grid_mode, mirror) of ndi.gaussian_filter's
+    output (truncate=4, mirror), i.e. a short list of taps into the padded axis.
+    Taps landing on the fill are dropped from the operator; the returned
+    per-row weight on the image says how much of each row they took.
+    """
+    factor = padded / out
+    sigma = max(0.0, (factor - 1) / 2)
+    src = (np.arange(out) + 0.5) * factor - 0.5
+    lo = np.floor(src)
+    frac = src - lo
+    cols = _mirror_index(np.stack([lo, lo + 1], 1).astype(np.int64), padded)
+    weights = np.stack([1 - frac, frac], 1)
+    if sigma > 1e-15:  # gaussian_filter skips axes with a zero sigma
+        radius = int(4.0 * sigma + 0.5)
+        offsets = np.arange(-radius, radius + 1)
+        kernel = np.exp(-0.5 / sigma**2 * offsets**2)
+        kernel /= kernel.sum()
+        cols = _mirror_index(cols[:, :, None] + offsets, padded)
+        weights = weights[:, :, None] * kernel
+    cols = cols.reshape(out, -1)
+    weights = weights.reshape(out, -1)
+    rows = np.broadcast_to(np.arange(out)[:, None], cols.shape)
+    keep = cols < content
+    rows, cols, weights = rows[keep], cols[keep], weights[keep]
+    image_weight = np.bincount(rows, weights, minlength=out)
+    # torch flags sparse tensors as beta and warns that invariant checks are off.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Sparse")
+        op = torch.sparse_coo_tensor(
+            torch.from_numpy(np.stack([rows, cols])),
+            torch.from_numpy(weights * scale),
+            (out, content),
+        ).coalesce().to(torch.float32).to_sparse_csr()
+    return op, torch.from_numpy(image_weight).float()
+
+
+@functools.lru_cache(maxsize=32)
+def _scipy_resize_operators(h, w, size, scale, device):
+    n = max(h, w)
+    ay, ay_weight = _scipy_resize_axis(h, n, size, scale)
+    ax, ax_weight = _scipy_resize_axis(w, n, size, 1.0)
+    # 0.5 fill of the padded margin, laid out like the (S_x, S_y) result below.
+    fill = 0.5 * (1 - torch.outer(ax_weight, ay_weight)).unsqueeze(-1)
+    return ay.to(device), ax.to(device), fill.to(device)
+
+
+class TorchScipyResize:
+    """SquarePad + ScipyResize in one step, as two sparse matmuls in torch.
+
+    Matches ``ScipyResize(SquarePad(image))`` to float32 rounding (~1e-4 of a
+    grey level) at a fraction of the cost, and faster than torchvision's
+    antialiased resize at the large end since the padded square is never
+    materialised. The operators depend only on the image size and are cached.
+
+    Accepts a PIL image, or a ``(C, H, W)`` tensor: integer images are scaled to
+    ``[0, 1]`` as ``ToDtype(scale=True)`` does, float images are taken as already
+    in range. Returns a float32 ``(C, size, size)`` tensor.
+    """
+
+    def __init__(self, size):
+        self.size = size
+
+    def __call__(self, image):
+        if isinstance(image, Image.Image):
+            hwc = torch.from_numpy(np.array(image))
+            if hwc.ndim == 2:
+                hwc = hwc.unsqueeze(-1)
+        else:
+            hwc = image.as_subclass(torch.Tensor).permute(1, 2, 0)
+        h, w, c = hwc.shape
+        s = self.size
+        scale = 1.0 if hwc.is_floating_point() else 1.0 / torch.iinfo(hwc.dtype).max
+        ay, ax, fill = _scipy_resize_operators(h, w, s, scale, hwc.device)
+        # Contract rows on the (H, W*C) view, then columns on the (W, S*C) view.
+        y = torch.sparse.mm(ay, hwc.reshape(h, w * c).float())
+        y = y.view(s, w, c).transpose(0, 1).reshape(w, s * c)
+        out = torch.sparse.mm(ax, y).view(s, s, c) + fill
+        # ScipyResize clips to the range of the padded input.
+        lo, hi = (v.item() * scale for v in torch.aminmax(hwc))
+        if h != w:
+            lo, hi = min(lo, 0.5), max(hi, 0.5)
+        return out.clamp_(lo, hi).permute(2, 1, 0).contiguous()
 
 
 class Attention(nn.Module): 
@@ -419,13 +520,12 @@ class OwlV2(nn.Module):
         self.register_buffer(
             "box_bias", self.compute_box_bias(self.sqrt_num_patches), persistent=False
         )
+        # Same result as the accurate path below, computed in torch.
         self.image_transform_fast = T.Compose([
-            T.ToImage(),
-            T.Lambda(lambda x: x*0.00392156862745098),
-            SquarePad(),
-            T.Resize((self.image_size, self.image_size), antialias=True),
+            TorchScipyResize(self.image_size),
             T.Normalize(mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD),
         ])
+        # The scipy reference (HF's Owlv2ImageProcessor), kept to check against.
         self.image_transform_accurate = T.Compose([
             T.ToImage(),
             T.ToDtype(torch.float32, scale=True),
@@ -433,14 +533,9 @@ class OwlV2(nn.Module):
             ScipyResize(self.image_size),
             T.Normalize(mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD),
         ])
-        self.image_transform = self.image_transform_accurate
+        self.image_transform = self.image_transform_fast
 
-        self.image_transform_unnormed = T.Compose([
-            T.ToImage(),
-            T.ToDtype(torch.float32,scale=True),
-            SquarePad(),
-            T.Resize((self.image_size, self.image_size), antialias=True),
-        ])
+        self.image_transform_unnormed = TorchScipyResize(self.image_size)
 
         self.owlv2_img_normalize = T.Normalize(mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD)
         
@@ -503,16 +598,16 @@ class OwlV2(nn.Module):
             or self.text_model.encoder.gradient_checkpointing
         )
 
-    def preprocess_image(self, image, fast=False):
+    def preprocess_image(self, image, fast=True):
         """Preprocess one or more images for OwlV2 detection.
 
         Accepts a single PIL image / file path, or a list/tuple of either.
         Always returns a ``[B, 3, H, W]`` float tensor (B=1 for a single input).
 
-        Per-sample preprocessing is used (the ``accurate`` path runs scipy's
-        gaussian-filter + zoom on each image individually, which can't be
-        meaningfully vectorised), but the outputs are stacked into a batch so
-        downstream forward passes can run with B>1.
+        Both paths give the same pixels; ``fast=False`` runs the original scipy
+        implementation, which is several times slower on the CPU. Images are
+        preprocessed one at a time (their sizes differ) and stacked into a batch
+        so downstream forward passes can run with B>1.
         """
         if isinstance(image, (list, tuple)):
             tensors = [self.preprocess_image(img, fast=fast).squeeze(0) for img in image]
