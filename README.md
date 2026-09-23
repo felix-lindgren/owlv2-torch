@@ -95,9 +95,21 @@ model = OwlV2TRT(output_dir=".")
 ```
 
 When no paths are supplied, the TensorRT variant writes
-`owlv2_vis_base.onnx` and `owlv2_vis_base.engine` in the current directory if
-the engine is missing. Use `output_dir="artifacts"` to place both files in a
-different folder, or pass `onnx_path` / `engine_path` for exact filenames.
+`owlv2_vis_base.onnx` / `owlv2_vis_base.engine` (vision tower) and
+`owlv2_heads_base.onnx` / `owlv2_heads_base.engine` (class, box and objectness
+heads) in the current directory if the engines are missing. Use
+`output_dir="artifacts"` to place the files in a different folder, or pass
+`onnx_path` / `engine_path` / `heads_engine_path` for exact filenames.
+
+The heads engine serves shared `[num_queries, text_dim]` queries (up to
+`max_queries=256`) under `torch.no_grad()` / `inference_mode()`; other calls use
+the torch heads. It bakes in the head weights, so after loading fine-tuned heads
+call `model.build_trt_heads()` (a few seconds); until then detection falls back
+to the torch heads with a warning. Pass `trt_heads=False` to skip it.
+
+TensorRT 11 takes layer precision from the ONNX graph, so fp16 is chosen at
+export time (`fp16=True`, the default). Engines and fp32 ONNX files made with
+TensorRT 10 must be deleted and rebuilt.
 
 ### Prototype-based detection
 
