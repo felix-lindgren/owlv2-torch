@@ -2937,6 +2937,8 @@ dependencies = [
     { name = "safetensors" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "tinygrad", version = "0.11.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "tinygrad", version = "0.14.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "torch" },
     { name = "torchao" },
     { name = "torchvision" },
@@ -2985,6 +2987,7 @@ requires-dist = [
     { name = "safetensors", specifier = ">=0.5.3" },
     { name = "scipy", specifier = ">=1.7.3" },
     { name = "tensorrt", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'trt') or (platform_machine == 'x86_64' and sys_platform == 'win32' and extra == 'trt')", specifier = ">=11.0.0", index = "https://pypi.nvidia.com/" },
+    { name = "tinygrad", specifier = ">=0.11.0" },
     { name = "torch", specifier = ">=2.1.0" },
     { name = "torchao", specifier = ">=0.18.0" },
     { name = "torchmetrics", marker = "extra == 'train'", specifier = ">=0.11.4" },
@@ -4440,6 +4443,36 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/7b/1e/e924b3b2326a856aaf68586f9c52a5fc81ef45715eca408393b68c597e0e/timm-1.0.26.tar.gz", hash = "sha256:f66f082f2f381cf68431c22714c8b70f723837fa2a185b155961eab90f2d5b10", size = 2419859, upload-time = "2026-03-23T18:12:10.272Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/6f/e9/bebf3d50e3fc847378988235f87c37ad3ac26d386041ab915d15e92025cd/timm-1.0.26-py3-none-any.whl", hash = "sha256:985c330de5ccc3a2aa0224eb7272e6a336084702390bb7e3801f3c91603d3683", size = 2568766, upload-time = "2026-03-23T18:12:08.062Z" },
+]
+
+[[package]]
+name = "tinygrad"
+version = "0.11.0"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version < '3.11' and platform_machine != 's390x'",
+    "python_full_version < '3.11' and platform_machine == 's390x'",
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6b/74/e3bca9f8e361296c19bd2b038d0be8013a76b68a83757864b6751f0d592b/tinygrad-0.11.0.tar.gz", hash = "sha256:d9d468a55906cc49a1b4df5b69be78a58ab4d15714b7f238f2b0876d2bc09bc1", size = 1849541, upload-time = "2025-08-19T21:11:46.557Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/40/ac/38878fef46f9ce2cc4d624ac061f5bb5bb8ef98594fff96730d9947c3af0/tinygrad-0.11.0-py3-none-any.whl", hash = "sha256:b901d98880f04ad9f796734a013151ba851dbb9a340f1a516099adcd6fd3b3e3", size = 1745076, upload-time = "2025-08-19T21:11:44.723Z" },
+]
+
+[[package]]
+name = "tinygrad"
+version = "0.14.0"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.13' and platform_machine != 's390x'",
+    "python_full_version == '3.12.*' and platform_machine != 's390x'",
+    "python_full_version == '3.11.*' and platform_machine != 's390x'",
+    "python_full_version >= '3.13' and platform_machine == 's390x'",
+    "python_full_version == '3.12.*' and platform_machine == 's390x'",
+    "python_full_version == '3.11.*' and platform_machine == 's390x'",
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ca/91/08bcf49cb05ddd63106552c120318e6bacfca392b0f5888c298c601310a8/tinygrad-0.14.0.tar.gz", hash = "sha256:437be6bb7481ec26e332e4f4342f6ea09e41258e62c5c09f4a9ed7aeb7829a07", size = 2660069, upload-time = "2026-08-24T22:53:11.682Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e5/47/18446b91a1ae8cf4ce216c024e6cc93bbff6c0e5667baac7f5dacec0d065/tinygrad-0.14.0-py3-none-any.whl", hash = "sha256:d2a5bea33c637fdf105963632329876b3d3253d38295ac1ffd2ff81646d93be3", size = 2757442, upload-time = "2026-08-24T22:53:10.116Z" },
 ]
 
 [[package]]

@@ -36,6 +36,7 @@ dependencies = [
     "onnxscript>=0.7.0",
     "peft>=0.20.0",
     "torchao>=0.18.0",
+    "tinygrad>=0.11.0",
 ]
 
 [project.optional-dependencies]
