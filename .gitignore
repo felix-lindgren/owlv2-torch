@@ -12,3 +12,4 @@ eval_samples/
 mlflow.*
 eval_visualizations/
 logs/
+trt_engines/

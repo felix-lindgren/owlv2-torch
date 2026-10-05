@@ -47,6 +47,7 @@ DOTA_V1_5_CLASSES: list[str] = [
 FASHIONPEDIA_DATASET_ID = "detection-datasets/fashionpedia"
 SATELLITE_QUERY_TEMPLATE = "a satellite photo of a {name}"
 PHOTO_QUERY_TEMPLATE = "a photo of {name}"
+AERIAL_QUERY_TEMPLATE = "an aerial photo of a {name}"
 DEFAULT_XVIEW_EVAL_SPEC = Path(__file__).resolve().parents[1] / "docs" / "xview-eval-spec.json"
 
 
@@ -158,6 +159,74 @@ def apply_text_checkpoint(model: OwlV2, checkpoint_path: str | Path | dict) -> d
     return checkpoint
 
 
+def checkpoint_touches_vision(checkpoint: dict) -> bool:
+    """Does this checkpoint change the weights a TensorRT engine has baked in?"""
+    return any(
+        key.startswith("vision_model.")
+        for key in checkpoint.get("model_state_dict", {})
+    )
+
+
+def build_owlv2_model(
+    model_size: str,
+    device: str,
+    *,
+    tensorrt: bool = False,
+    engine_path: str | Path | None = None,
+    engine_dir: str | Path = "trt_engines",
+    batch_size: int = 8,
+    allow_torch_fallback: bool = False,
+) -> OwlV2:
+    """Load OWLv2, optionally running the vision tower through TensorRT.
+
+    ``OwlV2TRT`` only overrides ``_get_vision_outputs``, so the text tower, the
+    heads and the pre/postprocessing are the same objects either way and the
+    evaluator does not need to know which one it got. The engine is exported and
+    built on first use and cached under ``engine_dir``; because the export runs
+    off the *pretrained* vision weights, a fine-tuned vision tower needs a fresh
+    engine (see ``checkpoint_touches_vision``).
+    """
+    if not tensorrt:
+        return OwlV2(model_size).eval().to(device)
+
+    from OWLv2torch.torch_version.owlv2_tensorrt import OwlV2TRT
+
+    model = (
+        OwlV2TRT(
+            engine_path=engine_path,
+            output_dir=engine_dir,
+            model_type=model_size,
+            min_batch=1,
+            opt_batch=batch_size,
+            max_batch=batch_size,
+        )
+        .eval()
+        .to(device)
+    )
+    if model.trt is None:
+        message = (
+            f"TensorRT engine unavailable at {model.engine_path} (needs the "
+            "'tensorrt' package and a CUDA device)."
+        )
+        if not allow_torch_fallback:
+            raise RuntimeError(message + " Pass --trt-allow-fallback to run in torch instead.")
+        print(f"[WARN] {message} Falling back to the torch vision tower.")
+        return model
+
+    # A cached engine carries the batch profile it was built with, so a rerun at
+    # a larger --batch-size would otherwise die inside execute_async_v3.
+    profile = model.trt.engine.get_tensor_profile_shape("image", 0)
+    min_batch, max_batch = int(profile[0][0]), int(profile[2][0])
+    if not min_batch <= batch_size <= max_batch:
+        raise ValueError(
+            f"Cached engine {model.engine_path} was built for batch "
+            f"{min_batch}..{max_batch}, but this run uses --batch-size {batch_size}. "
+            "Delete the engine to rebuild it, or pick a batch size in range."
+        )
+    print(f"TensorRT vision tower: {model.engine_path} (batch {min_batch}..{max_batch})")
+    return model
+
+
 def build_query_plan(
     class_names: list[str], query_template: str, aliases: dict[str, list[str]] | None,
 ) -> tuple[list[str], list[list[int]]]:
@@ -190,11 +259,24 @@ def pool_query_logits(
 
 
 class CocoFileDetectionDataset(Dataset):
+    """Any COCO-detection JSON paired with the image root its file_names resolve in.
+
+    With ``tile_size > 0`` each image is split into overlapping crops and every
+    crop becomes one inference item; the crop origin travels as ``offset`` so the
+    inference loop shifts detections back into full-image coordinates. Ground
+    truth is always the untiled image, so the metric stays comparable across
+    tiling settings. Overlapping tiles do re-detect the same object, which is
+    what ``merge_tiled_detections`` is for.
+    """
+
     def __init__(
         self,
         ann_file: str | Path,
         image_root: str | Path,
         limit: Optional[int] = None,
+        class_names: Optional[list[str]] = None,
+        tile_size: int = 0,
+        tile_overlap: int = 200,
     ):
         self.ann_file = Path(ann_file)
         self.image_root = Path(image_root)
@@ -202,7 +284,18 @@ class CocoFileDetectionDataset(Dataset):
             coco = json.load(f)
 
         categories = sorted(coco.get("categories", []), key=lambda c: int(c["id"]))
-        self.class_names = [str(c["name"]) for c in categories]
+        file_class_names = [str(c["name"]) for c in categories]
+        if class_names is None:
+            self.class_names = file_class_names
+        else:
+            available = {class_name_key(name) for name in file_class_names}
+            unknown = [n for n in class_names if class_name_key(n) not in available]
+            if unknown:
+                raise ValueError(
+                    f"{self.ann_file} has no categories named {unknown}; "
+                    f"available: {file_class_names}"
+                )
+            self.class_names = list(class_names)
         raw_coco_gt = {
             "info": coco.get("info", {}),
             "licenses": coco.get("licenses", []),
@@ -226,18 +319,38 @@ class CocoFileDetectionDataset(Dataset):
             ]
         self.images = images
 
+        self.items: list[tuple[dict, tuple[int, int, int, int]]] = []
+        for image_info in self.images:
+            width, height = self._image_size(image_info)
+            for tile in generate_tiles(width, height, tile_size, tile_overlap):
+                self.items.append((image_info, tile))
+
+    def _image_size(self, image_info: dict) -> tuple[int, int]:
+        width = image_info.get("width")
+        height = image_info.get("height")
+        if not width or not height:
+            with Image.open(self.image_root / image_info["file_name"]) as image:
+                width, height = image.size
+        return int(width), int(height)
+
     def __len__(self) -> int:
-        return len(self.images)
+        return len(self.items)
 
     def __getitem__(self, idx: int) -> dict:
-        image_info = self.images[idx]
+        image_info, (x0, y0, x1, y1) = self.items[idx]
         path = self.image_root / image_info["file_name"]
-        image = Image.open(path).convert("RGB")
+        with Image.open(path) as image:
+            image = image.convert("RGB")
+            width, height = image.size
+            if (x0, y0, x1, y1) == (0, 0, width, height):
+                crop = image.copy()
+            else:
+                crop = image.crop((x0, y0, x1, y1)).copy()
         return {
-            "image": image,
+            "image": crop,
             "image_id": int(image_info["id"]),
-            "target_size": (image.height, image.width),
-            "offset": (0.0, 0.0),
+            "target_size": (crop.height, crop.width),
+            "offset": (float(x0), float(y0)),
         }
 
     def build_coco_gt(self) -> dict:
@@ -748,6 +861,37 @@ def run_detection_inference(
     return detections
 
 
+def merge_tiled_detections(
+    detections: list[dict], iou_threshold: float
+) -> list[dict]:
+    """Suppress the duplicates that sliding-window inference creates at seams.
+
+    Every tile overlapping an object detects it, so without this an object in an
+    overlap region contributes several near-identical boxes and all but one are
+    scored as false positives. NMS is run per (image, class) group; input order
+    is preserved for the survivors.
+    """
+    if iou_threshold <= 0.0 or not detections:
+        return detections
+    from torchvision.ops import batched_nms
+
+    boxes = torch.tensor(
+        [
+            [d["bbox"][0], d["bbox"][1], d["bbox"][0] + d["bbox"][2], d["bbox"][1] + d["bbox"][3]]
+            for d in detections
+        ],
+        dtype=torch.float32,
+    )
+    scores = torch.tensor([float(d["score"]) for d in detections], dtype=torch.float32)
+    group_ids: dict[tuple[int, int], int] = {}
+    groups = []
+    for detection in detections:
+        key = (int(detection["image_id"]), int(detection["category_id"]))
+        groups.append(group_ids.setdefault(key, len(group_ids)))
+    keep = batched_nms(boxes, scores, torch.tensor(groups), iou_threshold)
+    return [detections[i] for i in sorted(keep.tolist())]
+
+
 def coco_eval_with_custom_sizes(
     coco_gt_dict: dict,
     detections: list[dict],
@@ -885,6 +1029,9 @@ def build_eval_dataset(args):
             ann_file=args.ann_file,
             image_root=args.image_root,
             limit=args.limit,
+            class_names=args.classes,
+            tile_size=args.tile_size,
+            tile_overlap=args.tile_overlap,
         )
         title = args.title or Path(args.ann_file).stem
     elif args.dataset == "dior":
@@ -938,6 +1085,18 @@ def main() -> None:
     parser.add_argument("--data-root", type=Path, default=Path("data/dotav1_5"))
     parser.add_argument("--tile-size", type=int, default=0)
     parser.add_argument("--tile-overlap", type=int, default=200)
+    parser.add_argument(
+        "--tile-nms-iou", type=float, default=0.0,
+        help="If >0, NMS detections across tile seams per image and class.",
+    )
+    parser.add_argument(
+        "--classes", nargs="+", default=None,
+        help=(
+            "Restrict --dataset coco to these category names. mAP is an average "
+            "over whatever class set you pass, so numbers from different sets "
+            "are not comparable."
+        ),
+    )
     parser.add_argument("--include-difficult", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--score-threshold", type=float, default=0.0)
@@ -951,6 +1110,13 @@ def main() -> None:
     )
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--tensorrt", action="store_true",
+        help="Run the vision tower through TensorRT (engine cached per model size).",
+    )
+    parser.add_argument("--trt-engine", type=Path, default=None)
+    parser.add_argument("--trt-engine-dir", type=Path, default=Path("trt_engines"))
+    parser.add_argument("--trt-allow-fallback", action="store_true")
     parser.add_argument("--fast-preprocess", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--no-autocast", dest="autocast", action="store_false")
     parser.set_defaults(autocast=True)
@@ -1009,7 +1175,22 @@ def main() -> None:
     print(f"Classes ({len(dataset.class_names)}): {dataset.class_names}")
 
     print(f"Loading OwlV2 ({args.model_size}) on {args.device}...")
-    model = OwlV2(args.model_size).eval().to(args.device)
+    if args.tensorrt and checkpoint is not None and checkpoint_touches_vision(checkpoint):
+        raise SystemExit(
+            f"{args.checkpoint} fine-tunes the vision tower, but the TensorRT engine "
+            "is exported from the pretrained weights before any checkpoint is "
+            "applied - the run would silently measure the pretrained tower. "
+            "Drop --tensorrt for this checkpoint."
+        )
+    model = build_owlv2_model(
+        args.model_size,
+        args.device,
+        tensorrt=args.tensorrt,
+        engine_path=args.trt_engine,
+        engine_dir=args.trt_engine_dir,
+        batch_size=args.batch_size,
+        allow_torch_fallback=args.trt_allow_fallback,
+    )
     if checkpoint is not None:
         apply_text_checkpoint(model, checkpoint)
         print(f"Loaded fine-tuned weights from {args.checkpoint}")
@@ -1043,6 +1224,14 @@ def main() -> None:
         query_aliases=(eval_spec.get("query_aliases") if args.alias_pooling else None),
     )
 
+    if args.tile_size and args.tile_nms_iou > 0:
+        before = len(detections)
+        detections = merge_tiled_detections(detections, args.tile_nms_iou)
+        print(
+            f"Cross-tile NMS @IoU {args.tile_nms_iou}: "
+            f"{before} -> {len(detections)} detections"
+        )
+
     if args.save_detections:
         save_detections(args.save_detections, detections)
         print(f"Wrote {len(detections)} detections to {args.save_detections}")
@@ -1069,6 +1258,7 @@ def main() -> None:
         payload = {
             "dataset": args.dataset,
             "model_size": args.model_size,
+            "tensorrt": args.tensorrt and getattr(model, "trt", None) is not None,
             "checkpoint": str(args.checkpoint) if args.checkpoint else None,
             "query_template": query_template,
             "alias_pooling": args.alias_pooling,

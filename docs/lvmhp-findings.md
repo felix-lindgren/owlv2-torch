@@ -1,7 +1,9 @@
 # Findings — OWLv2-base on LV-MHP-v1
 
-Results against `docs/lvmhp-run-plan.md`. Runs live in the `OwlV2-LVMHP` MLflow
-experiment; `mlflow.db` is authoritative and the `logs/` files are transcripts.
+Results against `docs/lvmhp-run-plan.md`, and from Phase L6 onward against
+`docs/lvmhp-lora-run-plan.md`. Runs live in the `OwlV2-LVMHP` MLflow experiment,
+except the L6/L8 LoRA block which is in `OwlV2-LVMHP-LoRA`; `mlflow.db` is
+authoritative and the `logs/` files are transcripts.
 
 ## Phase 0 — calibration
 
@@ -672,25 +674,234 @@ not obviously help it.
 | Is large worth it? | **Not on this dataset** — +0.0038 for 3.7x wall clock |
 | Was the recipe fair to large? | **Not entirely** — vb6 is 25% of large's tower vs 50% of base's |
 
+## Phase L6 — vision LoRA (2026-08-09)
+
+Run plan in `docs/lvmhp-lora-run-plan.md`. Q/V LoRA, rank 8, `alpha=8`, no
+dropout, vision tower only, heads at 5e-5 and the two norms at 1e-5 exactly as
+vb6. Two of the six cells were run, both at the primary 1e-4 LoRA LR: **L6d**
+(LoRA on all 12 blocks, no full blocks) and **L6f** (full last six *plus* LoRA on
+the first six). The comparison point throughout is **L4b vb6 = 0.4865**.
+
+### Pre-flight — the memory prediction was wrong (2026-08-09)
+
+The plan expected all-12 LoRA and the hybrid to need `--grad-checkpointing`
+"just as full vb12 did". Probed at bs8, compile on:
+
+| topology | trainable | ckpt off | ckpt on |
+|---|---:|---|---|
+| LoRA last 6, q/v r8 | 2.91M | 888 ms, 5.88 GiB | — |
+| LoRA all 12, q/v r8 | 3.06M | 1,294 ms, 9.21 GiB | 1,620 ms, 3.65 GiB |
+| vb6 + LoRA first 6 | 45.44M | 1,334 ms, 10.26 GiB | 1,656 ms, 3.93 GiB |
+| *vb6, for reference* | 45.29M | 1,051 ms, 6.91 GiB | — |
+| *vb12, for reference* | 87.8M | **OOM** | 1,737 ms, 4.23 GiB |
+
+**Both fit uncheckpointed**, so neither L6 arm carries L4c's confound. All-12
+LoRA spans the same blocks as vb12 and yet sits at 9.21 GiB where vb12 OOMs
+above 11.6. Weight gradients and Adam moments for 87.8M parameters only account
+for ~1 GB of that; the larger term is almost certainly that a *frozen* linear
+does not need its input activation retained — only the weight is needed to
+propagate the input gradient — so the 3,072-wide MLP inputs stop being saved in
+all 12 blocks. Not measured directly, but it is the only term of the right size.
+
+**But LoRA is not cheap here, and that is the practically important result.**
+All-12 LoRA has 15x fewer trainable parameters than vb6 and is *slower*
+(1,294 vs 1,051 ms/step) and *hungrier* (9.21 vs 6.91 GiB), because an adapter on
+block 0 forces backward through the whole tower while vb6 stops halfway. The only
+thing the parameter reduction buys is checkpoint size: **12 MB vs 173 MB** for
+`final.pth`, and **36 MB vs 521 MB** for `last.pth`, where the Adam moments
+dominate. That 14x storage saving is the only column LoRA wins here.
+
+Five manual smoke checks passed before launch: zero-init `B` reproduces
+pretrained OWLv2 bit-exactly, gradients reach only the adapters/heads/two norms,
+save→reload is exact, the PEFT merge matches the unmerged model to 8.6e-4 on
+logits, and the trainable counts hit the plan's table exactly (2,912,007 /
+3,059,463 / 45,439,239). One check needed correcting rather than the code:
+`lora_A` legitimately receives a **zero gradient on the first step**, because
+`dL/dA` is a function of `B` and `B` is zero-initialised. It is non-zero from
+step two.
+
+### L6d — all 12 blocks at rank 8 (2026-08-09)
+
+| arm | trainable | annealed 4,500 | vs. vb6 | `map_75` |
+|---|---:|---:|---:|---:|
+| vb6 (L4b) | 45.29M | 0.4865 | — | 0.5437 |
+| **LoRA all 12, r8** | **3.06M** | **0.4827** | **−0.0038** | 0.5347 |
+| *vb12 full (L4c)* | *87.8M* | *0.4431* | *−0.0434* | *0.4900* |
+
+**Rank-8 constraint cures the vb12 collapse.** At identical depth, constraining
+each update to a rank-8 subspace turns L4c's −0.0434 into −0.0038: **+0.0396**,
+with a smooth monotone curve and no crash at step 1,575. This is direct support
+for the mechanism proposed in Phase 4 — vb12 failed from *update freedom* at the
+early blocks, not from depth. It is mechanism, not a ranking: trainable capacity
+differs by 29x, so the two are not otherwise comparable.
+
+The delta diagnostic confirms the early adapters were actually used rather than
+merely harmless. Final `||ΔW||_F / ||W||_F`:
+
+| block | 0 | 3 | 7 | 9 | 11 |
+|---|---:|---:|---:|---:|---:|
+| `q_proj` | 0.0117 | 0.0102 | 0.0132 | 0.0503 | 0.0735 |
+| `v_proj` | 0.0308 | 0.0176 | 0.0231 | 0.0294 | 0.0395 |
+
+Late blocks move ~4x more than early ones on `q_proj`, but nothing is near zero —
+block 0's `v_proj` is the third-largest `v` delta in the tower.
+
+**Against the decision table, 0.4827 is a measurable loss** — it misses the
+0.4835 tie boundary by 0.0008, and sits ~4x the annealed noise floor below vb6.
+Combined with the runtime and memory numbers above, the pure-LoRA branch is
+unattractive on this dataset: it is worse on accuracy, wall clock and memory, and
+better only on disk.
+
+Two further observations, both about reading curves:
+
+- **L6d led vb6 by +0.0215 at step 1,350** (0.4689 vs 0.4474) and finished
+  0.0038 behind. A fourth instance of the "only compare annealed" rule paying
+  for itself.
+- **Low-rank Q/V converges fast and caps out.** From step 2,700 to 4,500 L6d
+  gains +0.0074 while vb6 gains +0.0169 over the same span.
+
+### L6f — the hybrid, and the best result on this dataset (2026-08-09)
+
+Full last six at 1e-5 (unchanged from vb6) plus Q/V LoRA on the first six at
+1e-4. This adds 147,456 parameters to vb6, a 0.3% increase, so it is not a
+capacity story.
+
+| arm | annealed 4,500 | vs. vb6 | `map_50` | `map_75` | `map_medium` | `map_large` |
+|---|---:|---:|---:|---:|---:|---:|
+| vb6 (L4b) | 0.4865 | — | 0.7215 | 0.5437 | 0.4061 | 0.5001 |
+| **vb6 + LoRA first 6** | **0.4949** | **+0.0083** | 0.7263 | **0.5538** | 0.4080 | 0.5083 |
+
+**+0.0083 is ~8x the annealed noise floor and the largest single gain since
+vb2 → vb6.** It is localisation-led — `map_75` gains +0.0101, more than the
+headline — which is vb6's own signature, and it holds across `map_50`,
+`map_medium` and `map_large`. The curve is healthy: monotone into the anneal,
+best 0.4951 at step 4,275 against 0.4949 at 4,500, no turnover.
+
+The first-six deltas are the same magnitude as L6d's (`q` 0.009–0.012, `v`
+0.015–0.027), so the early blocks did real work here too.
+
+**The interpretation, if it confirms: vb6 was an optimisation boundary, not a
+representational one.** Phase 4 established that the depth curve is an inverted U
+peaking at half the tower, and read vb12's failure as instability. L6f says the
+early blocks *do* hold useful signal for this dataset — it was only ever the
+size of the step that broke them.
+
+**Confound check.** L4b predates the LoRA commit (8510abe), so the comparison was
+audited rather than assumed: `gpu_augment.py` is untouched since L4b, the newly
+exposed `--scale-augment` default reproduces L4b's exact transform list, and the
+new `class_weights` path multiplies by exactly 1.0 when unset, which is bit-exact.
+The only difference between L4b and L6f is the adapters.
+
+## Phase L8 — seed confirmation of the hybrid (2026-08-10)
+
+A +0.0083 gain selected on a 400-image val slice needs a matched second seed, so
+**L8a** (hybrid, seed 1) and **L8b** (vb6, seed 1) were run as a pair. The rule
+set in advance: claim the gain only if the hybrid wins in *both* seeds and the
+mean gain is at least 0.003.
+
+### L8b — the vb6 control, and a much better noise-floor estimate
+
+| vb6 | annealed 4,500 |
+|---|---:|
+| seed 0 (L4b) | 0.4865 |
+| seed 1 (L8b) | 0.4858 |
+| \|Δ\| | **0.0007** |
+
+**This is the fourth independent seed pair to land inside the ±0.001 annealed
+floor** (after L0c, L2b and L3c), and the first one measured on the vb6 recipe
+itself. It matters because every LoRA comparison is scored against vb6.
+
+The mid-run spread is the widest the project has recorded:
+
+| | annealed | mid-run mean | mid-run max |
+|---|---:|---:|---:|
+| vb6 seed pair | 0.0007 | 0.0086 | **0.0472** (step 675) |
+
+**0.0472 at step 675 is 67x the annealed difference**, and well beyond the
+0.0125–0.0180 peaks seen in L0c, L2b and L3c. Seed 1 dips to 0.3791 at step 675
+while seed 0 sits at 0.4263 — the same recipe, the same data, a gap **larger than
+the entire vb0 → vb6 depth effect (0.0562)**. Any conclusion drawn from a
+truncated run on this dataset is worthless.
+
+Worth noting that L0c's mid-run peak was *also* at step 675. Two unrelated
+recipes hitting their widest seed spread at the same step suggests something
+structural early in the schedule — warmup ends at step 100 and the first LR decay
+is still shallow there — rather than coincidence.
+
+### L8a — the hybrid confirms
+
+| seed | vb6 | hybrid | Δ |
+|---|---:|---:|---:|
+| 0 | 0.4865 (L4b) | 0.4949 (L6f) | **+0.0083** |
+| 1 | 0.4858 (L8b) | **0.4974** (L8a) | **+0.0115** |
+| mean | 0.4862 | **0.4962** | **+0.0099** |
+
+**The gain is confirmed on the pre-registered rule**: the hybrid wins in both
+seeds and the mean gain of +0.0099 is over 3x the 0.003 threshold. Seed 1
+reproduces the shape of seed 0 as well as its sign — `map_75` +0.0088,
+`map_medium` +0.0095, `map_large` +0.0146, and `map_small` −0.0013, which is
+inside its own ±0.011 noise and should be ignored as always.
+
+**Full last six at 1e-5 plus Q/V rank-8 LoRA on the first six at 1e-4 is the best
+recipe found on LV-MHP**, and 0.4974 is the best single number the project has
+produced on this dataset.
+
+**It also beats `large`.** Phase 5's large vb6 reached 0.4903 for 3.7x the wall
+clock; the hybrid on base averages 0.4962 across two seeds at roughly a quarter
+of large's cost. The cheapest remaining upgrade for this dataset is no longer
+model scale.
+
+One caveat to carry forward: **the hybrid is less seed-stable than vb6.** Its
+seed spread is 0.0025 against vb6's 0.0007 — still small, but 2.5x the annealed
+floor and enough that a single hybrid run should not be quoted to four decimals.
+The mean of the two seeds is the honest number.
+
+### Phase L6/L8 verdict
+
+| question | answer |
+|---|---|
+| Can Q/V LoRA replace full tuning at the same depth? | Untested at six blocks; **at 12 blocks it loses 0.0038** |
+| Does LoRA make training cheaper? | **No.** Slower and hungrier than vb6; 14x smaller checkpoints only |
+| Do early blocks help if the update is constrained? | **Yes — +0.0099, confirmed on two seeds** |
+| Was vb12's collapse depth or update freedom? | **Update freedom.** Rank 8 at the same depth recovers +0.0396 |
+| Is vb6 the depth optimum? | **No — it was an optimisation boundary.** The early blocks hold usable signal |
+
 ## Where the project stands
 
-Best on LV-MHP: **0.4903 (large vb6)**, and **0.4865 (base vb6)** at a quarter of
-the cost, which is the number to build on.
+Best on LV-MHP: **0.4974 (base, vb6 + Q/V rank-8 LoRA on the first six blocks,
+seed 1)**, mean **0.4962** over two seeds. That is ahead of large vb6 (0.4903) at
+roughly a quarter of the cost, so **base with the hybrid recipe is now the thing
+to build on**, and model scale is no longer the obvious upgrade.
 
 The full chain on base: **0.2348** zero-shot (18 cls) → **0.2950** lateral merge
-→ **0.4706** trained at vb2 → **0.4865** at vb6. Training is worth +0.19 over
-zero-shot on the merged class set, and of the levers actually tested, exactly two
-mattered: the **class-set merge** (+0.060 free, and it is a metric change, not
-learning) and **vision depth** (+0.056 from vb0 to vb6). Mosaic, native merged
-training, batch size and model scale were each worth ≤0.004.
+→ **0.4706** trained at vb2 → **0.4865** at vb6 → **0.4962** hybrid. Of the levers
+actually tested, exactly three mattered: the **class-set merge** (+0.060 free, a
+metric change rather than learning), **vision depth** (+0.056 from vb0 to vb6),
+and **constrained early-layer adaptation** (+0.0099, two seeds). Mosaic, native
+merged training, batch size and model scale were each worth ≤0.004.
+
+The depth story ends up different from the Phase 4 verdict. The inverted U was
+real but it was an **artefact of the optimiser, not the representation**: given a
+rank-8 update the early blocks contribute, and given a full-rank one at the same
+LR they destroy the tower. Phase 4's "depth is saturated at vb6" should be read
+as "depth is saturated at vb6 *for full-rank updates at 1e-5*".
 
 Open, in rough order of expected value:
 
-1. **vb12 at a reduced vision LR**, or per-block LR decay — L4c's collapse is
-   instability, not capacity, so the depth optimum may not really be vb6.
-2. **large at vb12** — the fair version of phase 5, ~8 h and needs a memory plan.
-3. **vb6 + `--grad-checkpointing`** (~1.4 h) to close the L4c confound.
-4. The downscale-mosaic + no-aug-tail cell, to complete the 2x2.
-5. A final confirmation on the **official test list** (`--val-source test`), which
+1. **The rest of the L6 block** — L6e (hybrid at LoRA LR 3e-5) is the most
+   valuable single cell left: it says whether +0.0099 is LR-robust or a lucky
+   1e-4. L6a/L6b/L6c complete the pure-LoRA picture but that branch already looks
+   unattractive.
+2. **Rank and target expansion on the hybrid** — now justified, since the gain is
+   confirmed. Rank 4/16 at `alpha=rank`, then K/O or MLP targets.
+3. **vb12 at a reduced vision LR**, or per-block LR decay. The hybrid partly
+   answers this already: constraining the early update is what mattered, and LR
+   decay is the other way to do it.
+4. **large with the hybrid recipe** — Phase 5's fairness caveat still stands
+   (vb6 is 25% of large's tower vs 50% of base's), and the hybrid gives a
+   principled way to reach deeper without instability.
+5. **vb6 + `--grad-checkpointing`** (~1.4 h) to close the L4c confound. Note the
+   L6 arms did *not* need checkpointing, so they carry no such confound.
+6. A final confirmation on the **official test list** (`--val-source test`), which
    the run plan reserved and which nothing has been tuned on. Everything above is
    measured on the seeded 400-image val slice.

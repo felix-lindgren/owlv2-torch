@@ -50,6 +50,7 @@ from prototype_train.gpu_augment import BatchAugmentor
 from prototype_train.train_text import (
     AERIAL_PROMPT_TEMPLATES,
     DEFAULT_PROMPT_TEMPLATES,
+    VISION_LORA_TARGETS,
     TextQueryDetector,
     build_prompt_pools,
     configure_trainable_parameter_groups,
@@ -149,6 +150,19 @@ def synthetic_target_pool(
     return pool, [f"class {index}" for index in range(num_classes)]
 
 
+def lora_label(args) -> str:
+    """Compact topology label, e.g. ``first6 qv r8`` or ``off``."""
+    if not args.vision_lora_blocks:
+        return "off"
+    targets = "".join(
+        target.split("_")[0][0] for target in args.vision_lora_targets
+    )
+    return (
+        f"{args.vision_lora_placement}{args.vision_lora_blocks} "
+        f"{targets} r{args.vision_lora_rank}"
+    )
+
+
 def run_cell(args) -> dict:
     """Measure one (vision_blocks, batch_size, compile, checkpointing) configuration."""
     device = torch.device(args.device)
@@ -176,6 +190,13 @@ def run_cell(args) -> dict:
         train_objectness_head=True,
         vision_blocks=args.vision_blocks,
         text_blocks=0,
+        vision_lora_blocks=args.vision_lora_blocks,
+        vision_lora_placement=args.vision_lora_placement,
+        vision_lora_targets=list(args.vision_lora_targets),
+        vision_lora_rank=args.vision_lora_rank,
+        vision_lora_alpha=args.vision_lora_alpha,
+        vision_lora_dropout=args.vision_lora_dropout,
+        vision_lora_learning_rate=args.vision_lora_learning_rate,
     )
     parameter_groups = configure_trainable_parameter_groups(model, trainer_args)
     if args.grad_checkpointing:
@@ -254,9 +275,17 @@ def run_cell(args) -> dict:
         optimizer.zero_grad(set_to_none=True)
 
     trainable_count = sum(parameter.numel() for parameter in trainable_parameters)
+    lora_count = sum(
+        parameter.numel()
+        for group in parameter_groups
+        if group["name"] == "vision_lora"
+        for parameter in group["params"]
+    )
     result = {
         "model_type": args.model_type,
         "vision_blocks": args.vision_blocks,
+        "vision_lora": lora_label(args),
+        "lora_parameters": lora_count,
         "batch_size": args.batch_size,
         "compile": bool(args.compile),
         "grad_checkpointing": bool(args.grad_checkpointing),
@@ -305,15 +334,16 @@ def run_cell(args) -> dict:
 
 def format_table(results: list[dict], epoch_images: int, project_steps: int) -> str:
     header = (
-        "| vb | bs | compile | ckpt | step ms | sd | ms/sample | img/s | "
+        "| vb | lora | bs | compile | ckpt | step ms | sd | ms/sample | img/s | "
         f"peak alloc | peak resv | 1st step | {epoch_images}-img epoch | "
         f"{project_steps} steps |"
     )
-    lines = [header, "|" + "---|" * 13]
+    lines = [header, "|" + "---|" * 14]
     for result in results:
         if result["status"] != "ok":
             lines.append(
-                f"| {result['vision_blocks']} | {result['batch_size']} | "
+                f"| {result['vision_blocks']} | {result.get('vision_lora', 'off')} | "
+                f"{result['batch_size']} | "
                 f"{'on' if result['compile'] else 'off'} | "
                 f"{'on' if result['grad_checkpointing'] else 'off'} | "
                 f"**{result['status'].upper()}** | | | | | | | | |"
@@ -324,7 +354,8 @@ def format_table(results: list[dict], epoch_images: int, project_steps: int) -> 
         epoch_minutes = epoch_images / images_per_second / 60.0
         project_hours = project_steps * step_s / 3600.0
         lines.append(
-            f"| {result['vision_blocks']} | {result['batch_size']} | "
+            f"| {result['vision_blocks']} | {result.get('vision_lora', 'off')} | "
+            f"{result['batch_size']} | "
             f"{'on' if result['compile'] else 'off'} | "
             f"{'on' if result['grad_checkpointing'] else 'off'} | "
             f"{result['step_ms']:.0f} | {result['step_ms_sd']:.0f} | "
@@ -367,6 +398,28 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-classes", type=int, default=18)
     parser.add_argument("--vision-blocks", type=int, nargs="+", default=[0, 2, 6])
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[8, 16, 32])
+    # LoRA topology is held fixed across the grid: an adapter changes the backward
+    # span, so mixing topologies into one grid would confound the memory column.
+    parser.add_argument(
+        "--vision-lora-blocks",
+        type=int,
+        default=0,
+        help="Number of vision blocks receiving LoRA in every cell; 0 disables it.",
+    )
+    parser.add_argument(
+        "--vision-lora-placement", choices=("first", "last"), default="last"
+    )
+    parser.add_argument(
+        "--vision-lora-targets",
+        nargs="+",
+        choices=VISION_LORA_TARGETS,
+        default=["q_proj", "v_proj"],
+        metavar="TARGET",
+    )
+    parser.add_argument("--vision-lora-rank", type=int, default=8)
+    parser.add_argument("--vision-lora-alpha", type=float, default=8.0)
+    parser.add_argument("--vision-lora-dropout", type=float, default=0.0)
+    parser.add_argument("--vision-lora-learning-rate", type=float, default=1e-4)
     parser.add_argument(
         "--compile-modes",
         nargs="+",
@@ -431,6 +484,13 @@ def cell_command(args, vision_blocks: int, batch_size: int, compiled: bool, ckpt
         "--target-images", str(args.target_images),
         "--boxes-per-image", str(args.boxes_per_image),
         "--num-classes", str(args.num_classes),
+        "--vision-lora-blocks", str(args.vision_lora_blocks),
+        "--vision-lora-placement", args.vision_lora_placement,
+        "--vision-lora-rank", str(args.vision_lora_rank),
+        "--vision-lora-alpha", str(args.vision_lora_alpha),
+        "--vision-lora-dropout", str(args.vision_lora_dropout),
+        "--vision-lora-learning-rate", str(args.vision_lora_learning_rate),
+        "--vision-lora-targets", *args.vision_lora_targets,
     ]
     if args.density_quantiles:
         command += ["--density-quantiles", *map(str, args.density_quantiles)]
@@ -467,7 +527,8 @@ def main(argv: list[str] | None = None) -> None:
     print(
         f"{len(cells)} cells on {args.device}: "
         f"vb={args.vision_blocks} x bs={args.batch_sizes} x "
-        f"compile={args.compile_modes} x ckpt={args.grad_ckpt_modes}"
+        f"compile={args.compile_modes} x ckpt={args.grad_ckpt_modes}, "
+        f"lora={lora_label(args)}"
     )
 
     results = []

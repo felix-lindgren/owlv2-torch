@@ -1,7 +1,10 @@
 # Run plan — vision LoRA on OWLv2-base / LV-MHP-v1
 
-Status: implementation ready; experimental checkpoints have not yet been
-produced. The CLI and checkpoint requirements below define the experiment.
+Status (2026-08-10): implemented and partly executed. **L6d and L6f are done**
+and **L8a/L8b are the confirmation pair**; results live in
+`docs/lvmhp-findings.md`, not here. L6a/L6b/L6c/L6e are still open. The headline
+so far is that the hybrid (L6f) beat vb6 by +0.0083 and pure all-12 LoRA lost by
+0.0038 while costing more time and memory than vb6.
 
 This is a continuation of `docs/lvmhp-run-plan.md`, not a replacement for it.
 The completed results and their full trajectories remain in

@@ -1,7 +1,7 @@
 # What LV-MHP taught — the short version
 
 Full detail in `docs/lvmhp-findings.md`. This is the transferable part, written
-for the next dataset. Five phases, ~20 GPU-hours, OWLv2-base on 3,600 images.
+for the next dataset. Seven phases, ~27 GPU-hours, OWLv2-base on 3,600 images.
 
 ## The result
 
@@ -10,20 +10,30 @@ for the next dataset. Five phases, ~20 GPU-hours, OWLv2-base on 3,600 images.
 | zero-shot, 18 classes | 0.2348 |
 | merge 3 lateral class pairs (no training) | 0.2950 |
 | train, `--vision-blocks 2` | 0.4706 |
-| train, `--vision-blocks 6` | **0.4865** |
+| train, `--vision-blocks 6` | 0.4865 |
 | same recipe on `--model-type large` | 0.4903 |
+| vb6 + Q/V rank-8 LoRA on the first six blocks | **0.4962** (2 seeds) |
 
 ## Of everything tested, two things mattered
 
-**1. Vision depth, and it is an inverted U.** vb0 0.4303 / vb2 0.4706 / **vb6
-0.4865** / vb12 0.4431, with vision LR held at 1e-5 throughout. Unfreezing six
-blocks was the single most valuable setting found in the project. Both of the run
-plan's predictions were wrong: head-only did not win, and vb6 did not overfit.
+**1. Vision depth — an inverted U that turned out to be the optimiser's fault.**
+vb0 0.4303 / vb2 0.4706 / **vb6 0.4865** / vb12 0.4431, with vision LR held at
+1e-5 throughout. Unfreezing six blocks was the single most valuable setting found
+in the project. Both of the run plan's predictions were wrong: head-only did not
+win, and vb6 did not overfit.
 
 vb12's collapse is **instability, not overfitting** — it climbs to 0.4168 by step
 900, crashes to 0.3591 at 1,575, then recovers and is still improving at the
 final step. Updating the earliest blocks at an LR suited to the last six appears
 to damage the pretrained representation.
+
+**This was later confirmed and then exploited.** Rank-8 Q/V LoRA at the same
+depth turns vb12's 0.4431 into 0.4827 — no collapse — and adding that constrained
+update to vb6's first six blocks gives **+0.0099 over vb6 on two seeds**. So the
+inverted U was an optimiser artefact, not a property of the representation: the
+early blocks do hold usable signal, and the only thing wrong with vb12 was the
+size of the step. When a depth ladder turns over, **suspect the update before you
+conclude the layers are useless**.
 
 **2. The class set, which is arithmetic and not learning.** Merging three
 left/right pairs was **+0.060 zero-shot and +0.108 on trained weights**, with no
@@ -67,8 +77,23 @@ the right tile at the wrong offset is invisible. Test augmentation with
 sub-image boxes over spatially varying content, and *check a new metric is
 actually populated* before trusting it.
 
+## LoRA is not the cheap option people assume
+
+Worth knowing before planning the next adaptation budget. Pure Q/V rank-8 LoRA on
+all 12 blocks has **15x fewer trainable parameters than vb6 and is still worse on
+every axis except disk**: −0.0038 mAP, 1,294 vs 1,051 ms/step, 9.21 vs 6.91 GiB
+peak. An adapter on block 0 forces backward through the entire tower, while vb6
+stops halfway — so parameter count is simply the wrong proxy for training cost.
+What LoRA does buy is checkpoints: 12 MB vs 173 MB, and 36 MB vs 521 MB with
+optimiser state.
+
+The corollary is that LoRA earned its place here as an **accuracy** tool, not an
+efficiency one: the value was in constraining *where* full-rank updates were
+unsafe, not in training fewer parameters.
+
 ## What is genuinely untested
 
-Per-block LR decay (the obvious fix for vb12), large at a matched depth ratio
-(vb6 is half of base's tower but a quarter of large's), and the official test
-list — every number above is on a seeded 400-image val slice.
+Per-block LR decay, LoRA rank and target expansion on the winning hybrid, whether
+the hybrid's gain survives at a different LoRA LR (only 1e-4 was run), large at a
+matched depth ratio (vb6 is half of base's tower but a quarter of large's), and
+the official test list — every number above is on a seeded 400-image val slice.
