@@ -1,6 +1,7 @@
 *.safetensors
 __pycache__
 *.onnx
+*.onnx.data
 *.engine
 *.png
 *.egg-info
