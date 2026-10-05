@@ -8,9 +8,10 @@ from typing import Optional
 
 import numpy as np
 from tinygrad import Tensor, dtypes, nn
-from tinygrad.nn.state import load_state_dict, safe_load
+from tinygrad.nn.state import get_state_dict, load_state_dict, safe_load
 from huggingface_hub.file_download import hf_hub_download
 
+from OWLv2torch.tinygrad_version.flash_attention import flash_attention, flash_attention_supported
 from OWLv2torch.utils.hf_hub_utils import find_safetensors_in_cache
 
 MODEL_CONFIGS = {
@@ -28,19 +29,30 @@ MODEL_CONFIGS = {
     ),
 }
 
-F32_MIN = float(np.finfo(np.float32).min)
+
+def _finfo_min(dtype) -> float:
+    """Most negative finite value of a float dtype, like ``torch.finfo(dtype).min``."""
+    return float(np.finfo(np.float16 if dtype == dtypes.half else np.float32).min)
+
+
+class LayerNorm(nn.LayerNorm):
+    """Normalises in fp32 and casts back, as torch's half-precision layer_norm does internally."""
+
+    def __call__(self, x: Tensor) -> Tensor:
+        y = x.float().layernorm(eps=self.eps, axis=self.axis).cast(x.dtype)
+        return y * self.weight + self.bias
 
 
 def _l2_normalize(x: Tensor) -> Tensor:
     return x / (x.square().sum(axis=-1, keepdim=True).sqrt() + 1e-6)
 
 
-def build_causal_padding_mask(input_ids: Tensor) -> Tensor:
+def build_causal_padding_mask(input_ids: Tensor, dtype=dtypes.float32) -> Tensor:
     """[B, 1, L, L] additive causal + padding mask; pad id is 0 (see the torch version)."""
     B, L = input_ids.shape
     causal = Tensor.ones(L, L, dtype=dtypes.bool).triu(1).reshape(1, 1, L, L)
     pad = (input_ids == 0).reshape(B, 1, 1, L)
-    return (causal | pad).where(F32_MIN, 0.0).cast(dtypes.float32)
+    return (causal | pad).where(_finfo_min(dtype), 0.0).cast(dtype)
 
 
 class Attention:
@@ -52,8 +64,12 @@ class Attention:
         self.q_proj = nn.Linear(hidden_size, hidden_size)
         self.out_proj = nn.Linear(hidden_size, hidden_size)
 
-    def __call__(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+    def __call__(self, x: Tensor, mask: Optional[Tensor] = None, flash_num_valid: Optional[int] = None) -> Tensor:
+        """``flash_num_valid`` switches to the fused kernel, masking keys at positions >= it (``mask`` is ignored)."""
         B, L, D = x.shape
+        if flash_num_valid is not None:
+            out = flash_attention(self.q_proj(x), self.k_proj(x), self.v_proj(x), self.num_heads, flash_num_valid)
+            return self.out_proj(out)
         q, k, v = [
             p(x).reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
             for p in (self.q_proj, self.k_proj, self.v_proj)
@@ -75,12 +91,12 @@ class MLP:
 class EncoderLayer:
     def __init__(self, hidden_size, num_heads, mlp_dim):
         self.self_attn = Attention(hidden_size, num_heads)
-        self.layer_norm1 = nn.LayerNorm(hidden_size, eps=1e-5)
+        self.layer_norm1 = LayerNorm(hidden_size, eps=1e-5)
         self.mlp = MLP(hidden_size, mlp_dim)
-        self.layer_norm2 = nn.LayerNorm(hidden_size, eps=1e-5)
+        self.layer_norm2 = LayerNorm(hidden_size, eps=1e-5)
 
-    def __call__(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
-        x = x + self.self_attn(self.layer_norm1(x), mask)
+    def __call__(self, x: Tensor, mask: Optional[Tensor] = None, flash_num_valid: Optional[int] = None) -> Tensor:
+        x = x + self.self_attn(self.layer_norm1(x), mask, flash_num_valid)
         return x + self.mlp(self.layer_norm2(x))
 
 
@@ -88,9 +104,9 @@ class Encoder:
     def __init__(self, hidden_size, num_layers, num_heads, mlp_dim):
         self.layers = [EncoderLayer(hidden_size, num_heads, mlp_dim) for _ in range(num_layers)]
 
-    def __call__(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+    def __call__(self, x: Tensor, mask: Optional[Tensor] = None, flash_num_valid: Optional[int] = None) -> Tensor:
         for layer in self.layers:
-            x = layer(x, mask)
+            x = layer(x, mask, flash_num_valid)
         return x
 
 
@@ -100,13 +116,16 @@ class VisionTower:
         self.patch_embedding = nn.Conv2d(3, hidden_size, kernel_size=patch_size, stride=patch_size, bias=False)
         self.num_positions = (image_size // patch_size) ** 2 + 1
         self.position_embedding = nn.Embedding(self.num_positions, hidden_size)
-        self.pre_layernorm = nn.LayerNorm(hidden_size, eps=1e-5)
-        self.post_layernorm = nn.LayerNorm(hidden_size, eps=1e-5)
+        self.pre_layernorm = LayerNorm(hidden_size, eps=1e-5)
+        self.post_layernorm = LayerNorm(hidden_size, eps=1e-5)
         self.encoder = Encoder(hidden_size, num_layers, num_heads, mlp_dim)
         # The sequence (P*P + 1 tokens, 3601 for base) is zero-padded up to a
         # multiple of this so the encoder's kernels get well-shaped dims; the
         # padded keys are masked out and the padded rows dropped. 1 disables it.
         self.seq_pad_multiple = 32
+        self.head_dim = hidden_size // num_heads
+        # Use the fused fp16 attention kernel when the device/dtype support it.
+        self.use_flash_attention = True
 
     def __call__(self, x: Tensor):
         B = x.shape[0]
@@ -118,11 +137,16 @@ class VisionTower:
 
         N = self.num_positions
         pad = -N % self.seq_pad_multiple
-        mask = None
         if pad:
             embeddings = embeddings.pad((None, (0, pad), None))
-            mask = (Tensor.arange(N + pad) >= N).where(F32_MIN, 0.0).reshape(1, 1, 1, N + pad)
-        x = self.encoder(embeddings, mask)
+        if self.use_flash_attention and flash_attention_supported(embeddings, self.head_dim):
+            x = self.encoder(embeddings, flash_num_valid=N)
+        else:
+            mask = None
+            if pad:
+                mask = (Tensor.arange(N + pad) >= N).where(_finfo_min(embeddings.dtype), 0.0)
+                mask = mask.cast(embeddings.dtype).reshape(1, 1, 1, N + pad)
+            x = self.encoder(embeddings, mask)
         if pad:
             # contiguous() keeps the slice from being fused back into the last
             # layer, which would hand its kernels the unpadded length again.
@@ -135,13 +159,13 @@ class TextTower:
     def __init__(self, hidden_size, num_positions, vocab_size, num_layers, num_heads, mlp_dim):
         self.position_embedding = nn.Embedding(num_positions, hidden_size)
         self.token_embedding = nn.Embedding(vocab_size, hidden_size)
-        self.final_layer_norm = nn.LayerNorm(hidden_size)
+        self.final_layer_norm = LayerNorm(hidden_size)
         self.encoder = Encoder(hidden_size, num_layers, num_heads, mlp_dim)
 
     def __call__(self, input_ids: Tensor):
         L = input_ids.shape[-1]
         hidden = self.token_embedding(input_ids) + self.position_embedding.weight[:L].unsqueeze(0)
-        encoder_outputs = self.encoder(hidden, build_causal_padding_mask(input_ids))
+        encoder_outputs = self.encoder(hidden, build_causal_padding_mask(input_ids, hidden.dtype))
         last_hidden_state = self.final_layer_norm(encoder_outputs)
         # Features from the end-of-text token (highest id under CLIP's tokenizer).
         eot = input_ids.argmax(axis=-1).reshape(-1, 1, 1).expand(-1, 1, last_hidden_state.shape[-1])
@@ -186,12 +210,17 @@ class ClassPredictionHead:
         if query_mask is not None:
             if query_mask.ndim > 1:
                 query_mask = query_mask.unsqueeze(-2)
-            pred_logits = query_mask.where(pred_logits, F32_MIN)
+            pred_logits = query_mask.where(pred_logits, _finfo_min(pred_logits.dtype))
         return pred_logits, image_class_embeds
 
 
 class OwlV2:
-    def __init__(self, model_type="base"):
+    def __init__(self, model_type="base", dtype=dtypes.float32, use_flash_attention=True):
+        """``dtype`` is the weight and activation dtype (``dtypes.float32`` or ``dtypes.half``).
+
+        ``use_flash_attention`` uses the fused fp16 kernel for the vision tower where supported
+        (fp16 on an sm_80+ CUDA/NV device); otherwise tinygrad's SDPA is used.
+        """
         cfg = MODEL_CONFIGS["base" if model_type == "base" else "large"]
         self.model_string = cfg["model_string"]
         self.projected_dim = cfg["project_dim"]
@@ -204,6 +233,7 @@ class OwlV2:
             hidden_size=self.vision_dim, patch_size=self.patch_size, image_size=self.image_size,
             num_layers=cfg["num_layers"], num_heads=cfg["num_heads"], mlp_dim=cfg["mlp_dim"],
         )
+        self.vision_model.use_flash_attention = use_flash_attention
         self.text_model = TextTower(
             hidden_size=self.text_dim, num_positions=16, vocab_size=49408,
             num_layers=cfg["num_text_layers"], num_heads=cfg["text_num_heads"], mlp_dim=cfg["text_mlp_dim"],
@@ -211,7 +241,7 @@ class OwlV2:
         self.visual_projection = nn.Linear(self.vision_dim, self.projected_dim, bias=False)
         self.text_projection = nn.Linear(self.text_dim, self.projected_dim, bias=False)
         self.logit_scale = Tensor(2.6592)
-        self.layer_norm = nn.LayerNorm(self.vision_dim, eps=1e-5)
+        self.layer_norm = LayerNorm(self.vision_dim, eps=1e-5)
 
         self.class_head = ClassPredictionHead(self.text_dim, self.vision_dim)
         self.box_head = BoxPredictionHead(self.vision_dim)
@@ -221,6 +251,11 @@ class OwlV2:
         self._load_model(self.model_string)
         # Not a checkpoint weight, so set after loading (strict load would want it).
         self.box_bias = Tensor(self.compute_box_bias(self.sqrt_num_patches)).realize()
+        self.dtype = dtype
+        if dtype != dtypes.float32:
+            # Like torch's module.to(dtype): every parameter and buffer, box_bias included.
+            for v in get_state_dict(self).values():
+                v.replace(v.cast(dtype).realize())
 
     def _load_model(self, model_path):
         cache_path = find_safetensors_in_cache(model_path)
@@ -254,7 +289,7 @@ class OwlV2:
         return Tensor(np.ascontiguousarray(x), dtype=dtype)
 
     def get_vision_features(self, pixel_values, normalize=True):
-        vision_pooled, vision_full = self.vision_model(self._as_tensor(pixel_values, dtypes.float32))
+        vision_pooled, vision_full = self.vision_model(self._as_tensor(pixel_values, self.dtype))
         vision_features = self.visual_projection(vision_pooled)
         if normalize:
             vision_features = _l2_normalize(vision_features)
@@ -284,7 +319,7 @@ class OwlV2:
 
     def forward_object_detection(self, pixel_values, token_ids, attention_mask=None):
         """``token_ids`` is a shared ``[Q, L]`` query set or batched ``[B, Q, L]``."""
-        pixel_values = self._as_tensor(pixel_values, dtypes.float32)
+        pixel_values = self._as_tensor(pixel_values, self.dtype)
         token_ids = self._as_tensor(token_ids, dtypes.int32)
         B = pixel_values.shape[0]
         if token_ids.ndim == 3:
@@ -300,7 +335,7 @@ class OwlV2:
         return self.forward_object_detection_from_embeddings(pixel_values, text_features, query_mask)
 
     def forward_object_detection_from_embeddings(self, pixel_values, query_embeds: Tensor, query_mask: Optional[Tensor] = None):
-        pixel_values = self._as_tensor(pixel_values, dtypes.float32)
+        pixel_values = self._as_tensor(pixel_values, self.dtype)
         B = pixel_values.shape[0]
         if query_embeds.ndim == 2:
             text_features = query_embeds.unsqueeze(0).expand(B, -1, -1)
