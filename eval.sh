@@ -1,14 +1,5 @@
 uv run python tools/test_dior_flame.py \
     --model-size base \
-    --shots 30 \
-    --support-images 8 \
-    --limit 100 \
-    --classes "Airplane" "Ship" \
-    --score-threshold 0.05 \
-    --score-combine refiner \
-    --classifier-threshold 0.2 \
-    --text-score-threshold 0.0 \
-    --svm-kernel rbf \
-    --seed 456 \
-    --image-loader-batch-size 128 \
-    --detect-batch-size 16
+    --support-images 5 \
+    --limit 500 \
+    --classes "Airplane" "Ship" "Chimney"

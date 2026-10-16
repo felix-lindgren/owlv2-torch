@@ -1,8 +1,6 @@
-"""Train per-class FLAME refiners on Fashionpedia train and evaluate on val.
+"""FLAME few-shot vs zero-shot OWLv2 on Fashionpedia (support from train, eval on val).
 
-This is the Fashionpedia entry point for the same few-shot pipeline used by
-``test_dior_flame.py``. Run with ``--classes`` during iteration; evaluating all
-46 categories trains and evaluates a separate refiner for every category.
+Same driver as ``test_dior_flame.py``; see it for ``--mode boxes`` / ``--mode active``.
 """
 
 from test_dior_flame import main

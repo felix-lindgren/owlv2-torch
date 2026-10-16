@@ -111,6 +111,70 @@ TensorRT 11 takes layer precision from the ONNX graph, so fp16 is chosen at
 export time (`fp16=True`, the default). Engines and fp32 ONNX files made with
 TensorRT 10 must be deleted and rebuilt.
 
+### Few-shot refinement (FLAME)
+
+`Flame` implements [FLAME](https://arxiv.org/abs/2510.17670): zero-shot OWLv2
+scores every patch, and a small RBF-SVM per query, trained on a few labelled
+proposals, corrects that score. The model itself is not trained: fitting 20
+DIOR classes from 100 example images took 21 s on an RTX 3060, most of it the
+forward passes.
+
+```python
+from OWLv2torch import Flame, OwlV2
+
+model = OwlV2("base").eval().to("cuda")
+flame = Flame(model, ["a satellite photo of a chimney", "a satellite photo of a dam"])
+
+# Give it a few images with every instance boxed (labels index the queries)...
+flame.add_example("a.jpg", boxes=[[x1, y1, x2, y2], [x1, y1, x2, y2]], labels=[0, 1])
+flame.add_example("b.jpg", boxes=[])  # an image containing none of them
+
+# ...or let it pick proposals to ask about and answer yes/no (the paper's active step).
+candidates = flame.suggest(unlabelled_images, k=30)  # k per query
+flame.add_labels(candidates, answers)                 # one bool per candidate
+
+flame.fit()
+boxes, scores, labels = flame.detect("test.jpg")      # threshold=0.01 by default
+flame.save("flame.pt")                                # Flame.load("flame.pt", model)
+```
+
+Boxes must cover every instance of every query in that image, because anything
+left unboxed is used as a negative. A query that ends up with no positives stays
+zero-shot. Refined scores are low in absolute terms: F1 peaked at thresholds of
+0.005-0.02 on both datasets below.
+
+`tools/test_dior_flame.py` and `tools/test_fashionpedia_flame.py` sample 5 train
+images per class, pool them (100 images for DIOR's 20 classes, 230 for
+Fashionpedia's 46), and evaluate on the whole DIOR test split (3463 images) or
+Fashionpedia val (1158 images):
+
+| | AP@[.5:.95] | AP50 |
+|---|---|---|
+| DIOR base, zero-shot | 0.069 | 0.122 |
+| DIOR base, FLAME with boxes | 0.303 | 0.490 |
+| DIOR base, FLAME active (30 yes/no answers per class) | 0.189 | 0.303 |
+| DIOR large, zero-shot | 0.100 | 0.167 |
+| DIOR large, FLAME with boxes | 0.333 | 0.535 |
+| Fashionpedia base, zero-shot | 0.216 | 0.289 |
+| Fashionpedia base, FLAME with boxes | 0.294 | 0.409 |
+
+With one class at a time on 3000 DIOR test images (`base`, 3 seeds), a single
+example image already doubles zero-shot AP (0.067 to 0.150), 3 images reach
+0.215 and 10 reach 0.262. From 3 images on, the only class that ever scored
+below zero-shot was bridge (0.007 zero-shot), and by less than 0.01.
+
+Where this departs from the paper, it is because the paper's version measured
+worse on DIOR (`base`, 5 images per class, 3 seeds):
+
+- The SVM margin is added to the zero-shot logit (`alpha=8`) instead of
+  replacing the score. With the same labels, the SVM score alone reached
+  0.064 AP and the sum 0.218.
+- `suggest` keeps the `4k` best zero-shot proposals and takes one per k-means
+  cluster. The paper's PCA + KDE density band picked about 2 positives out of 30
+  and did no better than k-means alone.
+- No SMOTE: class-balanced SVM weights already handle the imbalance, and SMOTE
+  did not help.
+
 ### Prototype-based detection
 
 Train lightweight visual prototype embeddings for custom object classes while keeping the full model frozen:
@@ -146,15 +210,15 @@ uv run --extra train python tools/test_fashionpedia.py \
   --model-size base
 ```
 
-Train FLAME refiners from Fashionpedia `train` support images and compare them
-with the zero-shot baseline on `val`:
+Fit FLAME on a few Fashionpedia `train` images per class and compare it with
+the zero-shot baseline on `val` (add `--mode active --shots 30` for the yes/no
+variant):
 
 ```bash
 uv run --extra train python tools/test_fashionpedia_flame.py \
   --model-size base \
   --classes "shirt, blouse" "shoe" \
-  --shots 30 \
-  --support-images 8
+  --support-images 5
 ```
 
 Omit `--classes` to run all 46 categories. Use `--limit` for a validation-set
@@ -260,6 +324,7 @@ Pass `--save-full-model` if a standalone full state dictionary is preferable.
 OWLv2torch/
   torch_version/      # Main PyTorch implementation
     owlv2.py          #   Model architecture and inference
+    flame.py           #   FLAME few-shot refinement (SVM on OWLv2 proposals)
     prototypes.py      #   Visual prototype bank for few-shot detection
     loss.py            #   Training losses (focal, NWD, Hungarian matching)
     owlv2_tensorrt.py  #   TensorRT wrapper
