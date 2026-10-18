@@ -35,7 +35,10 @@ if str(REPO_ROOT) not in sys.path:
 from OWLv2torch.torch_version.owlv2 import OwlV2
 from OWLv2torch.torch_version.text_loss import (
     CLASS_LOSS_CHOICES,
+    DEFAULT_MAX_TARGETS,
+    batched_text_query_losses,
     compute_text_query_losses,
+    pad_text_targets,
 )
 from OWLv2torch.utils.tokenizer import tokenize
 from prototype_train.gpu_augment import BatchAugmentor
@@ -267,17 +270,22 @@ class TextQueryDetector(nn.Module):
         token_ids = tokenize(evaluation_prompts, context_length=16, truncate=True)
         self.register_buffer("evaluation_token_ids", token_ids, persistent=False)
 
+    def tokenize_prompts(self, prompts: list[str], device: torch.device) -> torch.Tensor:
+        if len(prompts) != self.num_queries:
+            raise ValueError(
+                f"Expected {self.num_queries} prompts, got {len(prompts)}"
+            )
+        token_ids = tokenize(prompts, context_length=16, truncate=True)
+        if device.type == "cuda":
+            # A pageable host-to-device copy waits for the stream to drain.
+            token_ids = token_ids.pin_memory()
+        return token_ids.to(device, non_blocking=True)
+
     def forward(self, pixel_values: torch.Tensor, prompts: list[str] | None = None):
         if prompts is None:
             token_ids = self.evaluation_token_ids
         else:
-            if len(prompts) != self.num_queries:
-                raise ValueError(
-                    f"Expected {self.num_queries} prompts, got {len(prompts)}"
-                )
-            token_ids = tokenize(prompts, context_length=16, truncate=True).to(
-                pixel_values.device
-            )
+            token_ids = self.tokenize_prompts(prompts, pixel_values.device)
         attention_mask = token_ids == 0
         return self.owl.forward_object_detection(pixel_values, token_ids, attention_mask)
 
@@ -1052,6 +1060,34 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Compile the vision encoder for faster training (about 1.10x end-to-end).",
     )
+    parser.add_argument(
+        "--batched-loss",
+        action="store_true",
+        help=(
+            "Use the sync-free batched loss (GPU Hungarian matching, fixed "
+            "--max-targets slots). Same values as the per-image loss; only "
+            "--class-loss mal/vfl. About 5%% faster per step on base."
+        ),
+    )
+    parser.add_argument(
+        "--compile-step",
+        action="store_true",
+        help=(
+            "Compile the detection forward and the batched loss as one graph. "
+            "Implies --batched-loss; combine with --compile so evaluation keeps "
+            "the compiled encoder. About 8%% faster per step than --compile alone."
+        ),
+    )
+    parser.add_argument(
+        "--max-targets",
+        type=int,
+        default=DEFAULT_MAX_TARGETS,
+        help=(
+            "Target slots per image for --batched-loss. Must cover the most boxes "
+            "any training image has after augmentation (LV-MHP 119, Fashionpedia 74; "
+            "mosaic merges several images)."
+        ),
+    )
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument(
         "--grad-accum-steps",
@@ -1317,6 +1353,12 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("warmup_steps must be non-negative")
     if args.grad_accum_steps < 1:
         raise ValueError("grad_accum_steps must be at least 1")
+    if args.compile_step:
+        args.batched_loss = True
+    if args.batched_loss and args.class_loss not in ("mal", "vfl"):
+        raise ValueError("--batched-loss/--compile-step require --class-loss mal or vfl")
+    if args.max_targets < 1:
+        raise ValueError("max_targets must be at least 1")
     if args.vision_lora_blocks < 0:
         raise ValueError("vision_lora_blocks must be non-negative")
     for name in ("horizontal_flip_prob", "vertical_flip_prob"):
@@ -1349,6 +1391,8 @@ def main(argv: list[str] | None = None) -> None:
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available")
+    if args.batched_loss and device.type != "cuda":
+        raise ValueError("--batched-loss/--compile-step need a CUDA device (Triton matching)")
 
     # Read before the tracking run is opened so a resume can rejoin the run it
     # was interrupted in rather than starting a second one.
@@ -1702,6 +1746,29 @@ def main(argv: list[str] | None = None) -> None:
         amp_enabled = args.amp and device.type == "cuda"
         scaler = torch.amp.GradScaler(device.type, enabled=amp_enabled)
 
+        loss_options = {
+            "lambda_cls": args.lambda_class,
+            "lambda_l1": args.lambda_l1,
+            "lambda_giou": args.lambda_giou,
+            "lambda_objectness": args.lambda_objectness,
+            "negative_ratio": args.negative_ratio,
+            "max_negatives_per_image": args.max_negatives_per_image,
+            "class_loss": args.class_loss,
+            "class_loss_gamma": args.class_loss_gamma,
+            "class_loss_alpha": args.class_loss_alpha,
+            "class_weights": classification_weights,
+        }
+
+        def batched_step_losses(images, token_ids, target_boxes, target_labels, target_valid):
+            # Prompts are tokenised outside so a compiled step sees only tensors.
+            outputs = model.forward_object_detection(images, token_ids, token_ids == 0)
+            return batched_text_query_losses(
+                outputs, target_boxes, target_labels, target_valid, **loss_options
+            )
+
+        if args.compile_step:
+            batched_step_losses = torch.compile(batched_step_losses)
+
         trainable_count = sum(
             parameter.numel() for parameter in model.parameters() if parameter.requires_grad
         )
@@ -1958,22 +2025,20 @@ def main(argv: list[str] | None = None) -> None:
                     )
                 prompts = sample_prompt_set(prompt_pools, prompt_generator)
                 with torch.autocast(device_type=device.type, enabled=amp_enabled):
-                    outputs = detector(images, prompts=prompts)
-                    losses = compute_text_query_losses(
-                        outputs,
-                        targets,
-                        lambda_cls=args.lambda_class,
-                        lambda_l1=args.lambda_l1,
-                        lambda_giou=args.lambda_giou,
-                        lambda_objectness=args.lambda_objectness,
-                        negative_ratio=args.negative_ratio,
-                        max_negatives_per_image=args.max_negatives_per_image,
-                        negative_loss_weight=args.negative_loss_weight,
-                        class_loss=args.class_loss,
-                        class_loss_gamma=args.class_loss_gamma,
-                        class_loss_alpha=args.class_loss_alpha,
-                        class_weights=classification_weights,
-                    )
+                    if args.batched_loss:
+                        losses = batched_step_losses(
+                            images,
+                            detector.tokenize_prompts(prompts, device),
+                            *pad_text_targets(targets, args.max_targets, device),
+                        )
+                    else:
+                        outputs = detector(images, prompts=prompts)
+                        losses = compute_text_query_losses(
+                            outputs,
+                            targets,
+                            negative_loss_weight=args.negative_loss_weight,
+                            **loss_options,
+                        )
                 scaler.scale(losses["loss"] / window_size).backward()
                 for name, value in losses.items():
                     window_losses[name] = (

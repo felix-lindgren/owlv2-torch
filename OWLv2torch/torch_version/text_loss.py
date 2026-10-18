@@ -356,3 +356,255 @@ def compute_text_query_losses(
 
 def _mean_or_zero(values: list[torch.Tensor], zero: torch.Tensor) -> torch.Tensor:
     return torch.stack(values).mean() if values else zero
+
+
+DEFAULT_MAX_TARGETS = 128
+
+
+def pad_text_targets(
+    targets: list[dict[str, torch.Tensor]],
+    max_targets: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad per-image targets to fixed ``[B, max_targets]`` slots for the batched loss.
+
+    Returns normalised cxcywh boxes, labels, and a validity mask. Host targets are
+    padded on the CPU and copied once; device targets (e.g. after mosaic) are padded
+    in place on the device. Neither path syncs. Padded boxes get a small non-zero
+    size so their GIoU stays finite: a NaN in a masked slot would still poison the
+    masked sums.
+    """
+    counts = [target["boxes"].shape[0] for target in targets]
+    if max(counts, default=0) > max_targets:
+        raise ValueError(
+            f"An image has {max(counts)} boxes, more than max_targets={max_targets}; "
+            "raise --max-targets"
+        )
+    on_host = all(target["boxes"].device.type == "cpu" for target in targets)
+    build_device = torch.device("cpu") if on_host else device
+    batch_size = len(targets)
+    boxes = torch.zeros((batch_size, max_targets, 4), dtype=torch.float32, device=build_device)
+    boxes[..., 2:] = 1e-3
+    labels = torch.zeros((batch_size, max_targets), dtype=torch.long, device=build_device)
+    valid = torch.zeros((batch_size, max_targets), dtype=torch.bool, device=build_device)
+    for index, (target, count) in enumerate(zip(targets, counts)):
+        boxes[index, :count] = target["boxes"].to(device=build_device, dtype=torch.float32)
+        labels[index, :count] = target["labels"].to(device=build_device, dtype=torch.long)
+        valid[index, :count] = True
+    if on_host:
+        boxes, labels, valid = (
+            tensor.pin_memory().to(device, non_blocking=True)
+            for tensor in (boxes, labels, valid)
+        )
+    return boxes, labels, valid
+
+
+def _pairwise_iou_giou(
+    boxes_a: torch.Tensor, boxes_b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Broadcasting IoU and GIoU of xyxy boxes (torchvision's ops are 2-D only)."""
+    top_left = torch.maximum(boxes_a[..., :2], boxes_b[..., :2])
+    bottom_right = torch.minimum(boxes_a[..., 2:], boxes_b[..., 2:])
+    intersection = (bottom_right - top_left).clamp(min=0).prod(-1)
+    area_a = (boxes_a[..., 2:] - boxes_a[..., :2]).prod(-1)
+    area_b = (boxes_b[..., 2:] - boxes_b[..., :2]).prod(-1)
+    union = area_a + area_b - intersection
+    iou = intersection / union
+    hull = (
+        torch.maximum(boxes_a[..., 2:], boxes_b[..., 2:])
+        - torch.minimum(boxes_a[..., :2], boxes_b[..., :2])
+    ).prod(-1)
+    return iou, iou - (hull - union) / hull
+
+
+@torch.no_grad()
+def batched_match_cost(
+    class_logits: torch.Tensor,
+    pred_boxes: torch.Tensor,
+    target_boxes: torch.Tensor,
+    target_labels: torch.Tensor,
+    target_valid: torch.Tensor,
+    *,
+    class_cost: float = 1.0,
+    bbox_cost: float = 5.0,
+    giou_cost: float = 2.0,
+) -> torch.Tensor:
+    """:func:`hungarian_match_text`'s cost, laid out ``[B, max_targets, num_patches]``.
+
+    Padded target rows get a constant zero cost. A constant row cannot change the
+    optimal assignment of the real rows while there are at least as many patches as
+    target slots, so padding only adds trivially solved rows.
+    """
+    batch_size, num_patches, _ = class_logits.shape
+    probabilities = class_logits.float().sigmoid()
+    label_index = target_labels[:, None, :].expand(batch_size, num_patches, -1)
+    class_probability = probabilities.gather(2, label_index).transpose(1, 2)
+    boxes = pred_boxes.float()
+    _, giou = _pairwise_iou_giou(
+        box_cxcywh_to_xyxy(target_boxes)[:, :, None],
+        box_cxcywh_to_xyxy(boxes)[:, None],
+    )
+    cost = (
+        -class_cost * class_probability
+        + bbox_cost * torch.cdist(target_boxes, boxes, p=1)
+        + giou_cost * (1.0 - giou)
+    )
+    return cost.masked_fill(~target_valid[..., None], 0.0)
+
+
+def batched_text_query_losses(
+    outputs,
+    target_boxes: torch.Tensor,
+    target_labels: torch.Tensor,
+    target_valid: torch.Tensor,
+    *,
+    lambda_cls: float = 1.0,
+    lambda_l1: float = 5.0,
+    lambda_giou: float = 2.0,
+    lambda_objectness: float = 0.5,
+    match_class_cost: float = 1.0,
+    match_bbox_cost: float = 5.0,
+    match_giou_cost: float = 2.0,
+    negative_ratio: int = 5,
+    max_negatives_per_image: int = 512,
+    class_loss: str = "mal",
+    class_loss_gamma: float = 1.5,
+    class_loss_alpha: float | None = None,
+    class_weights: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    """:func:`compute_text_query_losses` for ``mal``/``vfl`` without host syncs.
+
+    Targets come from :func:`pad_text_targets`, so every shape is static and the
+    whole loss, Hungarian matching included, stays on the GPU: the CPU can queue the
+    backward while the forward is still running, and the loss can be compiled into
+    one graph with the model. Matching uses the Triton solver in
+    :mod:`OWLv2torch.torch_version.linear_assignment`.
+
+    The terms match the per-image loss to fp32 rounding (~1e-7 on 8 LV-MHP
+    batches, gradients included). The extra ``matching_failures`` entry counts target
+    boxes the solver left unassigned; those boxes are dropped from the step rather
+    than matched to an arbitrary patch, and it should stay 0.
+    """
+    from OWLv2torch.torch_version.linear_assignment import batch_linear_assignment
+
+    if class_loss not in ("mal", "vfl"):
+        raise ValueError(f"The batched loss supports class_loss mal/vfl, got {class_loss!r}")
+    if class_loss_alpha is None and class_loss == "vfl":
+        class_loss_alpha = DEFAULT_VFL_ALPHA
+    class_logits, objectness_logits, pred_boxes = outputs[:3]
+    batch_size, num_patches, num_classes = class_logits.shape
+
+    assigned_patch = batch_linear_assignment(
+        batched_match_cost(
+            class_logits,
+            pred_boxes,
+            target_boxes,
+            target_labels,
+            target_valid,
+            class_cost=match_class_cost,
+            bbox_cost=match_bbox_cost,
+            giou_cost=match_giou_cost,
+        )
+    )
+    matched = target_valid & (assigned_patch >= 0)
+    assigned_patch = assigned_patch.clamp(min=0)
+    matched_weight = matched.float()
+    num_matched = matched_weight.sum(1)
+    images_with_boxes = (num_matched > 0).float()
+    num_images_with_boxes = images_with_boxes.sum().clamp(min=1)
+    per_image_count = num_matched.clamp(min=1)
+
+    # Geometry: mean over each image's matches, then over images that have any,
+    # exactly as the per-image loss averages its list of per-image terms.
+    matched_boxes = pred_boxes.gather(1, assigned_patch[..., None].expand(-1, -1, 4))
+    l1 = (matched_boxes - target_boxes.to(matched_boxes.dtype)).abs().sum(-1)
+    loss_l1 = (
+        (l1 * matched_weight).sum(1) / (4 * per_image_count) * images_with_boxes
+    ).sum() / num_images_with_boxes
+    iou, giou = _pairwise_iou_giou(
+        box_cxcywh_to_xyxy(matched_boxes.float()), box_cxcywh_to_xyxy(target_boxes)
+    )
+    loss_giou = (
+        (1.0 - (giou * matched_weight).sum(1) / per_image_count) * images_with_boxes
+    ).sum() / num_images_with_boxes
+
+    # Dense MAL/VFL as in _quality_class_loss. Assigned patches are distinct within
+    # an image, so scatter_add never adds two real boxes to one entry; unmatched and
+    # padded slots add 0.
+    flat_index = assigned_patch * num_classes + target_labels
+    one_hot = class_logits.new_zeros((batch_size, num_patches * num_classes))
+    quality = torch.zeros_like(one_hot)
+    one_hot.scatter_add_(1, flat_index, matched_weight.to(one_hot.dtype))
+    quality.scatter_add_(1, flat_index, (iou.detach() * matched_weight).to(quality.dtype))
+    one_hot = one_hot.view_as(class_logits)
+    quality = quality.view_as(class_logits)
+    num_boxes = num_matched.sum().clamp(min=1)
+    background = class_logits.detach().sigmoid().pow(class_loss_gamma) * (1.0 - one_hot)
+    if class_loss_alpha is not None:
+        background = class_loss_alpha * background
+    if class_loss == "mal":
+        target_score = quality.pow(class_loss_gamma)
+        weight = background + one_hot
+    else:
+        target_score = quality
+        weight = background + quality
+    class_bce = F.binary_cross_entropy_with_logits(
+        class_logits, target_score, weight=weight, reduction="none"
+    )
+    if class_weights is not None:
+        class_bce = class_bce * class_weights.to(
+            device=class_bce.device, dtype=class_bce.dtype
+        ).view(1, 1, -1)
+    loss_cls_pos = (class_bce * one_hot).sum() / num_boxes
+    loss_cls_neg = (class_bce * (1.0 - one_hot)).sum() / num_boxes
+    loss_cls = loss_cls_pos + loss_cls_neg
+
+    # Objectness: matched patches plus the top-`limit` unmatched patches by
+    # class x objectness score, as _hard_negative_indices picks them. A fixed-k topk
+    # with a per-image rank mask replaces the data-dependent nonzero/topk.
+    with torch.no_grad():
+        positive_patch = one_hot.amax(-1) > 0
+        scores = (
+            class_logits.float().sigmoid().amax(-1) * objectness_logits.float().sigmoid()
+        ).masked_fill(positive_patch, -1.0)
+        negative_patch = torch.topk(scores, k=max_negatives_per_image, dim=1).indices
+        limit = torch.where(
+            num_matched > 0,
+            (num_matched * negative_ratio).clamp(max=max_negatives_per_image),
+            torch.full_like(num_matched, float(max_negatives_per_image)),
+        )
+        negative_weight = (
+            torch.arange(max_negatives_per_image, device=limit.device)[None] < limit[:, None]
+        ).float()
+    objectness = objectness_logits.float()
+    positive_bce = F.binary_cross_entropy_with_logits(
+        objectness.gather(1, assigned_patch),
+        torch.ones_like(matched_weight),
+        reduction="none",
+    )
+    negative_bce = F.binary_cross_entropy_with_logits(
+        objectness.gather(1, negative_patch),
+        torch.zeros_like(negative_weight),
+        reduction="none",
+    )
+    loss_objectness = (
+        ((positive_bce * matched_weight).sum(1) + (negative_bce * negative_weight).sum(1))
+        / (num_matched + limit)
+    ).mean()
+
+    loss = (
+        lambda_cls * loss_cls
+        + lambda_l1 * loss_l1
+        + lambda_giou * loss_giou
+        + lambda_objectness * loss_objectness
+    )
+    return {
+        "loss": loss,
+        "L_cls": loss_cls,
+        "L_cls_pos": loss_cls_pos,
+        "L_cls_neg": loss_cls_neg,
+        "L_l1": loss_l1,
+        "L_giou": loss_giou,
+        "L_obj": loss_objectness,
+        "matching_failures": (target_valid & ~matched).sum().float(),
+    }
