@@ -205,7 +205,7 @@ def build_parser(default_dataset: Optional[str], description: str) -> argparse.A
     parser.add_argument("--model-size", default=None, choices=["base", "large"])
     parser.add_argument(
         "--checkpoint", type=Path, default=None,
-        help="Full or delta checkpoint written by prototype_train/train_text.py.",
+        help="Full, delta or LoRA checkpoint written by prototype_train/train_text.py.",
     )
     parser.add_argument("--limit", type=int, default=None, help="Cap evaluated images.")
     parser.add_argument(

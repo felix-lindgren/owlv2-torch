@@ -12,11 +12,60 @@ from OWLv2torch.torch_version.loss import (
     box_cxcywh_to_xyxy,
     sigmoid_focal_loss,
 )
+from OWLv2torch.torch_version.point_metrics import pairwise_oks
 
 CLASS_LOSS_CHOICES = ("focal", "vfl", "mal")
 
 # DEIM's defaults: MAL leaves the background term unscaled, VFL scales it by alpha.
 DEFAULT_VFL_ALPHA = 0.2
+
+
+def split_ignore_targets(
+    targets: list[dict[str, torch.Tensor]],
+) -> tuple[list[dict[str, torch.Tensor]], list[dict[str, torch.Tensor]]]:
+    """Separate pseudo-label ignore boxes from the real targets.
+
+    Ignore boxes ride through the dataset and batch augmentations as ordinary
+    targets whose label is encoded as ``-1 - class``, so every geometric
+    transform moves them exactly like the real boxes. This undoes the encoding
+    and returns ``(targets, ignore_targets)``, both with non-negative labels.
+    """
+    real, ignore = [], []
+    for target in targets:
+        labels = target["labels"]
+        is_ignore = labels < 0
+        real.append({"boxes": target["boxes"][~is_ignore], "labels": labels[~is_ignore]})
+        ignore.append({"boxes": target["boxes"][is_ignore], "labels": -1 - labels[is_ignore]})
+    return real, ignore
+
+
+@torch.no_grad()
+def _ignored_patches(
+    pred_boxes: torch.Tensor,
+    ignore_targets: list[dict[str, torch.Tensor]],
+    iou_threshold: float,
+    point_sigma: float | None = None,
+) -> torch.Tensor:
+    """``[B, num_patches]`` mask of patches whose box overlaps an ignore box.
+
+    With ``point_sigma`` the overlap is the OKS of the patch's predicted centre.
+
+    These are the patches that would otherwise be pushed towards background for
+    predicting an object the teacher was unsure about. Class-agnostic on purpose:
+    a teacher score in the uncertain band says little about the class either.
+    """
+    ignored = torch.zeros(pred_boxes.shape[:2], dtype=torch.bool, device=pred_boxes.device)
+    for batch_index, target in enumerate(ignore_targets):
+        boxes = target["boxes"]
+        if boxes.numel() == 0:
+            continue
+        boxes = boxes.to(device=pred_boxes.device, dtype=torch.float32)
+        if point_sigma is not None:
+            iou = pairwise_oks(pred_boxes[batch_index, :, :2], boxes, point_sigma)
+        else:
+            iou = box_iou(box_cxcywh_to_xyxy(pred_boxes[batch_index].float()), box_cxcywh_to_xyxy(boxes))
+        ignored[batch_index] = iou.amax(dim=1) >= iou_threshold
+    return ignored
 
 
 @torch.no_grad()
@@ -28,8 +77,13 @@ def hungarian_match_text(
     class_cost: float = 1.0,
     bbox_cost: float = 5.0,
     giou_cost: float = 2.0,
+    point_sigma: float | None = None,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    """Match patch predictions to targets using text class and box costs."""
+    """Match patch predictions to targets using text class and box costs.
+
+    With ``point_sigma`` only centres are compared: ``bbox_cost`` weighs the L1
+    centre distance and ``giou_cost`` weighs ``1 - OKS`` in place of ``1 - GIoU``.
+    """
     try:
         from scipy.optimize import linear_sum_assignment
     except ImportError:  # pragma: no cover - scipy is a project dependency
@@ -54,16 +108,24 @@ def hungarian_match_text(
         if class_cost:
             # Each target label indexes the corresponding text query.
             cost = cost - class_cost * logits.float().sigmoid()[:, target_labels]
-        if bbox_cost:
-            cost = cost + bbox_cost * torch.cdist(
-                boxes.float(), target_boxes.float(), p=1
-            )
-        if giou_cost:
-            giou = generalized_box_iou(
-                box_cxcywh_to_xyxy(boxes.float()),
-                box_cxcywh_to_xyxy(target_boxes.float()),
-            )
-            cost = cost + giou_cost * (1.0 - giou)
+        if point_sigma is not None:
+            if bbox_cost:
+                cost = cost + bbox_cost * torch.cdist(
+                    boxes[:, :2].float(), target_boxes[:, :2].float(), p=1
+                )
+            if giou_cost:
+                cost = cost + giou_cost * (1.0 - pairwise_oks(boxes[:, :2], target_boxes, point_sigma))
+        else:
+            if bbox_cost:
+                cost = cost + bbox_cost * torch.cdist(
+                    boxes.float(), target_boxes.float(), p=1
+                )
+            if giou_cost:
+                giou = generalized_box_iou(
+                    box_cxcywh_to_xyxy(boxes.float()),
+                    box_cxcywh_to_xyxy(target_boxes.float()),
+                )
+                cost = cost + giou_cost * (1.0 - giou)
 
         cost_cpu = cost.cpu()
         if linear_sum_assignment is not None:
@@ -127,6 +189,9 @@ def _quality_class_loss(
     gamma: float,
     alpha: float | None,
     class_weights: torch.Tensor | None,
+    ignored: torch.Tensor | None = None,
+    no_negative_classes: torch.Tensor | None = None,
+    point_sigma: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """IoU-aware dense classification loss: MAL (DEIM) or VFL (VarifocalNet).
 
@@ -141,6 +206,12 @@ def _quality_class_loss(
     gradient; MAL gives every positive weight 1 and moves the quality into the
     target (``q**gamma``). Returns the positive/background split of the same
     tensor, normalized by the batch's matched-box count.
+
+    ``ignored`` (``[B, num_patches]``) drops the background term of unmatched
+    patches that overlap a pseudo-label ignore box, and ``no_negative_classes``
+    (``[B, num_classes]``) drops it for whole classes of an image.
+
+    With ``point_sigma`` the quality is the matched centre's OKS instead of IoU.
     """
     if variant not in ("mal", "vfl"):
         raise ValueError(f"variant must be 'mal' or 'vfl', got {variant!r}")
@@ -163,10 +234,13 @@ def _quality_class_loss(
             device=device, dtype=matched_boxes.dtype
         )[target_indices]
         with torch.no_grad():
-            ious = box_iou(
-                box_cxcywh_to_xyxy(matched_boxes.float()),
-                box_cxcywh_to_xyxy(target_boxes.float()),
-            ).diagonal()
+            if point_sigma is not None:
+                ious = pairwise_oks(matched_boxes[:, :2], target_boxes, point_sigma).diagonal()
+            else:
+                ious = box_iou(
+                    box_cxcywh_to_xyxy(matched_boxes.float()),
+                    box_cxcywh_to_xyxy(target_boxes.float()),
+                ).diagonal()
         one_hot[batch_index, pred_indices, labels] = 1.0
         quality[batch_index, pred_indices, labels] = ious.to(quality.dtype)
         num_boxes += pred_indices.numel()
@@ -175,6 +249,12 @@ def _quality_class_loss(
     background = class_logits.detach().sigmoid().pow(gamma) * (1.0 - one_hot)
     if alpha is not None:
         background = alpha * background
+    if ignored is not None:
+        # Positives win: a matched patch keeps its other classes as background.
+        ignored = ignored & (one_hot.amax(-1) == 0)
+        background = background * (~ignored).unsqueeze(-1).to(background.dtype)
+    if no_negative_classes is not None:
+        background = background * (~no_negative_classes).unsqueeze(1).to(background.dtype)
 
     if variant == "mal":
         target_score = quality.pow(gamma)
@@ -213,6 +293,11 @@ def compute_text_query_losses(
     class_loss_gamma: float = 1.5,
     class_loss_alpha: float | None = None,
     class_weights: torch.Tensor | None = None,
+    ignore_targets: list[dict[str, torch.Tensor]] | None = None,
+    ignore_iou_threshold: float = 0.5,
+    no_negative_classes: torch.Tensor | None = None,
+    point_sigma: float | None = None,
+    point_size_weight: float = 0.0,
 ) -> dict[str, torch.Tensor]:
     """Compute detection losses where each class index denotes a text query.
 
@@ -232,6 +317,25 @@ def compute_text_query_losses(
 
     The box and objectness terms are identical across all three so the variants
     are directly comparable.
+
+    ``ignore_targets`` (from :func:`split_ignore_targets`) are pseudo-labels the
+    teacher was unsure about. They are never matched; an unmatched patch whose box
+    reaches ``ignore_iou_threshold`` IoU with one gets no negative classification
+    or objectness loss, instead of being trained as background.
+
+    ``no_negative_classes`` (``[B, num_classes]`` bool) removes the background
+    classification term of those classes in those images, for pseudo-labelled
+    images whose teacher misses most instances of a class: the unlabelled ones
+    would otherwise be trained as background. Matched positives still count, and
+    objectness is untouched since it is class-agnostic.
+
+    ``point_sigma`` trains a point (box-centre) detector. Ground-truth boxes only
+    set the tolerance: matching, the MAL/VFL quality target and the ignore mask
+    use OKS (:func:`pairwise_oks`) instead of IoU, ``lambda_l1`` weighs the L1
+    on the centre alone and ``lambda_giou`` weighs ``1 - OKS``, reported as
+    ``L_oks``. ``point_size_weight`` adds an L1 on the matched width and height
+    (``L_wh``): without it they get no gradient and drift as the shared box-head
+    layers train, and the unmatched patches' centres drift with them.
     """
     if class_loss not in CLASS_LOSS_CHOICES:
         raise ValueError(
@@ -257,22 +361,33 @@ def compute_text_query_losses(
         class_cost=match_class_cost,
         bbox_cost=match_bbox_cost,
         giou_cost=match_giou_cost,
+        point_sigma=point_sigma,
+    )
+    ignored = (
+        _ignored_patches(pred_boxes, ignore_targets, ignore_iou_threshold, point_sigma)
+        if ignore_targets is not None
+        else None
     )
 
     positive_class_losses = []
     negative_class_losses = []
     l1_losses = []
     giou_losses = []
+    size_losses = []
     objectness_losses = []
 
     for batch_index, (pred_indices, target_indices) in enumerate(matches):
         logits = class_logits[batch_index]
         objectness = objectness_logits[batch_index]
         num_positives = pred_indices.numel()
+        excluded = pred_indices
+        if ignored is not None:
+            # Mining skips ignored patches, so they leave both negative terms.
+            excluded = torch.cat([pred_indices, ignored[batch_index].nonzero().squeeze(1)])
         negative_indices = _hard_negative_indices(
             logits,
             objectness,
-            pred_indices,
+            excluded,
             num_positives=num_positives,
             negative_ratio=negative_ratio,
             max_negatives=max_negatives_per_image,
@@ -293,19 +408,35 @@ def compute_text_query_losses(
             target_boxes = targets[batch_index]["boxes"].to(
                 device=matched_boxes.device, dtype=matched_boxes.dtype
             )[target_indices]
-            l1_losses.append(F.l1_loss(matched_boxes, target_boxes, reduction="mean"))
-            giou = generalized_box_iou(
-                box_cxcywh_to_xyxy(matched_boxes.float()),
-                box_cxcywh_to_xyxy(target_boxes.float()),
-            )
-            giou_losses.append(1.0 - giou.diag().mean())
+            if point_sigma is not None:
+                l1_losses.append(
+                    F.l1_loss(matched_boxes[:, :2], target_boxes[:, :2], reduction="mean")
+                )
+                oks = pairwise_oks(matched_boxes[:, :2], target_boxes, point_sigma)
+                giou_losses.append(1.0 - oks.diag().mean())
+                size_losses.append(
+                    F.l1_loss(matched_boxes[:, 2:], target_boxes[:, 2:], reduction="mean")
+                )
+            else:
+                l1_losses.append(F.l1_loss(matched_boxes, target_boxes, reduction="mean"))
+                giou = generalized_box_iou(
+                    box_cxcywh_to_xyxy(matched_boxes.float()),
+                    box_cxcywh_to_xyxy(target_boxes.float()),
+                )
+                giou_losses.append(1.0 - giou.diag().mean())
 
         if class_loss == "focal" and negative_indices.numel():
+            negative_weights = class_weights
+            if no_negative_classes is not None:
+                keep = (~no_negative_classes[batch_index]).to(logits.dtype)
+                negative_weights = keep if class_weights is None else class_weights.to(
+                    keep.device, keep.dtype
+                ) * keep
             negative_class_losses.append(
                 _focal_class_loss(
                     logits[negative_indices],
                     torch.zeros_like(logits[negative_indices]),
-                    class_weights,
+                    negative_weights,
                 )
             )
 
@@ -331,27 +462,37 @@ def compute_text_query_losses(
             gamma=class_loss_gamma,
             alpha=class_loss_alpha,
             class_weights=class_weights,
+            ignored=ignored,
+            no_negative_classes=no_negative_classes,
+            point_sigma=point_sigma,
         )
         loss_cls = loss_cls_pos + loss_cls_neg
     loss_l1 = _mean_or_zero(l1_losses, zero)
     loss_giou = _mean_or_zero(giou_losses, zero)
     loss_objectness = _mean_or_zero(objectness_losses, zero)
 
+    loss_size = _mean_or_zero(size_losses, zero)
+
     loss = lambda_cls * loss_cls
     if include_geometry_loss:
-        loss = loss + lambda_l1 * loss_l1 + lambda_giou * loss_giou
+        loss = loss + lambda_l1 * loss_l1 + lambda_giou * loss_giou + point_size_weight * loss_size
     if include_objectness_loss:
         loss = loss + lambda_objectness * loss_objectness
 
-    return {
+    result = {
         "loss": loss,
         "L_cls": loss_cls,
         "L_cls_pos": loss_cls_pos,
         "L_cls_neg": loss_cls_neg,
         "L_l1": loss_l1,
-        "L_giou": loss_giou,
+        "L_oks" if point_sigma is not None else "L_giou": loss_giou,
         "L_obj": loss_objectness,
     }
+    if point_sigma is not None:
+        result["L_wh"] = loss_size
+    if ignored is not None:
+        result["ignored_patches"] = ignored.float().sum(1).mean()
+    return result
 
 
 def _mean_or_zero(values: list[torch.Tensor], zero: torch.Tensor) -> torch.Tensor:
@@ -471,6 +612,10 @@ def batched_text_query_losses(
     class_loss_gamma: float = 1.5,
     class_loss_alpha: float | None = None,
     class_weights: torch.Tensor | None = None,
+    ignore_boxes: torch.Tensor | None = None,
+    ignore_valid: torch.Tensor | None = None,
+    ignore_iou_threshold: float = 0.5,
+    no_negative_classes: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """:func:`compute_text_query_losses` for ``mal``/``vfl`` without host syncs.
 
@@ -484,6 +629,10 @@ def batched_text_query_losses(
     batches, gradients included). The extra ``matching_failures`` entry counts target
     boxes the solver left unassigned; those boxes are dropped from the step rather
     than matched to an arbitrary patch, and it should stay 0.
+
+    ``ignore_boxes``/``ignore_valid`` are pseudo-label ignore boxes padded by
+    :func:`pad_text_targets`, with the same semantics as ``ignore_targets`` in the
+    per-image loss; ``no_negative_classes`` is shared with it unchanged.
     """
     from OWLv2torch.torch_version.linear_assignment import batch_linear_assignment
 
@@ -542,6 +691,19 @@ def batched_text_query_losses(
     background = class_logits.detach().sigmoid().pow(class_loss_gamma) * (1.0 - one_hot)
     if class_loss_alpha is not None:
         background = class_loss_alpha * background
+    positive_patch = one_hot.amax(-1) > 0
+    ignored = None
+    if ignore_boxes is not None:
+        with torch.no_grad():
+            ignore_iou, _ = _pairwise_iou_giou(
+                box_cxcywh_to_xyxy(pred_boxes.float())[:, :, None],
+                box_cxcywh_to_xyxy(ignore_boxes)[:, None],
+            )
+            ignored = ((ignore_iou >= ignore_iou_threshold) & ignore_valid[:, None]).any(-1)
+            ignored = ignored & ~positive_patch
+        background = background * (~ignored).unsqueeze(-1).to(background.dtype)
+    if no_negative_classes is not None:
+        background = background * (~no_negative_classes).unsqueeze(1).to(background.dtype)
     if class_loss == "mal":
         target_score = quality.pow(class_loss_gamma)
         weight = background + one_hot
@@ -563,10 +725,10 @@ def batched_text_query_losses(
     # class x objectness score, as _hard_negative_indices picks them. A fixed-k topk
     # with a per-image rank mask replaces the data-dependent nonzero/topk.
     with torch.no_grad():
-        positive_patch = one_hot.amax(-1) > 0
+        excluded_patch = positive_patch if ignored is None else positive_patch | ignored
         scores = (
             class_logits.float().sigmoid().amax(-1) * objectness_logits.float().sigmoid()
-        ).masked_fill(positive_patch, -1.0)
+        ).masked_fill(excluded_patch, -1.0)
         negative_patch = torch.topk(scores, k=max_negatives_per_image, dim=1).indices
         limit = torch.where(
             num_matched > 0,
@@ -576,6 +738,9 @@ def batched_text_query_losses(
         negative_weight = (
             torch.arange(max_negatives_per_image, device=limit.device)[None] < limit[:, None]
         ).float()
+        if ignored is not None:
+            # Only reachable when fewer patches than `limit` are left unexcluded.
+            negative_weight = negative_weight * (~ignored.gather(1, negative_patch)).float()
     objectness = objectness_logits.float()
     positive_bce = F.binary_cross_entropy_with_logits(
         objectness.gather(1, assigned_patch),
@@ -598,7 +763,7 @@ def batched_text_query_losses(
         + lambda_giou * loss_giou
         + lambda_objectness * loss_objectness
     )
-    return {
+    result = {
         "loss": loss,
         "L_cls": loss_cls,
         "L_cls_pos": loss_cls_pos,
@@ -608,3 +773,6 @@ def batched_text_query_losses(
         "L_obj": loss_objectness,
         "matching_failures": (target_valid & ~matched).sum().float(),
     }
+    if ignored is not None:
+        result["ignored_patches"] = ignored.float().sum(1).mean()
+    return result

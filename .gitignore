@@ -14,3 +14,4 @@ mlflow.*
 eval_visualizations/
 logs/
 trt_engines/
+text_checkpoints/

@@ -1,6 +1,7 @@
 from OWLv2torch.torch_version.prototypes import VisualPrototypeBank
 from OWLv2torch.torch_version.owlv2 import OwlV2, PrototypeDetector
 from OWLv2torch.torch_version.loss import compute_losses
+from OWLv2torch.torch_version.point_metrics import POINT_SIZE_BUCKETS, PointAPAccumulator
 from OWLv2torch.utils.tokenizer import tokenize
 import torch
 from torchvision.datasets import CocoDetection
@@ -31,6 +32,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 DEFAULT_MLFLOW_TRACKING_URI = f"sqlite:///{(REPO_ROOT / 'mlflow.db').as_posix()}"
+# Annotation flag set by train_text.py's pseudo-label thresholds. Flagged boxes
+# leave AugmentedDetectionDataset with label ``-1 - class`` so the augmentations
+# move them like any box; text_loss.split_ignore_targets decodes them.
+PSEUDO_IGNORE_KEY = "pseudo_ignore"
 from tools.ovd_eval import (
     DiorDetectionDataset,
     DotaDetectionDataset,
@@ -114,6 +119,9 @@ class AugmentedDetectionDataset(Dataset):
     vertical flips can be disabled for orientation-sensitive datasets, and
     ``photometric=False`` drops the ColorJitter for callers that redo it on the
     GPU (see ``prototype_train.gpu_augment``).
+
+    With ``pseudo_image_ids`` every target also carries a ``"pseudo"`` bool:
+    whether the image's labels come from a teacher rather than a human.
     """
 
     def __init__(
@@ -136,8 +144,10 @@ class AugmentedDetectionDataset(Dataset):
         vertical_flip_prob=0.5,
         photometric=True,
         scale_augment=True,
+        pseudo_image_ids=None,
     ):
         self.base = base
+        self.pseudo_image_ids = pseudo_image_ids
         self.image_transform = image_transform
         self.category_id_to_label = category_id_to_label
         self.augment = augment
@@ -194,7 +204,12 @@ class AugmentedDetectionDataset(Dataset):
                 dim=1,
             )
             labels = torch.as_tensor(
-                [self.category_id_to_label[a["category_id"]] for a in anns],
+                [
+                    -1 - self.category_id_to_label[a["category_id"]]
+                    if a.get(PSEUDO_IGNORE_KEY)
+                    else self.category_id_to_label[a["category_id"]]
+                    for a in anns
+                ],
                 dtype=torch.int64,
             )
         else:
@@ -254,7 +269,10 @@ class AugmentedDetectionDataset(Dataset):
         else:
             boxes_norm = torch.zeros((0, 4), dtype=torch.float32)
 
-        return image_tensor, {"boxes": boxes_norm, "labels": labels.to(torch.int64)}
+        target = {"boxes": boxes_norm, "labels": labels.to(torch.int64)}
+        if self.pseudo_image_ids is not None:
+            target["pseudo"] = self.base.ids[idx] in self.pseudo_image_ids
+        return image_tensor, target
 
 
 def aug_collate_fn(batch):
@@ -582,7 +600,12 @@ def coco_eval(
     title: str = "COCO Evaluation Results",
     max_batches: int | None = None,
     class_names: list[str] | None = None,
+    point_sigma: float | None = None,
 ):
+    """COCO box mAP, or with ``point_sigma`` OKS point AP on the box centres.
+
+    Point AP has no fixed detection cap: ``top_k`` is its per-image maximum.
+    """
     model.eval()
     device_type = torch.device(device).type
     if max_batches is not None and max_batches <= 0:
@@ -603,6 +626,11 @@ def coco_eval(
         backend='faster_coco_eval'
     )
     metric.warn_on_many_detections = False
+    point_metric = (
+        PointAPAccumulator(point_sigma, max_detections=top_k or 10_000)
+        if point_sigma is not None
+        else None
+    )
 
     sample_output_dir = Path(sample_output_dir) if sample_output_dir is not None else None
     drawn = 0
@@ -693,6 +721,15 @@ def coco_eval(
                     'labels': gt_labels.detach().cpu(),
                 }
                 batch_metric_targets.append(target_dict)
+                if point_metric is not None:
+                    size_h, size_w = target_sizes[i].tolist()
+                    point_metric.update(
+                        (img_boxes[:, :2] + img_boxes[:, 2:]).detach().cpu() * 0.5,
+                        img_scores,
+                        img_labels,
+                        gt_boxes.detach().cpu() * torch.tensor([size_w, size_h, size_w, size_h]),
+                        gt_labels,
+                    )
 
                 if debug and sample_output_dir is not None and drawn < debug_max_images:
                     save_eval_sample(
@@ -708,7 +745,23 @@ def coco_eval(
                     )
                     drawn += 1
 
-            metric.update(batch_predictions, batch_metric_targets)
+            if point_metric is None:
+                metric.update(batch_predictions, batch_metric_targets)
+
+    if point_metric is not None:
+        metrics = point_metric.compute()
+        print(f"\n=== {title} (point AP, OKS sigma={point_sigma:g}, maxDets={point_metric.max_detections}) ===")
+        print(f"AP (OKS=0.50:0.95): {metrics['map']:.4f}")
+        print(f"AP (OKS=0.50): {metrics['map_50']:.4f}")
+        print(f"AP (OKS=0.75): {metrics['map_75']:.4f}")
+        print(f"AR (OKS=0.50:0.95): {metrics['mar']:.4f}   AR (OKS=0.50): {metrics['mar_50']:.4f}")
+        for name, _, _ in POINT_SIZE_BUCKETS:
+            if metrics[f"num_gt_{name}"]:
+                print(
+                    f"  AR {name:<9s} (model px) {metrics[f'mar_{name}']:.4f}   "
+                    f"@0.50 {metrics[f'mar_50_{name}']:.4f}   n={int(metrics[f'num_gt_{name}'])}"
+                )
+        return metrics
 
     metrics = metric.compute()
 

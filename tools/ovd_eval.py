@@ -137,25 +137,59 @@ def load_eval_spec(path: str | Path | None) -> dict | None:
     return spec
 
 
-def apply_text_checkpoint(model: OwlV2, checkpoint_path: str | Path | dict) -> dict:
-    """Load a full or delta checkpoint written by train_text.py."""
+def apply_text_checkpoint(
+    model: OwlV2, checkpoint_path: str | Path | dict, *, wise_alpha: float = 1.0
+) -> dict:
+    """Load a full, delta or vision-LoRA checkpoint written by train_text.py.
+
+    LoRA adapters are merged into plain linear layers, so the model stays an
+    ordinary ``OwlV2``. ``wise_alpha`` < 1 then interpolates every weight toward
+    the pretrained one (WiSE-FT): ``w = w0 + wise_alpha * (w - w0)``.
+    """
     checkpoint = (
         checkpoint_path
         if isinstance(checkpoint_path, dict)
         else torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     )
+    if not 0.0 <= wise_alpha <= 1.0:
+        raise ValueError(f"wise_alpha must be in [0, 1], got {wise_alpha}")
+    pretrained = (
+        {name: value.detach().to("cpu", copy=True) for name, value in model.state_dict().items()}
+        if wise_alpha != 1.0
+        else None
+    )
     checkpoint_format = checkpoint.get("format")
-    valid_formats = {"owlv2-text-finetune-full-v1", "owlv2-text-finetune-delta-v1"}
+    lora_formats = {"owlv2-text-finetune-lora-full-v1", "owlv2-text-finetune-lora-delta-v1"}
+    valid_formats = {"owlv2-text-finetune-full-v1", "owlv2-text-finetune-delta-v1"} | lora_formats
     if checkpoint_format not in valid_formats:
         raise ValueError(
             f"Unsupported checkpoint format {checkpoint_format!r}; expected one of {sorted(valid_formats)}"
         )
-    incompatible = model.load_state_dict(
-        checkpoint["model_state_dict"],
-        strict=checkpoint_format == "owlv2-text-finetune-full-v1",
-    )
-    if checkpoint_format.endswith("delta-v1") and incompatible.unexpected_keys:
-        raise RuntimeError(f"Unexpected checkpoint keys: {incompatible.unexpected_keys}")
+    if checkpoint_format in lora_formats:
+        # The adapter topology lives in the trainer (PEFT), which also imports this
+        # module, so import it lazily and only when an adapter needs it.
+        import sys
+
+        repo_root = str(Path(__file__).resolve().parents[1])
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from prototype_train.train_text import apply_text_checkpoint as apply_adapter_checkpoint
+        from prototype_train.train_text import merge_vision_lora
+
+        apply_adapter_checkpoint(model, checkpoint)
+        merge_vision_lora(model)
+    else:
+        incompatible = model.load_state_dict(
+            checkpoint["model_state_dict"],
+            strict=checkpoint_format == "owlv2-text-finetune-full-v1",
+        )
+        if checkpoint_format.endswith("delta-v1") and incompatible.unexpected_keys:
+            raise RuntimeError(f"Unexpected checkpoint keys: {incompatible.unexpected_keys}")
+    if pretrained is not None:
+        with torch.no_grad():
+            for name, value in model.state_dict().items():
+                if value.is_floating_point():
+                    value.lerp_(pretrained[name].to(value.device), 1.0 - wise_alpha)
     return checkpoint
 
 
@@ -810,7 +844,11 @@ def run_detection_inference(
         image_ids = batch["image_ids"]
         offsets = batch["offsets"]
         target_sizes = torch.tensor(batch["target_sizes"], dtype=torch.float32, device=device)
-        pixel_values = preprocess_model.preprocess_image(images, fast=fast_preprocess).to(device)
+        # Resizing on the device: the CPU resize runs serially in this process and
+        # left the 5070 Ti idle ~2/3 of the time on DIOR (24 img/s).
+        pixel_values = preprocess_model.preprocess_image(
+            images, fast=fast_preprocess, device=device if fast_preprocess else None
+        ).to(device)
 
         with torch.inference_mode():
             with torch.autocast(
@@ -1072,7 +1110,11 @@ def main() -> None:
     parser.add_argument("--model-size", default=None, choices=["base", "large"])
     parser.add_argument(
         "--checkpoint", type=Path,
-        help="Full or delta checkpoint written by prototype_train/train_text.py.",
+        help="Full, delta or LoRA checkpoint written by prototype_train/train_text.py.",
+    )
+    parser.add_argument(
+        "--wise-alpha", type=float, default=1.0,
+        help="WiSE-FT: interpolate --checkpoint toward the pretrained weights (1 = as trained, 0 = pretrained).",
     )
     parser.add_argument("--ann-file", type=Path, default=None, help="COCO annotation JSON.")
     parser.add_argument("--image-root", type=Path, default=None, help="COCO image root.")
@@ -1192,8 +1234,8 @@ def main() -> None:
         allow_torch_fallback=args.trt_allow_fallback,
     )
     if checkpoint is not None:
-        apply_text_checkpoint(model, checkpoint)
-        print(f"Loaded fine-tuned weights from {args.checkpoint}")
+        apply_text_checkpoint(model, checkpoint, wise_alpha=args.wise_alpha)
+        print(f"Loaded fine-tuned weights from {args.checkpoint} (wise_alpha={args.wise_alpha})")
     query_template = args.query_template
     if query_template is None:
         query_template = (
@@ -1260,6 +1302,7 @@ def main() -> None:
             "model_size": args.model_size,
             "tensorrt": args.tensorrt and getattr(model, "trt", None) is not None,
             "checkpoint": str(args.checkpoint) if args.checkpoint else None,
+            "wise_alpha": args.wise_alpha if args.checkpoint else None,
             "query_template": query_template,
             "alias_pooling": args.alias_pooling,
             "eval_spec": str(eval_spec_path) if eval_spec_path else None,

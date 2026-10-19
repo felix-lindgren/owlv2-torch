@@ -33,16 +33,19 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from OWLv2torch.torch_version.owlv2 import OwlV2
+from OWLv2torch.torch_version.point_metrics import DEFAULT_POINT_SIGMA
 from OWLv2torch.torch_version.text_loss import (
     CLASS_LOSS_CHOICES,
     DEFAULT_MAX_TARGETS,
     batched_text_query_losses,
     compute_text_query_losses,
     pad_text_targets,
+    split_ignore_targets,
 )
 from OWLv2torch.utils.tokenizer import tokenize
 from prototype_train.gpu_augment import BatchAugmentor
 from prototype_train.train import (
+    PSEUDO_IGNORE_KEY,
     AugmentedDetectionDataset,
     aug_collate_fn,
     coco_collate_fn,
@@ -145,6 +148,76 @@ def drop_categories_by_name(
         if cleaned_by_id[category_id] in wanted
     ]
     return kept, dropped
+
+
+def apply_pseudo_label_thresholds(
+    coco, label_threshold: float, ignore_threshold: float | None
+) -> Counter:
+    """Split scored pseudo-label annotations into targets, ignore boxes and background.
+
+    Works in place on the loaded COCO index so the dataset, shot selection and
+    stream statistics all see the same annotations. Unscored annotations are human
+    labels and pass through untouched, which lets one file mix both.
+    """
+    counts: Counter[str] = Counter()
+    kept = []
+    for annotation in coco.dataset["annotations"]:
+        score = annotation.get("score")
+        if score is None:
+            counts["human"] += 1
+        elif score >= label_threshold:
+            counts["target"] += 1
+        elif ignore_threshold is not None and score >= ignore_threshold:
+            annotation[PSEUDO_IGNORE_KEY] = True
+            counts["ignore"] += 1
+        else:
+            counts["dropped"] += 1
+            continue
+        kept.append(annotation)
+    if not counts["target"] + counts["ignore"] + counts["dropped"]:
+        raise ValueError(
+            "--pseudo-label-threshold was given, but no training annotation carries a 'score'"
+        )
+    coco.dataset["annotations"] = kept
+    coco.createIndex()
+    return counts
+
+
+def estimate_pseudo_label_recall(
+    coco, category_id_to_label: dict[int, int], num_labels: int
+) -> tuple[list[float | None], set[int]]:
+    """Per-label recall of the pseudo-label targets, estimated without held-out labels.
+
+    Compares each label's target density on pseudo-labelled images with its density
+    on the human-labelled ones (images holding any unscored annotation). Shots are
+    drawn per class, so the human density is biased and the estimate is rough for
+    common classes, but it reliably finds the classes the teacher barely labels: on
+    DIOR it matched the true recall within 0.03 for every class below 0.25. Run after
+    :func:`apply_pseudo_label_thresholds`. Returns the recall per label (``None``
+    without human labels to compare against) and the pseudo-labelled image ids.
+    """
+    human_images = {a["image_id"] for a in coco.dataset["annotations"] if "score" not in a}
+    pseudo_images = set(coco.getImgIds()) - human_images
+    if not human_images or not pseudo_images:
+        raise ValueError(
+            "Estimating pseudo-label recall needs both human-labelled images "
+            "(unscored annotations) and pseudo-labelled ones"
+        )
+    human_counts = [0] * num_labels
+    target_counts = [0] * num_labels
+    for annotation in coco.dataset["annotations"]:
+        label = category_id_to_label.get(annotation["category_id"])
+        if label is None or annotation.get(PSEUDO_IGNORE_KEY):
+            continue
+        if "score" in annotation:
+            target_counts[label] += 1
+        else:
+            human_counts[label] += 1
+    recall = [
+        (targets / len(pseudo_images)) / (human / len(human_images)) if human else None
+        for targets, human in zip(target_counts, human_counts)
+    ]
+    return recall, pseudo_images
 
 
 def build_label_space(
@@ -852,6 +925,10 @@ RESUME_CRITICAL_ARGS = (
     "prompt_templates",
     "eval_prompt_template",
     "classification_class_weights",
+    "pseudo_label_threshold",
+    "pseudo_ignore_threshold",
+    "pseudo_ignore_iou",
+    "pseudo_negative_min_recall",
 )
 
 
@@ -894,6 +971,22 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-images")
     parser.add_argument("--val-annotations")
     parser.add_argument("--val-images")
+    parser.add_argument(
+        "--general-val-annotations",
+        help=(
+            "COCO-format set scored alongside every validation with its own full "
+            "class list, logged as general/*, to track how much the fine-tune "
+            "erodes out-of-domain detection. Build one with tools/make_coco_mini.py. "
+            "Never used for best-checkpoint selection, and not truncated by "
+            "--eval-max-batches."
+        ),
+    )
+    parser.add_argument("--general-val-images")
+    parser.add_argument(
+        "--general-eval-prompt-template",
+        default="a photo of {name}",
+        help="Prompt template for the general set, independent of --prompt-profile.",
+    )
     parser.add_argument("--model-type", choices=("base", "large"), default="base")
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
@@ -1246,6 +1339,76 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda-l1", type=float, default=5.0)
     parser.add_argument("--lambda-giou", type=float, default=2.0)
     parser.add_argument("--lambda-objectness", type=float, default=0.5)
+    parser.add_argument(
+        "--point-loss",
+        action="store_true",
+        help=(
+            "Train a point (box-centre) detector: matching, the MAL/VFL quality "
+            "target and the box terms use the centre's OKS against the GT box "
+            "instead of IoU; --lambda-l1 weighs the centre L1 and --lambda-giou "
+            "weighs 1 - OKS. Implies --point-eval."
+        ),
+    )
+    parser.add_argument(
+        "--point-eval",
+        action="store_true",
+        help=(
+            "Score validation with OKS point AP on predicted box centres instead "
+            "of box mAP. --eval-top-k is the per-image detection cap; dense "
+            "scenes such as AI-TOD need ~1500."
+        ),
+    )
+    parser.add_argument(
+        "--point-sigma",
+        type=float,
+        default=DEFAULT_POINT_SIGMA,
+        help="OKS sigma for --point-loss/--point-eval; the default scores 0.5 at a miss of ~half the box side.",
+    )
+    parser.add_argument(
+        "--point-size-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of an auxiliary L1 on matched width/height under --point-loss. "
+            "At 0 the size outputs are unsupervised and drift; 2.5 matches the "
+            "per-coordinate L1 weight of the default box loss."
+        ),
+    )
+    parser.add_argument(
+        "--pseudo-label-threshold",
+        type=float,
+        help=(
+            "Treat training annotations that carry a 'score' (tools/pseudo_label.py) "
+            "as pseudo-labels: those scoring at least this are targets. Annotations "
+            "without a score (human labels) are always targets."
+        ),
+    )
+    parser.add_argument(
+        "--pseudo-ignore-threshold",
+        type=float,
+        help=(
+            "Scored annotations in [this, --pseudo-label-threshold) become ignore "
+            "boxes: patches predicting them get no negative loss instead of being "
+            "trained as background. Below it they are dropped. Default: no ignore band."
+        ),
+    )
+    parser.add_argument(
+        "--pseudo-ignore-iou",
+        type=float,
+        default=0.5,
+        help="IoU between a patch's predicted box and an ignore box that exempts the patch.",
+    )
+    parser.add_argument(
+        "--pseudo-negative-min-recall",
+        type=float,
+        help=(
+            "Classes whose estimated pseudo-label recall is below this get no background "
+            "classification loss on pseudo-labelled images, so the instances the teacher "
+            "missed are not trained as background; they learn from the human-labelled "
+            "images and their own targets. Recall is estimated against the human "
+            "labels in the same file. Requires --pseudo-label-threshold and no mosaic."
+        ),
+    )
 
     parser.add_argument("--confidence-threshold", type=float, default=0.001)
     parser.add_argument(
@@ -1349,6 +1512,8 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("eval_every_steps must be positive")
     if args.eval_max_batches is not None and args.eval_max_batches <= 0:
         raise ValueError("eval_max_batches must be positive")
+    if (args.general_val_annotations is None) != (args.general_val_images is None):
+        parser.error("--general-val-annotations and --general-val-images must be used together")
     if args.warmup_steps < 0:
         raise ValueError("warmup_steps must be non-negative")
     if args.grad_accum_steps < 1:
@@ -1359,6 +1524,14 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("--batched-loss/--compile-step require --class-loss mal or vfl")
     if args.max_targets < 1:
         raise ValueError("max_targets must be at least 1")
+    if args.point_loss:
+        args.point_eval = True
+        if args.batched_loss:
+            raise ValueError("--point-loss is not implemented for --batched-loss/--compile-step")
+    if args.point_sigma <= 0:
+        raise ValueError("point_sigma must be positive")
+    if args.point_size_weight < 0:
+        raise ValueError("point_size_weight must be non-negative")
     if args.vision_lora_blocks < 0:
         raise ValueError("vision_lora_blocks must be non-negative")
     for name in ("horizontal_flip_prob", "vertical_flip_prob"):
@@ -1384,6 +1557,20 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("--no-scale-augment is incompatible with downscale mosaic")
     if args.resume and args.init_from:
         raise ValueError("--resume and --init-from are mutually exclusive")
+    if args.pseudo_ignore_threshold is not None:
+        if args.pseudo_label_threshold is None:
+            raise ValueError("--pseudo-ignore-threshold requires --pseudo-label-threshold")
+        if args.pseudo_ignore_threshold >= args.pseudo_label_threshold:
+            raise ValueError("--pseudo-ignore-threshold must be below --pseudo-label-threshold")
+    if not 0.0 < args.pseudo_ignore_iou <= 1.0:
+        raise ValueError("pseudo_ignore_iou must be in (0, 1]")
+    if args.pseudo_negative_min_recall is not None:
+        if args.pseudo_label_threshold is None:
+            raise ValueError("--pseudo-negative-min-recall requires --pseudo-label-threshold")
+        if args.mosaic_prob > 0:
+            # Mosaic merges images and rebuilds their targets, losing which ones
+            # were pseudo-labelled.
+            raise ValueError("--pseudo-negative-min-recall is incompatible with mosaic")
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -1470,6 +1657,21 @@ def main(argv: list[str] | None = None) -> None:
             annFile=args.train_annotations,
             root=args.train_images,
         )
+        if args.pseudo_label_threshold is not None:
+            pseudo_counts = apply_pseudo_label_thresholds(
+                train_dataset.coco, args.pseudo_label_threshold, args.pseudo_ignore_threshold
+            )
+            print(
+                f"Pseudo-labels: {pseudo_counts['target']} targets "
+                f"(score >= {args.pseudo_label_threshold:g}), "
+                f"{pseudo_counts['ignore']} ignore boxes, {pseudo_counts['dropped']} dropped; "
+                f"{pseudo_counts['human']} human labels"
+            )
+        elif any("score" in annotation for annotation in train_dataset.coco.dataset["annotations"]):
+            print(
+                "[WARN] Training annotations carry pseudo-label scores but "
+                "--pseudo-label-threshold is not set; every box is a hard target."
+            )
         val_dataset = CocoDetection(
             annFile=args.val_annotations,
             root=args.val_images,
@@ -1493,6 +1695,23 @@ def main(argv: list[str] | None = None) -> None:
         )
         for sources, target in merges:
             print(f"Merged {' + '.join(sources)} -> {target}")
+        pseudo_image_ids = no_negative_class_mask = None
+        if args.pseudo_negative_min_recall is not None:
+            pseudo_recall, pseudo_image_ids = estimate_pseudo_label_recall(
+                train_dataset.coco, category_id_to_label, len(class_names)
+            )
+            no_negative = [
+                recall is not None and recall < args.pseudo_negative_min_recall
+                for recall in pseudo_recall
+            ]
+            no_negative_class_mask = torch.tensor(no_negative, device=device)
+            print("Estimated pseudo-label recall (* = no negatives on pseudo images):")
+            for name, recall, flagged in sorted(
+                zip(class_names, pseudo_recall, no_negative),
+                key=lambda item: -1.0 if item[1] is None else item[1],
+            ):
+                shown = "n/a" if recall is None else f"{recall:.2f}"
+                print(f"  {'*' if flagged else ' '} {name:28s} {shown}")
 
         if resume_checkpoint is not None:
             check_resume_compatibility(resume_checkpoint, args, class_names)
@@ -1551,6 +1770,65 @@ def main(argv: list[str] | None = None) -> None:
             "evaluation_prompt_template": eval_prompt_template,
         }
         detector = TextQueryDetector(model, eval_prompts).to(device)
+        general_detector = None
+        if args.general_val_annotations:
+            general_dataset = CocoDetection(
+                annFile=args.general_val_annotations,
+                root=args.general_val_images,
+                transform=val_dataset.transform,
+            )
+            general_category_ids = sorted(general_dataset.coco.getCatIds())
+            general_class_names = [
+                general_dataset.coco.cats[category_id]["name"]
+                for category_id in general_category_ids
+            ]
+            # Shares ``model`` with ``detector``; only the query bank differs.
+            general_detector = TextQueryDetector(
+                model,
+                evaluation_prompts(general_class_names, args.general_eval_prompt_template),
+            ).to(device)
+            general_loader = DataLoader(
+                general_dataset,
+                batch_size=args.val_batch_size or args.batch_size,
+                collate_fn=partial(
+                    coco_collate_fn,
+                    id2size=general_dataset.coco.imgs,
+                    square_pad=True,
+                    category_id_to_label={
+                        category_id: label
+                        for label, category_id in enumerate(general_category_ids)
+                    },
+                ),
+                shuffle=False,
+                num_workers=max(0, args.num_workers // 2),
+                pin_memory=device.type == "cuda",
+            )
+            print(
+                f"General-domain eval: {len(general_dataset)} images, "
+                f"{len(general_class_names)} classes from {args.general_val_annotations}"
+            )
+
+        def run_general_eval(step: int, title: str) -> float | None:
+            if general_detector is None:
+                return None
+            metrics = coco_eval(
+                general_detector,
+                general_loader,
+                device,
+                confidence_threshold=args.confidence_threshold,
+                score_with_objectness=args.score_with_objectness,
+                top_k=args.eval_top_k,
+                output_format="standard",
+                title=f"General-domain {title}",
+                log_to_mlflow=args.mlflow,
+                class_names=general_class_names if args.per_class_ap else None,
+            )
+            general_map = float(metrics["map"])
+            if args.mlflow:
+                log_eval_metrics(metrics, "general/", step=step)
+                log_per_class_ap(metrics, general_class_names, "general/", step=step)
+            return general_map
+
         if args.compile:
             model.vision_model.encoder.compile()
 
@@ -1573,6 +1851,7 @@ def main(argv: list[str] | None = None) -> None:
             vertical_flip_prob=args.vertical_flip_prob,
             photometric=not gpu_augment,
             scale_augment=args.scale_augment,
+            pseudo_image_ids=pseudo_image_ids,
         )
         batch_augmentor = (
             BatchAugmentor(
@@ -1757,13 +2036,31 @@ def main(argv: list[str] | None = None) -> None:
             "class_loss_gamma": args.class_loss_gamma,
             "class_loss_alpha": args.class_loss_alpha,
             "class_weights": classification_weights,
+            "ignore_iou_threshold": args.pseudo_ignore_iou,
         }
+        use_ignore_boxes = args.pseudo_ignore_threshold is not None
 
-        def batched_step_losses(images, token_ids, target_boxes, target_labels, target_valid):
+        def batched_step_losses(
+            images,
+            token_ids,
+            target_boxes,
+            target_labels,
+            target_valid,
+            ignore_boxes=None,
+            ignore_valid=None,
+            no_negative_classes=None,
+        ):
             # Prompts are tokenised outside so a compiled step sees only tensors.
             outputs = model.forward_object_detection(images, token_ids, token_ids == 0)
             return batched_text_query_losses(
-                outputs, target_boxes, target_labels, target_valid, **loss_options
+                outputs,
+                target_boxes,
+                target_labels,
+                target_valid,
+                ignore_boxes=ignore_boxes,
+                ignore_valid=ignore_valid,
+                no_negative_classes=no_negative_classes,
+                **loss_options,
             )
 
         if args.compile_step:
@@ -1824,6 +2121,7 @@ def main(argv: list[str] | None = None) -> None:
                 log_to_mlflow=args.mlflow,
                 max_batches=args.eval_max_batches,
                 class_names=class_names if args.per_class_ap else None,
+                point_sigma=args.point_sigma if args.point_eval else None,
             )
             if args.mlflow:
                 log_eval_metrics(baseline_metrics, "baseline/")
@@ -1842,11 +2140,15 @@ def main(argv: list[str] | None = None) -> None:
                 log_to_mlflow=args.mlflow,
                 max_batches=args.eval_max_batches,
                 class_names=class_names if args.per_class_ap else None,
+                point_sigma=args.point_sigma if args.point_eval else None,
             )
             if args.mlflow:
                 log_eval_metrics(metrics, "val/", step=0)
                 log_per_class_ap(metrics, class_names, "val/", step=0)
             print(f"Evaluation mAP over {len(class_names)} classes: {float(metrics['map']):.4f}")
+            general_map = run_general_eval(0, "evaluation")
+            if general_map is not None:
+                print(f"General-domain mAP: {general_map:.4f}")
             return
 
         output_dir = Path(args.output_dir)
@@ -1854,6 +2156,7 @@ def main(argv: list[str] | None = None) -> None:
         latest_map = None
         global_step = 0
         last_eval_step = None
+        general_reference_map = None
         completed_epoch = 0
         start_epoch = 0
         resume_batches_done = 0
@@ -1876,6 +2179,7 @@ def main(argv: list[str] | None = None) -> None:
             best_map = state["best_map"]
             latest_map = state["latest_map"]
             last_eval_step = state["last_eval_step"]
+            general_reference_map = state.get("general_reference_map")
             torch.set_rng_state(state["torch_rng_state"])
             if state["cuda_rng_state"] is not None and device.type == "cuda":
                 torch.cuda.set_rng_state_all(state["cuda_rng_state"])
@@ -1920,6 +2224,7 @@ def main(argv: list[str] | None = None) -> None:
                 "best_map": best_map,
                 "latest_map": latest_map,
                 "last_eval_step": last_eval_step,
+                "general_reference_map": general_reference_map,
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "scaler": scaler.state_dict(),
@@ -1950,12 +2255,24 @@ def main(argv: list[str] | None = None) -> None:
                 log_to_mlflow=args.mlflow,
                 max_batches=args.eval_max_batches,
                 class_names=class_names if args.per_class_ap else None,
+                point_sigma=args.point_sigma if args.point_eval else None,
             )
             latest_map = float(metrics["map"])
             last_eval_step = step
             if args.mlflow:
                 log_eval_metrics(metrics, "val/", step=step)
                 log_per_class_ap(metrics, class_names, "val/", step=step)
+            general_map = run_general_eval(
+                step, f"validation epoch {epoch_number}, step {step}"
+            )
+            if general_map is not None and general_reference_map is not None:
+                general_delta = general_map - general_reference_map
+                print(
+                    f"General-domain mAP {general_map:.4f} "
+                    f"({general_delta:+.4f} vs initial weights)"
+                )
+                if args.mlflow:
+                    log_metrics({"general/map_delta": general_delta}, step=step)
             if latest_map > best_map:
                 best_map = latest_map
                 save_checkpoint(
@@ -1982,6 +2299,12 @@ def main(argv: list[str] | None = None) -> None:
                 training_state=build_training_state(),
                 ontology_metadata=ontology_metadata,
             )
+
+        if resume_checkpoint is None:
+            # The step-0 point of the general/* curves, and the reference that
+            # general/map_delta is measured against: whatever weights the run
+            # starts from, so --init-from measures this fine-tune alone.
+            general_reference_map = run_general_eval(0, "reference (initial weights)")
 
         for epoch in range(start_epoch, epochs_to_run):
             batch_offset = resume_batches_done if epoch == start_epoch else 0
@@ -2024,12 +2347,30 @@ def main(argv: list[str] | None = None) -> None:
                         images, targets, apply_mosaic=mosaic_enabled
                     )
                 prompts = sample_prompt_set(prompt_pools, prompt_generator)
+                no_negative_classes = None
+                if no_negative_class_mask is not None:
+                    is_pseudo = torch.tensor(
+                        [target["pseudo"] for target in targets], device=device
+                    )
+                    no_negative_classes = is_pseudo[:, None] & no_negative_class_mask
+                ignore_targets = None
+                if use_ignore_boxes:
+                    # Boolean indexing syncs, so this is skipped unless asked for.
+                    targets, ignore_targets = split_ignore_targets(targets)
                 with torch.autocast(device_type=device.type, enabled=amp_enabled):
                     if args.batched_loss:
+                        ignore_boxes = ignore_valid = None
+                        if ignore_targets is not None:
+                            ignore_boxes, _, ignore_valid = pad_text_targets(
+                                ignore_targets, args.max_targets, device
+                            )
                         losses = batched_step_losses(
                             images,
                             detector.tokenize_prompts(prompts, device),
                             *pad_text_targets(targets, args.max_targets, device),
+                            ignore_boxes,
+                            ignore_valid,
+                            no_negative_classes,
                         )
                     else:
                         outputs = detector(images, prompts=prompts)
@@ -2037,6 +2378,10 @@ def main(argv: list[str] | None = None) -> None:
                             outputs,
                             targets,
                             negative_loss_weight=args.negative_loss_weight,
+                            ignore_targets=ignore_targets,
+                            no_negative_classes=no_negative_classes,
+                            point_sigma=args.point_sigma if args.point_loss else None,
+                            point_size_weight=args.point_size_weight,
                             **loss_options,
                         )
                 scaler.scale(losses["loss"] / window_size).backward()

@@ -278,14 +278,7 @@ class OwlV2TRT(OwlV2):
         if self.build_missing:
             self._ensure_artifacts()
 
-        trt_ready = TRT_AVAILABLE and torch.cuda.is_available()
-        self.trt = None
-        if trt_ready and self.engine_path.exists():
-            self.trt = TRTRunner(
-                self.engine_path,
-                input_names=["image"],
-                output_names=["cls_emb", "full_output"],
-            )
+        self._load_trt_vision()
         self._load_trt_heads()
 
     # ------------------------------------------------------------------ heads
@@ -421,6 +414,89 @@ class OwlV2TRT(OwlV2):
 
     # ------------------------------------------------------------------ vision
 
+    # The vision engine is guarded like the heads engine: it bakes in the tower
+    # it was exported from, so a checkpoint that fine-tunes vision blocks would
+    # otherwise be scored with pretrained features, silently.
+
+    def _vision_parameters(self):
+        yield from self.vision_model.parameters()
+
+    def _vision_fingerprint(self) -> list[float]:
+        with torch.no_grad():
+            stats = [
+                torch.stack([p.double().sum(), p.double().square().sum()])
+                for p in self._vision_parameters()
+            ]
+            return torch.stack(stats).flatten().cpu().tolist()
+
+    def _vision_state(self):
+        return tuple((id(p), p.data_ptr(), p._version) for p in self._vision_parameters())
+
+    def _vision_fingerprint_path(self) -> Path:
+        return self.engine_path.with_name(self.engine_path.name + ".json")
+
+    def _load_trt_vision(self):
+        self.trt = None
+        if not (TRT_AVAILABLE and torch.cuda.is_available() and self.engine_path.exists()):
+            return
+        self.trt = TRTRunner(
+            self.engine_path,
+            input_names=["image"],
+            output_names=["cls_emb", "full_output"],
+        )
+        # An engine without a fingerprint is trusted to match the weights at load
+        # time (the pretrained ones here), so a checkpoint loaded later still trips it.
+        fp_path = self._vision_fingerprint_path()
+        if fp_path.exists():
+            self._trt_vision_fingerprint = json.loads(fp_path.read_text())["fingerprint"]
+        else:
+            self._trt_vision_fingerprint = self._vision_fingerprint()
+        self._trt_vision_state = None
+        self._trt_vision_stale = False
+
+    def build_trt_vision(self):
+        """Re-export and rebuild the vision engine from the current vision weights."""
+        from OWLv2torch.torch_version.export import export_vision_tower
+
+        for path in (self.engine_path, self.onnx_path):
+            path.unlink(missing_ok=True)
+        self.onnx_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Exporting OWLv2 vision ONNX to {self.onnx_path}")
+        export_vision_tower(self.vision_model, str(self.onnx_path), self.image_size, fp16=self.fp16)
+        if not self._can_build():
+            return
+        from OWLv2torch.torch_version.build_engine import build_engine
+
+        print(f"Building OWLv2 vision TensorRT engine to {self.engine_path}")
+        build_engine(
+            onnx_file_path=str(self.onnx_path),
+            engine_file_path=str(self.engine_path),
+            **self.engine_build_kwargs,
+        )
+        self._vision_fingerprint_path().write_text(
+            json.dumps({"fingerprint": self._vision_fingerprint()})
+        )
+        self._load_trt_vision()
+
+    def trt_vision_matches_weights(self) -> bool:
+        """False when the vision weights changed since the engine was built."""
+        if self.trt is None:
+            return False
+        state = self._vision_state()
+        if state != self._trt_vision_state:
+            current = self._vision_fingerprint()
+            self._trt_vision_stale = not np.allclose(
+                current, self._trt_vision_fingerprint, rtol=1e-6, atol=1e-6
+            )
+            self._trt_vision_state = state
+            if self._trt_vision_stale:
+                warnings.warn(
+                    f"Vision weights differ from those in {self.engine_path}; using "
+                    "the torch vision tower. Call build_trt_vision() to rebuild the engine.",
+                    stacklevel=3,
+                )
+        return not self._trt_vision_stale
+
     @timer("trt_inference")
     def trt_inference(self, pixel_data: torch.Tensor):
         pooled_output, full_vision = self.trt(image=pixel_data)
@@ -436,7 +512,7 @@ class OwlV2TRT(OwlV2):
         return pooled_output, full_vision
 
     def _get_vision_outputs(self, pixel_values):
-        if self.trt is not None:
+        if self.trt is not None and self.trt_vision_matches_weights():
             return self.trt_inference(pixel_values)
         return self.vision_model(pixel_values)
 
