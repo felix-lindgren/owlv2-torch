@@ -3,8 +3,8 @@
 Status (2026-10-20, evening): seeds and 2b done, nothing running. The point
 loss alone ties the box loss, but **point loss + 2x2 point slots (P3) wins on
 every seed**: 0.765 vs 0.748 mean, very tiny recall 0.63 -> 0.77. Slots with
-the box loss (P4) lose. Next: an eval-only diagnosis of the AP-vs-recall gap
-(duplicates vs ranking, point NMS). 2a is not started.
+the box loss (P4) lose, to duplicates (diagnosis below). P3's remaining false
+positives are mostly background, not duplicates. 2a is not started.
 
 | final point AP | seed 0 | seed 1 | seed 2 | mean | AR@0.5 | very tiny AR@0.5 |
 |---|---|---|---|---|---|---|
@@ -181,6 +181,47 @@ layer on load. `--point-slot-learning-rate` defaults to the head LR.
   cause is not diagnosed. Duplicates that the IoU quality target does not
   suppress are the first suspect.
 - P3's three seeds spread 0.755–0.775, wider than P0's 0.745–0.752.
+
+**Diagnosis (eval-only, all 12 final checkpoints, val200, 3-seed means).**
+The script reproduces every logged AP exactly. It is not committed; it lived in
+the session scratchpad as `slot_diag.py`. Note that the trainer evaluates at
+`--confidence-threshold 0.001`, not `coco_eval`'s 0.05 default; at 0.05, P3's
+AP reads 0.718.
+
+Recall at OKS 0.5, alone in its 16 px patch | sharing it with another GT:
+
+| size (model px) | n | P0 | P2 | P3 | P4 |
+|---|---|---|---|---|---|
+| < 8 | 101 \| 87 | 0.78 \| 0.46 | 0.78 \| 0.42 | **0.88 \| 0.64** | 0.81 \| 0.68 |
+| 8–12 | 1682 \| 1053 | 0.95 \| 0.78 | 0.94 \| 0.76 | **0.97 \| 0.92** | 0.96 \| 0.89 |
+| 12–16 | 3658 \| 914 | 0.99 \| 0.93 | 0.99 \| 0.93 | 0.99 \| 0.98 | 0.99 \| 0.97 |
+| ≥ 24 | 350 \| 16 | 0.95 \| 1.0 | 0.95 \| 1.0 | 0.94 \| 1.0 | 0.93 \| 0.96 |
+
+- **Crowding confirmed.** Slots lift the shares-a-patch column most
+  (8–12 px: 0.78 -> 0.92). Isolated sub-8 px objects gain too (0.78 -> 0.88).
+  The ≥ 24 px alone bucket dips slightly in both slot arms (0.95 -> 0.93,
+  n = 350); watch it.
+- **P4 loses to duplicates.** With as many detections as GT, P4 has 1033
+  duplicate FPs (OKS ≥ 0.5 to an already-matched GT) vs 438 for P3 and 688 for
+  P0, and 366 fewer TPs than P3. Removing all duplicates lifts P4's AP@0.5 from
+  0.826 to 0.859, level with P0's oracle 0.863. Why the box loss leaves them is
+  still a hypothesis (IoU barely separates slots 8 px apart; OKS does).
+- **P3 has little duplicate headroom.** The duplicate oracle gives +0.015
+  AP@0.5; at the same operating point there are 1583 background FPs vs 438
+  duplicates. Only 22% of P3's duplicates are sibling slots of the same token;
+  the rest are neighbouring tokens, as at 1x.
+- **Point NMS** (square neighbourhood, before the 1500 cap), AP .50:.95:
+
+  | arm | none | r = 2 | r = 3 | r = 4 | r = 6 | r = 8 |
+  |---|---|---|---|---|---|---|
+  | P0 | 0.748 | **0.753** | 0.753 | 0.751 | 0.743 | 0.722 |
+  | P2 | 0.744 | 0.745 | 0.744 | 0.742 | 0.734 | 0.712 |
+  | P3 | 0.765 | **0.767** | 0.767 | 0.765 | 0.756 | 0.728 |
+  | P4 | 0.736 | 0.745 | **0.746** | 0.744 | 0.733 | 0.713 |
+
+  2–3 px NMS is a small free gain; ≥ 6 px suppresses real crowded neighbours.
+  It narrows but does not close P4's gap. P3 + NMS (0.767) still leads P0 +
+  NMS (0.753) by 0.014.
 - Launch with `ARMS="P3 P4" tools/run_aitod_points.sh`. On the 5070 Ti the slot
   arms use 13 GB at batch 8 and are ~12% slower per step; the 3060 needs
   `EXTRA_ARGS=--grad-checkpointing`. P3 seed 0 and P4 seed 0 ran on the 3060.
