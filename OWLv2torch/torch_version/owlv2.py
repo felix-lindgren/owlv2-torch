@@ -520,6 +520,9 @@ class OwlV2(nn.Module):
         self.register_buffer(
             "box_bias", self.compute_box_bias(self.sqrt_num_patches), persistent=False
         )
+        # One prediction per patch token unless enable_point_slots() adds more.
+        self.point_slot_grid = 1
+        self.point_slot_head = None
         # Same result as the accurate path below, computed in torch.
         self.image_transform_fast = T.Compose([
             TorchScipyResize(self.image_size),
@@ -785,6 +788,7 @@ class OwlV2(nn.Module):
         # Detection needs dense vision states, not the pooled visual projection.
         _, vision_full = self._get_vision_outputs(pixel_values)
         image_feats, feature_map = self._detection_image_features_from_vision(vision_full)
+        image_feats = self.point_slot_features(image_feats)
         if text_features.dtype != image_feats.dtype:
             text_features = text_features.to(dtype=image_feats.dtype)
 
@@ -798,9 +802,71 @@ class OwlV2(nn.Module):
         # Predict object boxes. Use functional add (not +=) so autograd is
         # happy during training.
         pred_boxes = self.box_head(image_feats)
-        pred_boxes = torch.sigmoid(pred_boxes + self.box_bias)
+        pred_boxes = torch.sigmoid(pred_boxes + self.detection_box_bias)
 
         return pred_logits, objectness_logits, pred_boxes, class_embeds, (feature_map, text_features)
+
+    def enable_point_slots(self, grid: int) -> "OwlV2":
+        """Give every patch token ``grid x grid`` point slots instead of one prediction.
+
+        A linear layer maps each token's detection embedding to ``grid**2`` slot
+        embeddings, which the unchanged class, objectness and box heads score as
+        ordinary queries. The slots are laid out as a row-major ``P*grid`` square
+        grid, so this is a stride ``patch_size / grid`` detector on the same
+        backbone. The layer starts as the identity tiled ``grid**2`` times, so
+        every slot begins as its parent token. Each slot's centre prior is the
+        parent's, shifted to the centre of its sub-cell (symmetrically, so the
+        slots straddle what the pretrained head predicts). The size prior stays
+        at one parent patch.
+        """
+        if grid < 1:
+            raise ValueError(f"grid must be at least 1, got {grid}")
+        if self.point_slot_head is not None:
+            raise RuntimeError(f"Point slots are already enabled ({self.point_slot_grid}x{self.point_slot_grid})")
+        if grid == 1:
+            return self
+        device, dtype = self.box_bias.device, self.layer_norm.weight.dtype
+        dim = self.vision_dim
+        head = nn.Linear(dim, grid * grid * dim, device=device, dtype=dtype)
+        with torch.no_grad():
+            head.weight.copy_(torch.eye(dim, device=device, dtype=dtype).repeat(grid * grid, 1))
+            head.bias.zero_()
+        self.point_slot_head = head
+        self.point_slot_grid = grid
+        self.register_buffer(
+            "point_slot_box_bias", self.compute_point_slot_box_bias(grid).to(device), persistent=False
+        )
+        return self
+
+    def compute_point_slot_box_bias(self, grid: int) -> torch.Tensor:
+        """Box bias for :meth:`enable_point_slots`, ``[(P*grid)**2, 4]`` in slot order."""
+        P = self.sqrt_num_patches
+        # (y, sub_y, x, sub_x) is row-major order on the fine grid.
+        coords = self.normalize_grid_corner_coordinates(P).view(P, 1, P, 1, 2).repeat(1, grid, 1, grid, 1)
+        offsets = (torch.arange(grid, dtype=torch.float32) + 0.5) / (P * grid) - 0.5 / P
+        coords[..., 0] += offsets.view(1, 1, 1, grid)
+        coords[..., 1] += offsets.view(1, grid, 1, 1)
+        coords = torch.clip(coords.view(-1, 2), 0.0, 1.0)
+        coord_bias = torch.log(coords + 1e-4) - torch.log1p(-coords + 1e-4)
+        size_bias = self.compute_box_bias(P)[:1, 2:].expand(coord_bias.shape[0], 2)
+        return torch.cat([coord_bias, size_bias], dim=-1)
+
+    def point_slot_features(self, image_feats: torch.Tensor) -> torch.Tensor:
+        """``[B, P*P, D]`` token features to ``[B, (P*grid)**2, D]`` slot features.
+
+        Returns ``image_feats`` unchanged when point slots are not enabled.
+        """
+        if self.point_slot_head is None:
+            return image_feats
+        batch_size, _, dim = image_feats.shape
+        P, S = self.sqrt_num_patches, self.point_slot_grid
+        slots = self.point_slot_head(image_feats).view(batch_size, P, P, S, S, dim)
+        return slots.permute(0, 1, 3, 2, 4, 5).reshape(batch_size, (P * S) ** 2, dim)
+
+    @property
+    def detection_box_bias(self) -> torch.Tensor:
+        """The box bias matching :meth:`point_slot_features`' query layout."""
+        return self.box_bias if self.point_slot_head is None else self.point_slot_box_bias
 
     @staticmethod
     def normalize_grid_corner_coordinates(num_patches: int) -> torch.Tensor:

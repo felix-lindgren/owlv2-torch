@@ -1,7 +1,19 @@
 # Run plan — OWLv2 as a point detector for tiny objects (AI-TOD)
 
-Status (2026-10-20): concept test done, one seed. Nothing is running. Next up:
-seeds, then 2x zoom vs a multi-slot point head, as competing arms.
+Status (2026-10-20, evening): seeds and 2b done, nothing running. The point
+loss alone ties the box loss, but **point loss + 2x2 point slots (P3) wins on
+every seed**: 0.765 vs 0.748 mean, very tiny recall 0.63 -> 0.77. Slots with
+the box loss (P4) lose. Next: an eval-only diagnosis of the AP-vs-recall gap
+(duplicates vs ranking, point NMS). 2a is not started.
+
+| final point AP | seed 0 | seed 1 | seed 2 | mean | AR@0.5 | very tiny AR@0.5 |
+|---|---|---|---|---|---|---|
+| P0 box loss | 0.745 | 0.752 | 0.748 | 0.748 | 0.950 | 0.628 |
+| P2 point loss + w/h | 0.749 | 0.750 | 0.732 | 0.744 | 0.946 | 0.615 |
+| **P3 P2 + `--point-slot-grid 2`** | 0.755 | 0.775 | 0.764 | **0.765** | **0.976** | **0.768** |
+| P4 P0 + `--point-slot-grid 2` | 0.740 | 0.740 | 0.727 | 0.736 | 0.968 | 0.743 |
+
+Recall and very tiny recall are three-seed means.
 
 ## Where things stand
 
@@ -56,7 +68,9 @@ Launch with `tools/run_aitod_points.sh`.
 
 ## Step 1 — seeds (no code changes)
 
-P2 vs P0 is +0.004 on one seed and 200 val images, inside plausible seed noise.
+Done. P2 − P0 is +0.004, −0.002, −0.016: the point loss alone is no better
+than the box loss and spreads wider across seeds. It pays off only together
+with the slot head (2b).
 
 ```sh
 SEED=1 tools/run_aitod_points.sh
@@ -137,6 +151,39 @@ Risks:
   unverified.
 - With 14,400 queries, duplicate points on one object become more likely.
   Watch precision (AP vs AR), not just recall.
+
+**Implementation (2026-10-20).** `--point-slot-grid 2` (`OwlV2.enable_point_slots`).
+The slots are ordered as a row-major 120x120 grid, so the loss, matching and
+`coco_eval` are unchanged. Checkpoints store `point_slot_grid` and recreate the
+layer on load. `--point-slot-learning-rate` defaults to the head LR.
+- **Centre prior:** the parent's prior shifted by ±1/4 patch (±4 px) to each
+  sub-cell centre, not `compute_box_bias(120)`. OWL's prior sits at the patch
+  corner, so the plain 120-grid bias would have put three of the four slots up
+  to 8 px off what the pretrained head predicts. **Size prior:** one parent
+  patch (1/60).
+- **Step 0:** scores and w/h equal the parent token's exactly. Each object
+  therefore gets four equal-score points ±4 px apart. Zero-shot point AP falls
+  from 0.217 to **0.054**, while AR@0.5 rises from 0.579 to 0.626. Training
+  has to learn to suppress three of the four. A 60-step smoke run
+  (batch 4, 3 val batches) gave 0.434 vs 0.502 without slots.
+- **Cost:** Hungarian on random costs at 1,499 GT takes 0.27 s (0.07 s at 3600
+  queries); median train image has 22 GT. Step time on the 3060 is
+  unchanged at batch 4. Batch 8 OOMs on the 3060 (12 GB) without
+  `--grad-checkpointing`; on it, 6 GB at 1.9 s/step.
+- If P3 lags P2, the first thing to try is breaking the step-0 symmetry
+  (e.g. a per-slot score offset) or a higher `--point-slot-learning-rate`.
+
+**Result (three seeds, table at the top).**
+- **P3 beats P0 on every seed** (+0.010, +0.023, +0.016) and P2 on every seed.
+- **P4 loses to P0 on every seed** (−0.005, −0.012, −0.020), although its
+  recall rises almost as much (AR@0.5 0.968, very tiny 0.74). Its AP@0.5 falls
+  (0.826 vs 0.844), so with the box loss the extra slots cost precision. The
+  cause is not diagnosed. Duplicates that the IoU quality target does not
+  suppress are the first suspect.
+- P3's three seeds spread 0.755–0.775, wider than P0's 0.745–0.752.
+- Launch with `ARMS="P3 P4" tools/run_aitod_points.sh`. On the 5070 Ti the slot
+  arms use 13 GB at batch 8 and are ~12% slower per step; the 3060 needs
+  `EXTRA_ARGS=--grad-checkpointing`. P3 seed 0 and P4 seed 0 ran on the 3060.
 
 ### What to watch (2a and 2b)
 

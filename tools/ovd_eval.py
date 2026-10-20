@@ -111,6 +111,7 @@ def detect(
     num_queries = token_ids.shape[0] // batch_size
 
     image_feats, _ = model._image_grid_features(pixel_values)
+    image_feats = model.point_slot_features(image_feats)
     text_features = model.get_text_features(token_ids, attention_mask)
     text_features = text_features.reshape(batch_size, num_queries, -1)
     query_token_ids = token_ids.reshape(batch_size, num_queries, -1)
@@ -118,7 +119,7 @@ def detect(
 
     pred_logits, _ = model.class_head(image_feats, text_features, query_mask)
     objectness_logits = model.objectness_head(image_feats)[..., 0]
-    pred_boxes = torch.sigmoid(model.box_head(image_feats) + model.box_bias)
+    pred_boxes = torch.sigmoid(model.box_head(image_feats) + model.detection_box_bias)
     return pred_logits, objectness_logits, pred_boxes
 
 

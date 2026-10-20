@@ -638,6 +638,12 @@ def configure_trainable_parameter_groups(model: OwlV2, args) -> list[dict]:
             groups.append({"params": parameters, "lr": learning_rate, "name": name})
 
     add_group("class_head", model.class_head, args.head_learning_rate)
+    if model.point_slot_head is not None:
+        add_group(
+            "point_slot_head",
+            model.point_slot_head,
+            args.point_slot_learning_rate or args.head_learning_rate,
+        )
     if args.train_box_head:
         add_group("box_head", model.box_head, args.head_learning_rate)
     if args.train_objectness_head:
@@ -795,6 +801,7 @@ def save_checkpoint(
             "map": map_value,
             "config": vars(args),
             "vision_lora": vision_lora,
+            "point_slot_grid": model.point_slot_grid,
             "training_ontology": ontology_metadata,
             "training_state": training_state,
         },
@@ -829,6 +836,9 @@ def apply_text_checkpoint(model: OwlV2, checkpoint: dict) -> dict:
         # Accept transitional checkpoints that stored adapter metadata before
         # adopting the explicit LoRA format names.
         inject_vision_lora(model, vision_lora)
+    point_slot_grid = checkpoint.get("point_slot_grid", 1)
+    if point_slot_grid > 1:
+        model.enable_point_slots(point_slot_grid)
 
     incompatible = model.load_state_dict(
         checkpoint["model_state_dict"],
@@ -902,6 +912,7 @@ RESUME_CRITICAL_ARGS = (
     "text_blocks",
     "train_box_head",
     "train_objectness_head",
+    "point_slot_grid",
     "head_learning_rate",
     "vision_learning_rate",
     "text_learning_rate",
@@ -1375,6 +1386,22 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--point-slot-grid",
+        type=int,
+        default=1,
+        help=(
+            "Give every patch token GRID x GRID point slots (a stride 16/GRID "
+            "output) from an identity-initialised linear layer on its detection "
+            "embedding, for objects that share a patch. 1 keeps one prediction "
+            "per token. Checkpoints record it and recreate the slots on load."
+        ),
+    )
+    parser.add_argument(
+        "--point-slot-learning-rate",
+        type=float,
+        help="Learning rate of the --point-slot-grid layer; defaults to --head-learning-rate.",
+    )
+    parser.add_argument(
         "--pseudo-label-threshold",
         type=float,
         help=(
@@ -1532,6 +1559,8 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("point_sigma must be positive")
     if args.point_size_weight < 0:
         raise ValueError("point_size_weight must be non-negative")
+    if args.point_slot_grid < 1:
+        raise ValueError("point_slot_grid must be at least 1")
     if args.vision_lora_blocks < 0:
         raise ValueError("vision_lora_blocks must be non-negative")
     for name in ("horizontal_flip_prob", "vertical_flip_prob"):
@@ -1647,6 +1676,16 @@ def main(argv: list[str] | None = None) -> None:
                         f"{initial_lora.get('full_vision_blocks', 0)}, requested "
                         f"{args.vision_blocks}"
                     )
+        if model.point_slot_grid == 1:
+            model.enable_point_slots(args.point_slot_grid)
+        elif args.point_slot_grid == 1:
+            # The checkpoint's slots are part of its weights.
+            args.point_slot_grid = model.point_slot_grid
+        elif args.point_slot_grid != model.point_slot_grid:
+            raise ValueError(
+                f"--point-slot-grid {args.point_slot_grid} does not match the "
+                f"checkpoint's {model.point_slot_grid}"
+            )
         parameter_groups = configure_trainable_parameter_groups(model, args)
         if not parameter_groups:
             raise RuntimeError("No trainable parameter groups were configured")

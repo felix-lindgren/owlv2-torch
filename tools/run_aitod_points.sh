@@ -3,8 +3,10 @@
 # the same recipe with the box loss and with --point-loss, and score both (plus
 # the zero-shot weights) with OKS point AP on box centres.
 #
-#   tools/run_aitod_points.sh          # both arms, seed 0
+#   tools/run_aitod_points.sh          # default arms, seed 0
 #   SEED=1 tools/run_aitod_points.sh
+#   SEED=1 ARMS="P3 P4" tools/run_aitod_points.sh      # only the point-slot arms
+#   EXTRA_ARGS=--grad-checkpointing tools/run_aitod_points.sh   # 12 GB cards with slots
 #
 # Subsets: /mnt/datasets/sat/xview_aitod_v2/subsets/vehicle_{train1000,val200}.json
 # (seed-0 random images, vehicle annotations only).
@@ -13,6 +15,9 @@ cd "$(dirname "$0")/.."
 
 SEED=${SEED:-0}
 STEPS=${STEPS:-2000}
+# P1 (point loss without the w/h L1) lost on seed 0 and is off by default.
+ARMS=${ARMS:-P0 P2 P3 P4}
+read -ra EXTRA <<< "${EXTRA_ARGS:-}"
 OUT=logs/aitod_points
 mkdir -p "$OUT"
 AITOD=/mnt/datasets/sat/xview_aitod_v2
@@ -39,11 +44,15 @@ COMMON=(
 
 run() {  # name, then extra args
   local name=$1; shift
+  [[ " $ARMS " == *" ${name%%_*} "* ]] || return 0
   [ -f "text_checkpoints/$name/final.pth" ] && return
-  uv run --extra train python prototype_train/train_text.py "${COMMON[@]}" "$@" \
+  uv run --extra train python prototype_train/train_text.py "${COMMON[@]}" "${EXTRA[@]}" "$@" \
     --mlflow-run-name "$name" --output-dir "text_checkpoints/$name" 2>&1 | tee "$OUT/train_$name.log"
 }
 
 run P0_box_loss_seed$SEED --run-zero-shot-baseline
 run P1_point_loss_seed$SEED --point-loss
 run P2_point_loss_wh2.5_seed$SEED --point-loss --point-size-weight 2.5
+# 2b: 2x2 point slots per token (stride-8 output), with the point and the box loss.
+run P3_point_slots2_wh2.5_seed$SEED --point-loss --point-size-weight 2.5 --point-slot-grid 2
+run P4_box_slots2_seed$SEED --point-slot-grid 2
