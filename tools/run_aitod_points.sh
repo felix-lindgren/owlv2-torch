@@ -7,9 +7,12 @@
 #   SEED=1 tools/run_aitod_points.sh
 #   SEED=1 ARMS="P3 P4" tools/run_aitod_points.sh      # only the point-slot arms
 #   EXTRA_ARGS=--grad-checkpointing tools/run_aitod_points.sh   # 12 GB cards with slots
+#   TRAIN_SUBSET=vehicle_train_all TAG=_trainall STEPS=7400 tools/run_aitod_points.sh
 #
 # Subsets: /mnt/datasets/sat/xview_aitod_v2/subsets/vehicle_{train1000,val200}.json
-# (seed-0 random images, vehicle annotations only).
+# (seed-0 random images, vehicle annotations only). vehicle_train_all.json is the
+# whole train split (3704 images), vehicle annotations only. TAG is appended to run
+# names so runs on another subset do not collide with (and get skipped as) these.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -17,13 +20,15 @@ SEED=${SEED:-0}
 STEPS=${STEPS:-2000}
 # P1 (point loss without the w/h L1) lost on seed 0 and is off by default.
 ARMS=${ARMS:-P0 P2 P3 P4}
+TRAIN_SUBSET=${TRAIN_SUBSET:-vehicle_train1000}
+TAG=${TAG:-}
 read -ra EXTRA <<< "${EXTRA_ARGS:-}"
 OUT=logs/aitod_points
 mkdir -p "$OUT"
 AITOD=/mnt/datasets/sat/xview_aitod_v2
 
 COMMON=(
-  --train-annotations $AITOD/subsets/vehicle_train1000.json --train-images $AITOD/train/images
+  --train-annotations "$AITOD/subsets/$TRAIN_SUBSET.json" --train-images $AITOD/train/images
   --val-annotations $AITOD/subsets/vehicle_val200.json --val-images $AITOD/val/images
   --model-type base --prompt-profile aerial
   --class-loss mal --class-loss-gamma 1.5
@@ -43,7 +48,7 @@ COMMON=(
 )
 
 run() {  # name, then extra args
-  local name=$1; shift
+  local name=$1$TAG; shift
   [[ " $ARMS " == *" ${name%%_*} "* ]] || return 0
   [ -f "text_checkpoints/$name/final.pth" ] && return
   uv run --extra train python prototype_train/train_text.py "${COMMON[@]}" "${EXTRA[@]}" "$@" \

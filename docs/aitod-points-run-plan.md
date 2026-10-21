@@ -66,6 +66,34 @@ Launch with `tools/run_aitod_points.sh`.
   above, not the probe, to judge crowding. It is per-GT greedy matching of the
   top 1500 points against centres, bucketed by patch-mates.
 
+## Full train split (2026-10-20/21)
+
+`subsets/vehicle_train_all.json`: all 3704 train-split images, vehicle boxes
+only (190,288), no overlap with val200. Same 16 epochs as the 1000-image runs:
+7400 steps, cosine over all of them, eval every 500 steps on val200.
+
+| seed 0 | AP | AP@0.5 | AR@0.5 | very tiny AR@0.5 |
+|---|---|---|---|---|
+| P0 box loss, train1000 | 0.745 | 0.840 | 0.947 | 0.633 |
+| P0 box loss, train_all | 0.781 | 0.869 | 0.955 | 0.676 |
+| P3 point + slots, train1000 (3-seed mean 0.765) | 0.755 | 0.862 | 0.973 | 0.734 |
+| **P3 point + slots, train_all** | **0.808** | 0.904 | 0.981 | 0.878 |
+
+Slots and data stack: P3 − P0 is +0.027 on train_all against +0.010 on
+train1000 (seed 0; the 3-seed train1000 gap is +0.017). P3 led P0 at every eval
+from step 1500 on. Very tiny AR@0.5 rises from 0.68 to 0.88, so more data helps
+the slots resolve crowded patches more than it helps the single-output head.
+Medium AR@0.5 drops 0.942 → 0.916, but n = 154.
+
+```sh
+ARMS=P3 SEED=0 TRAIN_SUBSET=vehicle_train_all TAG=_trainall STEPS=7400 \
+  EXTRA_ARGS="--eval-every-steps 500" tools/run_aitod_points.sh
+```
+
+About 65 min on the 5070 Ti. Still open: an equal-compute arm (2000 steps on
+train_all) to separate more data from longer training, and seeds 1–2 on
+train_all.
+
 ## Step 1 — seeds (no code changes)
 
 Done. P2 − P0 is +0.004, −0.002, −0.016: the point loss alone is no better
