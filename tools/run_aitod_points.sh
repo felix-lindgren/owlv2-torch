@@ -13,6 +13,7 @@
 # (seed-0 random images, vehicle annotations only). vehicle_train_all.json is the
 # whole train split (3704 images), vehicle annotations only. TAG is appended to run
 # names so runs on another subset do not collide with (and get skipped as) these.
+# Rerunning the same command resumes any arm that has last.pth but no final.pth.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -51,8 +52,13 @@ run() {  # name, then extra args
   local name=$1$TAG; shift
   [[ " $ARMS " == *" ${name%%_*} "* ]] || return 0
   [ -f "text_checkpoints/$name/final.pth" ] && return
-  uv run --extra train python prototype_train/train_text.py "${COMMON[@]}" "${EXTRA[@]}" "$@" \
-    --mlflow-run-name "$name" --output-dir "text_checkpoints/$name" 2>&1 | tee "$OUT/train_$name.log"
+  # An interrupted run continues from its last eval; EXTRA_ARGS must match the first launch.
+  local resume=() tee_args=()
+  if [ -f "text_checkpoints/$name/last.pth" ]; then
+    resume=(--resume "text_checkpoints/$name"); tee_args=(-a)
+  fi
+  uv run --extra train python prototype_train/train_text.py "${COMMON[@]}" "${EXTRA[@]}" "$@" "${resume[@]}" \
+    --mlflow-run-name "$name" --output-dir "text_checkpoints/$name" 2>&1 | tee "${tee_args[@]}" "$OUT/train_$name.log"
 }
 
 run P0_box_loss_seed$SEED --run-zero-shot-baseline

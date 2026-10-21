@@ -90,6 +90,51 @@ ARMS=P3 SEED=0 TRAIN_SUBSET=vehicle_train_all TAG=_trainall STEPS=7400 \
   EXTRA_ARGS="--eval-every-steps 500" tools/run_aitod_points.sh
 ```
 
+**TP/FP breakdown (eval-only, seed 0 train_all, val200, OKS 0.5).** Greedy
+matching in score order. FP kinds: dup = OKS >= 0.5 to an already-matched GT,
+loc = best OKS 0.1-0.5, bg = best OKS < 0.1. P3 scores run higher than P0's,
+so fixed thresholds mislead; compare at best F1 or equal recall.
+
+| arm | thr | P | R | F1 | TP | FP | dup | loc | bg |
+|---|---|---|---|---|---|---|---|---|---|
+| P0 best F1 | 0.15 | 0.839 | 0.817 | 0.828 | 8676 | 1669 | 440 | 319 | 910 |
+| P3 best F1 | 0.24 | 0.862 | 0.833 | 0.847 | 8852 | 1419 | 221 (16 sibling slots) | 288 | 910 |
+
+FPs needed to reach a recall: 0.80: P3 1064 vs P0 1448; 0.90: 3047 vs 5598;
+0.95: 8398 vs 54,116; 0.97: P3 21,371, P0 never gets there.
+
+Slots do not add FPs. At best F1, 0.4% of empty patches have an active slot
+(P0: 0.5%), and 99% of single-GT patches use at most one slot. Mean active
+slots per token rise with GT in the patch (0.72 / 1.00 / 1.33 / 1.82 for
+1 / 2 / 3 / 4+ GT), so the head is conservative: only 13% of two-GT patches
+fire two slots at best F1. The slots halve duplicates; background FPs are the
+same 910 in both arms and are now 64% of P3's FPs.
+
+**The background FPs are mostly missing labels.** A contact sheet of P3's
+910 background FPs at best F1, made by eye from 64 px crops: about 45 of the
+top-scored 48 (scores 0.86-0.98) are clear vehicles without a GT point, often
+next to labelled ones. In a random 48 from the rest, most above 0.5 are
+vehicles and about half below 0.5. So most of the remaining precision gap is
+val-label incompleteness, and it affects both arms. Train labels are
+presumably just as incomplete, so these vehicles are trained as negatives.
+
+Seed 1: P3 0.8068 (seed 0 0.8081). P0 seeds 1-2 and P3 seed 2 were stopped
+for a shutdown; rerun the same launch commands and the script resumes them.
+
+**Low-precision inference, no retraining (P3 seed 0, vision-encoder linears).**
+
+| variant | AP | AP@0.5 | very tiny AR@0.5 |
+|---|---|---|---|
+| fp16 autocast (reference) | 0.8081 | 0.9044 | 0.878 |
+| fp16 accumulation | 0.8080 | 0.9043 | 0.872 |
+| FP8 rowwise, MLP only | 0.8060 | 0.9042 | 0.878 |
+| FP8 rowwise, all linears | 0.8023 | 0.9013 | 0.888 |
+| FP8 tensorwise, all linears | 0.8006 | 0.8997 | 0.872 |
+| NVFP4, MLP only | 0.7782 | 0.8863 | 0.825 |
+| NVFP4, all linears | 0.7526 | 0.8682 | 0.819 |
+
+FP8 needs no QAT; NVFP4 loses 0.03-0.06 and would need it.
+
 About 65 min on the 5070 Ti. Still open: an equal-compute arm (2000 steps on
 train_all) to separate more data from longer training, and seeds 1–2 on
 train_all.
