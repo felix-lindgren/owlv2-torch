@@ -322,8 +322,18 @@ stops at block 6. Estimate from the 5070 Ti profile (421 ms/step):
   trainable ones need dX and dW, so they are 6 of the 18 GEMM units in 85 ms.
 - They add about 15 ms of elementwise backward.
 
-So plain vb6 should be about 20-25% faster per step (~320 ms), with lower
-activation memory. Measure it rather than trust this.
+Measured (2026-10-22, P3 recipe, train_all, 5070 Ti, steps 60-200 of a
+200-step run, +/- 1 s timer resolution):
+
+| arm | ms/step | vs hybrid |
+|---|---|---|
+| hybrid (vb6 + first-six LoRA), current | 507 | |
+| vb6, no LoRA | 407 | -20% |
+| hybrid + `--fp16-accumulation` | 457 | -10% |
+| vb6, no LoRA + `--fp16-accumulation` | 364 | -28% |
+
+The estimate above was right. A full 7400-step run drops from about 63 to
+about 45 min with both changes.
 
 Test: P3 with `--vision-lora-blocks 0` on train_all, seed 0, against P3 seeds
 0/1 (0.8081 / 0.8068). The two train_all seeds sit 0.0013 apart, so one run
