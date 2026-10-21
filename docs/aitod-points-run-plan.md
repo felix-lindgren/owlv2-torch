@@ -306,6 +306,31 @@ above: 2b should mainly lift the shares-a-patch column. The size bucket edges
 are in model pixels in the in-training eval; for AI-TOD's 800 px tiles,
 multiply source pixels by 1.2.
 
+## Open: is the first-six LoRA worth its backward cost here?
+
+Every AI-TOD arm uses the LV-MHP hybrid: `--vision-blocks 6` trains blocks 6-11
+in full, and `--vision-lora-blocks 6 --vision-lora-placement first` puts Q/V
+LoRA on blocks 0-5, which are otherwise frozen. It was carried over from LV-MHP
+(+0.0099 over plain vb6, two seeds) and never re-tested here. LoRA on 6-11
+would be redundant, because those weights already train in full. The real
+alternative is plain vb6 (`--vision-lora-blocks 0`).
+
+Cost: the adapters on block 0 force backward through all 12 blocks. Plain vb6
+stops at block 6. Estimate from the 5070 Ti profile (421 ms/step):
+- Blocks 0-5 add about 56 ms of flash backward (112 ms / 12 blocks).
+- They add about 28 ms of input-gradient GEMMs: frozen blocks need only dX,
+  trainable ones need dX and dW, so they are 6 of the 18 GEMM units in 85 ms.
+- They add about 15 ms of elementwise backward.
+
+So plain vb6 should be about 20-25% faster per step (~320 ms), with lower
+activation memory. Measure it rather than trust this.
+
+Test: P3 with `--vision-lora-blocks 0` on train_all, seed 0, against P3 seeds
+0/1 (0.8081 / 0.8068). The two train_all seeds sit 0.0013 apart, so one run
+is informative here, unlike train1000 (spread 0.02). Small objects may lean on
+early-block adaptation more than LV-MHP did, so the +0.0099 may not transfer
+either way.
+
 ## Known limits
 
 - `--point-loss` is not implemented for `--batched-loss`/`--compile-step` and
