@@ -925,6 +925,7 @@ RESUME_CRITICAL_ARGS = (
     "seed",
     "shots_per_class",
     "amp",
+    "fp16_accumulation",
     "mosaic_no_aug_steps",
     "mosaic_mode",
     "scale_augment",
@@ -1159,6 +1160,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--fp16-accumulation",
+        action="store_true",
+        help=(
+            "Let fp16 matmuls accumulate in fp16 (torch.backends.cuda.matmul."
+            "allow_fp16_accumulation). About 1.6x faster GEMMs on GeForce Blackwell, "
+            "which runs fp32-accumulate MMA at half rate. Attention is unaffected."
+        ),
+    )
     parser.add_argument(
         "--compile",
         action="store_true",
@@ -1499,6 +1509,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     parser = build_argument_parser()
     args = parser.parse_args(argv)
+    if args.fp16_accumulation:
+        torch.backends.cuda.matmul.allow_fp16_accumulation = True
     if args.merge_lora_checkpoint is not None or args.merge_lora_output is not None:
         if args.merge_lora_checkpoint is None or args.merge_lora_output is None:
             parser.error(
