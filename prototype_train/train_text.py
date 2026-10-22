@@ -914,6 +914,7 @@ RESUME_CRITICAL_ARGS = (
     "train_box_head",
     "train_objectness_head",
     "point_slot_grid",
+    "point_max_size",
     "head_learning_rate",
     "vision_learning_rate",
     "text_learning_rate",
@@ -1408,6 +1409,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--point-max-size",
+        type=float,
+        default=None,
+        help=(
+            "Hybrid --point-loss: only targets with sqrt(w*h) below this many "
+            "model-input pixels are matched and trained as points; larger ones get "
+            "the box loss (L1, GIoU, IoU quality target). Default: all are points."
+        ),
+    )
+    parser.add_argument(
         "--point-slot-grid",
         type=int,
         default=1,
@@ -1587,6 +1598,8 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("point_sigma must be positive")
     if args.point_size_weight < 0:
         raise ValueError("point_size_weight must be non-negative")
+    if args.point_max_size is not None and (not args.point_loss or args.point_max_size <= 0):
+        raise ValueError("--point-max-size needs --point-loss and a positive size")
     if args.point_slot_grid < 1:
         raise ValueError("point_slot_grid must be at least 1")
     if args.vision_lora_blocks < 0:
@@ -2449,6 +2462,11 @@ def main(argv: list[str] | None = None) -> None:
                             no_negative_classes=no_negative_classes,
                             point_sigma=args.point_sigma if args.point_loss else None,
                             point_size_weight=args.point_size_weight,
+                            point_max_size=(
+                                args.point_max_size / model.image_size
+                                if args.point_max_size is not None
+                                else None
+                            ),
                             **loss_options,
                         )
                 scaler.scale(losses["loss"] / window_size).backward()

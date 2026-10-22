@@ -68,6 +68,13 @@ def _ignored_patches(
     return ignored
 
 
+def _is_point_target(target_boxes: torch.Tensor, point_max_size: float | None) -> torch.Tensor:
+    """Targets trained as points: all of them, or those with ``sqrt(w*h) < point_max_size``."""
+    if point_max_size is None:
+        return torch.ones(target_boxes.shape[0], dtype=torch.bool, device=target_boxes.device)
+    return (target_boxes[:, 2] * target_boxes[:, 3]).clamp_min(0).sqrt() < point_max_size
+
+
 @torch.no_grad()
 def hungarian_match_text(
     class_logits: torch.Tensor,
@@ -78,11 +85,14 @@ def hungarian_match_text(
     bbox_cost: float = 5.0,
     giou_cost: float = 2.0,
     point_sigma: float | None = None,
+    point_max_size: float | None = None,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
     """Match patch predictions to targets using text class and box costs.
 
     With ``point_sigma`` only centres are compared: ``bbox_cost`` weighs the L1
     centre distance and ``giou_cost`` weighs ``1 - OKS`` in place of ``1 - GIoU``.
+    ``point_max_size`` (normalised ``sqrt(w*h)``) limits that to smaller targets;
+    larger ones keep the box cost.
 
     On CUDA all images are solved in one launch of the Triton solver in
     :mod:`OWLv2torch.torch_version.linear_assignment`, which reproduces SciPy's
@@ -110,7 +120,18 @@ def hungarian_match_text(
         if class_cost:
             # Each target label indexes the corresponding text query.
             cost = cost - class_cost * logits.float().sigmoid()[:, target_labels]
-        if point_sigma is not None:
+        is_point = _is_point_target(target_boxes, point_max_size) if point_sigma is not None else None
+        if is_point is not None and not is_point.all():
+            point_cost = bbox_cost * torch.cdist(
+                boxes[:, :2].float(), target_boxes[:, :2].float(), p=1
+            ) + giou_cost * (1.0 - pairwise_oks(boxes[:, :2], target_boxes, point_sigma))
+            box_cost = bbox_cost * torch.cdist(boxes.float(), target_boxes.float(), p=1) + giou_cost * (
+                1.0 - generalized_box_iou(
+                    box_cxcywh_to_xyxy(boxes.float()), box_cxcywh_to_xyxy(target_boxes.float())
+                )
+            )
+            cost = cost + torch.where(is_point[None, :], point_cost, box_cost)
+        elif point_sigma is not None:
             if bbox_cost:
                 cost = cost + bbox_cost * torch.cdist(
                     boxes[:, :2].float(), target_boxes[:, :2].float(), p=1
@@ -244,6 +265,7 @@ def _quality_class_loss(
     ignored: torch.Tensor | None = None,
     no_negative_classes: torch.Tensor | None = None,
     point_sigma: float | None = None,
+    point_max_size: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """IoU-aware dense classification loss: MAL (DEIM) or VFL (VarifocalNet).
 
@@ -263,7 +285,8 @@ def _quality_class_loss(
     patches that overlap a pseudo-label ignore box, and ``no_negative_classes``
     (``[B, num_classes]``) drops it for whole classes of an image.
 
-    With ``point_sigma`` the quality is the matched centre's OKS instead of IoU.
+    With ``point_sigma`` the quality is the matched centre's OKS instead of IoU,
+    for the targets ``point_max_size`` selects (all by default).
     """
     if variant not in ("mal", "vfl"):
         raise ValueError(f"variant must be 'mal' or 'vfl', got {variant!r}")
@@ -286,13 +309,19 @@ def _quality_class_loss(
             device=device, dtype=matched_boxes.dtype
         )[target_indices]
         with torch.no_grad():
-            if point_sigma is not None:
+            is_point = (
+                _is_point_target(target_boxes, point_max_size) if point_sigma is not None else None
+            )
+            if is_point is not None and is_point.all():
                 ious = pairwise_oks(matched_boxes[:, :2], target_boxes, point_sigma).diagonal()
             else:
                 ious = box_iou(
                     box_cxcywh_to_xyxy(matched_boxes.float()),
                     box_cxcywh_to_xyxy(target_boxes.float()),
                 ).diagonal()
+                if is_point is not None:
+                    oks = pairwise_oks(matched_boxes[:, :2], target_boxes, point_sigma).diagonal()
+                    ious = torch.where(is_point, oks.to(ious.dtype), ious)
         one_hot[batch_index, pred_indices, labels] = 1.0
         quality[batch_index, pred_indices, labels] = ious.to(quality.dtype)
         num_boxes += pred_indices.numel()
@@ -350,6 +379,7 @@ def compute_text_query_losses(
     no_negative_classes: torch.Tensor | None = None,
     point_sigma: float | None = None,
     point_size_weight: float = 0.0,
+    point_max_size: float | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute detection losses where each class index denotes a text query.
 
@@ -388,6 +418,11 @@ def compute_text_query_losses(
     ``L_oks``. ``point_size_weight`` adds an L1 on the matched width and height
     (``L_wh``): without it they get no gradient and drift as the shared box-head
     layers train, and the unmatched patches' centres drift with them.
+
+    ``point_max_size`` (normalised ``sqrt(w*h)``) keeps the point treatment for
+    smaller targets only: larger ones are matched and trained as boxes (full-box
+    L1, GIoU, IoU quality target) in the same loss terms, and ``L_wh`` covers the
+    point targets alone.
     """
     if class_loss not in CLASS_LOSS_CHOICES:
         raise ValueError(
@@ -414,6 +449,7 @@ def compute_text_query_losses(
         bbox_cost=match_bbox_cost,
         giou_cost=match_giou_cost,
         point_sigma=point_sigma,
+        point_max_size=point_max_size,
     )
     ignored = (
         _ignored_patches(pred_boxes, ignore_targets, ignore_iou_threshold, point_sigma)
@@ -460,7 +496,24 @@ def compute_text_query_losses(
             target_boxes = targets[batch_index]["boxes"].to(
                 device=matched_boxes.device, dtype=matched_boxes.dtype
             )[target_indices]
-            if point_sigma is not None:
+            is_point = (
+                _is_point_target(target_boxes, point_max_size) if point_sigma is not None else None
+            )
+            if is_point is not None and not is_point.all():
+                centre_l1 = (matched_boxes[:, :2] - target_boxes[:, :2]).abs().mean(1)
+                box_l1 = (matched_boxes - target_boxes).abs().mean(1)
+                l1_losses.append(torch.where(is_point, centre_l1, box_l1).mean())
+                oks = pairwise_oks(matched_boxes[:, :2], target_boxes, point_sigma).diag()
+                giou = generalized_box_iou(
+                    box_cxcywh_to_xyxy(matched_boxes.float()),
+                    box_cxcywh_to_xyxy(target_boxes.float()),
+                ).diag()
+                giou_losses.append((1.0 - torch.where(is_point, oks.to(giou.dtype), giou)).mean())
+                if is_point.any():
+                    size_losses.append(
+                        F.l1_loss(matched_boxes[is_point, 2:], target_boxes[is_point, 2:], reduction="mean")
+                    )
+            elif point_sigma is not None:
                 l1_losses.append(
                     F.l1_loss(matched_boxes[:, :2], target_boxes[:, :2], reduction="mean")
                 )
@@ -517,6 +570,7 @@ def compute_text_query_losses(
             ignored=ignored,
             no_negative_classes=no_negative_classes,
             point_sigma=point_sigma,
+            point_max_size=point_max_size,
         )
         loss_cls = loss_cls_pos + loss_cls_neg
     loss_l1 = _mean_or_zero(l1_losses, zero)
