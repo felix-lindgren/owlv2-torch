@@ -926,6 +926,7 @@ RESUME_CRITICAL_ARGS = (
     "shots_per_class",
     "amp",
     "fp16_accumulation",
+    "attention_bwd_fp16_accumulation",
     "mosaic_no_aug_steps",
     "mosaic_mode",
     "scale_augment",
@@ -1167,6 +1168,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "Let fp16 matmuls accumulate in fp16 (torch.backends.cuda.matmul."
             "allow_fp16_accumulation). About 1.6x faster GEMMs on GeForce Blackwell, "
             "which runs fp32-accumulate MMA at half rate. Attention is unaffected."
+        ),
+    )
+    parser.add_argument(
+        "--attention-bwd-fp16-accumulation",
+        action="store_true",
+        help=(
+            "Use a Triton flash-attention backward that accumulates dQ/dK/dV in fp16 "
+            "per tile (fp32 across tiles) behind PyTorch's unchanged FA2 forward. "
+            "About 1.27x faster attention backward on GeForce Blackwell at 1.1-1.4x "
+            "FA2's gradient error; outputs and eval are bit-identical."
         ),
     )
     parser.add_argument(
@@ -1511,6 +1522,10 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.fp16_accumulation:
         torch.backends.cuda.matmul.allow_fp16_accumulation = True
+    if args.attention_bwd_fp16_accumulation:
+        from OWLv2torch.torch_version.flash_attention_fp16acc import install
+
+        install()
     if args.merge_lora_checkpoint is not None or args.merge_lora_output is not None:
         if args.merge_lora_checkpoint is None or args.merge_lora_output is None:
             parser.error(
