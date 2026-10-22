@@ -8,11 +8,18 @@
 #   SEED=1 ARMS="P3 P4" tools/run_aitod_points.sh      # only the point-slot arms
 #   EXTRA_ARGS=--grad-checkpointing tools/run_aitod_points.sh   # 12 GB cards with slots
 #   TRAIN_SUBSET=vehicle_train_all TAG=_trainall STEPS=7400 tools/run_aitod_points.sh
+#   TRAIN_SUBSET=all4_train_all VAL_SUBSET=all4_val200 TAG=_all4 STEPS=7400 tools/run_aitod_points.sh
+#   AITOD_ROOT=/mnt/datasets/sat/aitod_v2_full TRAIN_SUBSET=all8_probe2k VAL_SUBSET=all8_val600 \
+#     TAG=_all8probe STEPS=4000 tools/run_aitod_points.sh      # complete AI-TOD, 8 classes
 #
 # Subsets: /mnt/datasets/sat/xview_aitod_v2/subsets/vehicle_{train1000,val200}.json
 # (seed-0 random images, vehicle annotations only). vehicle_train_all.json is the
 # whole train split (3704 images), vehicle annotations only. TAG is appended to run
 # names so runs on another subset do not collide with (and get skipped as) these.
+# all4_*.json (tools/aitod_class_subsets.py) add airplane, storage-tank and ship,
+# the only other classes the xView part annotates; vehicle GT is unchanged.
+# AITOD_ROOT=.../aitod_v2_full is the complete AI-TOD-v2 (all five sources); its
+# subsets come from tools/aitod_full_subsets.py.
 # Rerunning the same command resumes any arm that has last.pth but no final.pth.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -22,15 +29,16 @@ STEPS=${STEPS:-2000}
 # P1 (point loss without the w/h L1) lost on seed 0 and is off by default.
 ARMS=${ARMS:-P0 P2 P3 P4}
 TRAIN_SUBSET=${TRAIN_SUBSET:-vehicle_train1000}
+VAL_SUBSET=${VAL_SUBSET:-vehicle_val200}
 TAG=${TAG:-}
 read -ra EXTRA <<< "${EXTRA_ARGS:-}"
 OUT=logs/aitod_points
 mkdir -p "$OUT"
-AITOD=/mnt/datasets/sat/xview_aitod_v2
+AITOD=${AITOD_ROOT:-/mnt/datasets/sat/xview_aitod_v2}
 
 COMMON=(
-  --train-annotations "$AITOD/subsets/$TRAIN_SUBSET.json" --train-images $AITOD/train/images
-  --val-annotations $AITOD/subsets/vehicle_val200.json --val-images $AITOD/val/images
+  --train-annotations "$AITOD/subsets/$TRAIN_SUBSET.json" --train-images "$AITOD/train/images"
+  --val-annotations "$AITOD/subsets/$VAL_SUBSET.json" --val-images "$AITOD/val/images"
   --model-type base --prompt-profile aerial
   --class-loss mal --class-loss-gamma 1.5
   --head-learning-rate 5e-5 --vision-learning-rate 1e-5
@@ -43,11 +51,12 @@ COMMON=(
   # Zoom-out would shrink 10 px vehicles further; flips and rotations stay.
   --augment --gpu-augment --right-angle-rotations --no-scale-augment --mosaic-prob 0
   --val-transform fast --amp --compile
-  # -11% step time; P3 train_all seed 2 0.8079 vs 0.8081/0.8068 without. Runs before
-  # 2026-10-22 trained without it, so resuming one of those needs it removed.
-  --fp16-accumulation
+  # -11% / -5% step time. P3 train_all: 0.8079 with fp16 GEMM accumulation alone vs
+  # 0.8081/0.8068 without; + the attention backward 0.8030/0.8074. Runs before
+  # 2026-10-22 trained without both, so resuming one of those needs them removed.
+  --fp16-accumulation --attention-bwd-fp16-accumulation
   --negative-ratio 5 --eval-top-k 1500 --weight-decay 1e-4
-  --point-eval
+  --point-eval --per-class-ap
   --mlflow --mlflow-experiment AITOD-Points --seed "$SEED"
 )
 

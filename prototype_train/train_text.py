@@ -716,15 +716,16 @@ def log_per_class_ap(
     """Log per-class AP and AR@100 under ``<prefix>ap/<class>``.
 
     A no-op unless the evaluation was run with class metrics enabled, in which
-    case ``map_per_class`` is a scalar -1 rather than a per-class tensor.
+    case ``map_per_class`` is a scalar -1 rather than a per-class tensor. Point
+    AP reports recall at its per-image cap as ``mar_per_class``; it is logged
+    under the same ``ar_100`` key.
     """
     per_class = metrics.get("map_per_class")
     if per_class is None or per_class.numel() <= 1:
         return
+    recalls = metrics.get("mar_100_per_class", metrics.get("mar_per_class"))
     scalars = {}
-    for label, ap, recall in zip(
-        metrics["classes"].tolist(), per_class, metrics["mar_100_per_class"]
-    ):
+    for label, ap, recall in zip(metrics["classes"].tolist(), per_class, recalls):
         label = int(label)
         name = class_names[label] if label < len(class_names) else f"label {label}"
         key = re.sub(r"[^0-9A-Za-z_.-]+", "_", name)

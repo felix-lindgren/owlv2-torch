@@ -146,10 +146,15 @@ class PointAPAccumulator:
                 self.bucket_hit_50[bucket] += recovered[0, in_bucket].sum()
                 self.bucket_hit[bucket] += recovered[:, in_bucket].sum() / len(OKS_THRESHOLDS)
 
-    def compute(self) -> dict[str, float]:
-        """``map`` (OKS .50:.95), ``map_50``, ``map_75``, recall, per-size recall."""
-        per_class_ap, per_class_recall = [], []
-        for label, num_gts in self.num_gts.items():
+    def compute(self, per_class: bool = False) -> dict:
+        """``map`` (OKS .50:.95), ``map_50``, ``map_75``, recall, per-size recall.
+
+        ``map`` is the mean over classes with ground truth, as in COCO. With
+        ``per_class`` the result also holds ``classes``, ``map_per_class`` and
+        ``mar_per_class`` tensors (OKS .50:.95, recall at ``max_detections``).
+        """
+        per_class_ap, per_class_recall, class_labels = [], [], []
+        for label, num_gts in sorted(self.num_gts.items()):
             if num_gts == 0:
                 continue  # COCO leaves classes without ground truth out of the mean
             scores = np.concatenate(self.scores[label]) if self.scores[label] else np.zeros(0)
@@ -160,6 +165,7 @@ class PointAPAccumulator:
             )
             per_class_ap.append(_average_precision(scores, tp, num_gts))
             per_class_recall.append(tp.sum(axis=1) / num_gts)
+            class_labels.append(label)
         if not per_class_ap:
             return {"map": -1.0, "map_50": -1.0, "map_75": -1.0, "mar": -1.0, "mar_50": -1.0}
         ap = np.mean(per_class_ap, axis=0)
@@ -176,4 +182,8 @@ class PointAPAccumulator:
             metrics[f"mar_{name}"] = float(self.bucket_hit[bucket] / total) if total else -1.0
             metrics[f"mar_50_{name}"] = float(self.bucket_hit_50[bucket] / total) if total else -1.0
             metrics[f"num_gt_{name}"] = float(total)
+        if per_class:
+            metrics["classes"] = torch.tensor(class_labels)
+            metrics["map_per_class"] = torch.tensor([float(ap.mean()) for ap in per_class_ap])
+            metrics["mar_per_class"] = torch.tensor([float(r.mean()) for r in per_class_recall])
         return metrics

@@ -749,7 +749,7 @@ def coco_eval(
                 metric.update(batch_predictions, batch_metric_targets)
 
     if point_metric is not None:
-        metrics = point_metric.compute()
+        metrics = point_metric.compute(per_class=per_class)
         print(f"\n=== {title} (point AP, OKS sigma={point_sigma:g}, maxDets={point_metric.max_detections}) ===")
         print(f"AP (OKS=0.50:0.95): {metrics['map']:.4f}")
         print(f"AP (OKS=0.50): {metrics['map_50']:.4f}")
@@ -761,6 +761,17 @@ def coco_eval(
                     f"  AR {name:<9s} (model px) {metrics[f'mar_{name}']:.4f}   "
                     f"@0.50 {metrics[f'mar_50_{name}']:.4f}   n={int(metrics[f'num_gt_{name}'])}"
                 )
+        if per_class and "classes" in metrics:
+            print(f"\n--- {title}: per-class point AP @[.50:.95] ---")
+            rows = [
+                (class_names[label] if label < len(class_names) else f"label {label}", float(ap), float(recall))
+                for label, ap, recall in zip(
+                    metrics["classes"].tolist(), metrics["map_per_class"], metrics["mar_per_class"]
+                )
+            ]
+            width = max(len(name) for name, _, _ in rows)
+            for name, ap, recall in sorted(rows, key=lambda row: row[1], reverse=True):
+                print(f"  {name:<{width}}  AP {ap:.4f}  AR {recall:.4f}")
         return metrics
 
     metrics = metric.compute()

@@ -408,3 +408,37 @@ compile + amp, hybrid. The profiling scripts lived in the session scratchpad.
   an open-vocab remote-sensing model needs two things: the w/h loss masked per
   annotation, and an OKS scale for GT without a box (a per-class size prior or
   a fixed pixel radius).
+
+## More classes (2026-10-22)
+
+**xView part, four classes.** The xView part of AI-TOD annotates only airplane
+(118 train), storage-tank (384), ship (411) and vehicle (190,288). The other
+four classes have no instances. `tools/aitod_class_subsets.py` writes
+`all4_{train_all,val200,val}.json`. Their vehicle annotations and images are
+identical to the `vehicle_*` subsets, so `val/ap/vehicle` (`--per-class-ap`,
+now always on) compares directly with the vehicle-only runs. val200 has only 7
+airplanes, 20 ships and 31 tanks, so score rare classes post hoc on
+`all4_val` with `--eval-only`.
+
+**Complete AI-TOD-v2, eight classes.** `/mnt/datasets/sat/aitod_v2_full`
+combines the official AI-TOD_wo_xview images (gdown) with the local xView crops
+under the released v2 annotations. That is 11,214 train / 2,804 val / 14,018
+test images from xView, DOTA, DIOR, Airbus-ship and VisDrone; see its README.
+`tools/aitod_full_subsets.py` writes `all8_train_all`, `all8_probe2k` and
+`all8_val600`. The probe and val subsets fill per-source quotas with every
+rare-class image first, so they keep every airplane, bridge, swimming-pool and
+wind-mill instance.
+
+- person comes only from VisDrone and wind-mill only from DIOR.
+- AI-TOD contains DIOR and DOTA crops, so do not score a model trained on it on
+  DIOR or DOTA.
+
+```sh
+AITOD_ROOT=/mnt/datasets/sat/aitod_v2_full TRAIN_SUBSET=all8_probe2k VAL_SUBSET=all8_val600 \
+  TAG=_all8probe STEPS=4000 EXTRA_ARGS="--eval-every-steps 1000" tools/run_aitod_points.sh
+```
+
+The run script now also passes `--attention-bwd-fp16-accumulation`. P3
+train_all with both speed flags: 0.8030 / 0.8074 (seeds 0 / 1), against
+0.8081 / 0.8068 / 0.8079 for the earlier seeds. Any cost is under ~0.002 and
+not resolved by two seeds.
