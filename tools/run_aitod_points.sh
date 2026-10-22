@@ -43,6 +43,9 @@ COMMON=(
   # Zoom-out would shrink 10 px vehicles further; flips and rotations stay.
   --augment --gpu-augment --right-angle-rotations --no-scale-augment --mosaic-prob 0
   --val-transform fast --amp --compile
+  # -11% step time; P3 train_all seed 2 0.8079 vs 0.8081/0.8068 without. Runs before
+  # 2026-10-22 trained without it, so resuming one of those needs it removed.
+  --fp16-accumulation
   --negative-ratio 5 --eval-top-k 1500 --weight-decay 1e-4
   --point-eval
   --mlflow --mlflow-experiment AITOD-Points --seed "$SEED"

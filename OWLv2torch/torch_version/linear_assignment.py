@@ -195,13 +195,18 @@ def _linear_assignment_kernel(
         tl.debug_barrier()
 
 
-def batch_linear_assignment(cost: torch.Tensor, num_warps: int = 4) -> torch.Tensor:
+def batch_linear_assignment(cost: torch.Tensor, num_warps: int | None = None) -> torch.Tensor:
     """Minimise each ``[rows, columns]`` problem of a ``[B, rows, columns]`` CUDA cost.
 
     Requires ``rows <= columns``. Returns the column assigned to each row as a
     ``[B, rows]`` long tensor, ``-1`` where the kernel failed to assign the row.
     ``rows`` and ``columns`` are compile-time constants of the kernel, so keep
     them fixed (pad the rows) to avoid a recompile for every new shape.
+
+    ``num_warps`` defaults to one warp per 1024 padded columns, clamped to 4-16:
+    4 for OWLv2's 3600 patches, 16 for the 14,400 point slots. At 4 warps the
+    16,384-wide slot rows spill registers and solve ~7x slower (5070 Ti, a batch
+    of 8 real P3 costs: 24.9 ms at 4 warps, 3.6 at 16, SciPy 34).
     """
     if cost.ndim != 3 or not cost.is_cuda:
         raise ValueError("Need a 3-dimensional CUDA cost tensor of shape (B, rows, columns)")
@@ -214,6 +219,9 @@ def batch_linear_assignment(cost: torch.Tensor, num_warps: int = 4) -> torch.Ten
     col4row = torch.full((batch_size, rows), -1, device=cost.device, dtype=torch.int32)
     row4col = torch.full((batch_size, columns), -1, device=cost.device, dtype=torch.int32)
     infeasible = torch.zeros((batch_size,), device=cost.device, dtype=torch.int32)
+    block_n = triton.next_power_of_2(columns)
+    if num_warps is None:
+        num_warps = max(4, min(16, block_n // 1024))
     _linear_assignment_kernel[(batch_size,)](
         cost,
         u,
@@ -223,7 +231,7 @@ def batch_linear_assignment(cost: torch.Tensor, num_warps: int = 4) -> torch.Ten
         infeasible,
         NUM_ROWS=rows,
         NUM_COLUMNS=columns,
-        BLOCK_N=triton.next_power_of_2(columns),
+        BLOCK_N=block_n,
         IS_FP64=False,
         num_warps=num_warps,
     )

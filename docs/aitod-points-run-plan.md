@@ -118,8 +118,17 @@ vehicles and about half below 0.5. So most of the remaining precision gap is
 val-label incompleteness, and it affects both arms. Train labels are
 presumably just as incomplete, so these vehicles are trained as negatives.
 
-Seed 1: P3 0.8068 (seed 0 0.8081). P0 seeds 1-2 and P3 seed 2 were stopped
-for a shutdown; rerun the same launch commands and the script resumes them.
+**Three seeds on train_all (2026-10-22).** P3 seed 2 ran with
+`--fp16-accumulation`.
+
+| train_all | seed 0 | seed 1 | seed 2 | mean |
+|---|---|---|---|---|
+| P0 box loss | 0.7809 | 0.7691 | 0.7794 | 0.7765 |
+| **P3 point + slots** | 0.8081 | 0.8068 | 0.8079 | **0.8076** |
+
+P3 − P0 is +0.031. P3's seeds sit within 0.0013 of each other, P0's within
+0.012. fp16 accumulation in training costs nothing visible: seed 2 lies between
+seeds 0 and 1 and tracked them at every eval.
 
 **Low-precision inference, no retraining (P3 seed 0, vision-encoder linears).**
 
@@ -335,11 +344,56 @@ Measured (2026-10-22, P3 recipe, train_all, 5070 Ti, steps 60-200 of a
 The estimate above was right. A full 7400-step run drops from about 63 to
 about 45 min with both changes.
 
-Test: P3 with `--vision-lora-blocks 0` on train_all, seed 0, against P3 seeds
-0/1 (0.8081 / 0.8068). The two train_all seeds sit 0.0013 apart, so one run
-is informative here, unlike train1000 (spread 0.02). Small objects may lean on
-early-block adaptation more than LV-MHP did, so the +0.0099 may not transfer
-either way.
+**Result (2026-10-22, P3, train_all, seed 0): keep the hybrid.**
+
+| backbone adaptation | trainable backbone params | AP | ms/step |
+|---|---|---|---|
+| **hybrid: vb6 + Q/V LoRA r8 on blocks 0-5** | 42.5M + 0.15M | **0.8081** | 490 |
+| LoRA on all 12 blocks, Q/K/V/O r32, alpha 32, no full fine-tuning | 2.36M | 0.7904 | 480 |
+| LoRA on all 12 blocks, Q/V r8, no full fine-tuning | 0.29M | 0.7659 | 463 |
+| vb6, no LoRA | 42.5M | 0.7567 | 402 |
+
+- **Neither half is enough alone.** Plain vb6 trailed the hybrid by about
+  0.05 at every eval from step 1500 on. The early-block LoRA is worth five
+  times what it was on LV-MHP (+0.0099).
+- **LoRA capacity matters but does not close the gap.** Q/V r8 to Q/K/V/O r32
+  is +0.025, and r32 is still 0.018 short. MLP targets (`mlp.0`, `mlp.2`) were
+  not tried.
+- **Pure LoRA saves no time.** Backward still runs through all 12 blocks; only
+  the dW GEMMs of blocks 6-11 go away.
+
+## Step profile and speedups (2026-10-22)
+
+Measured on the real `train_text.py` P3 train_all step, 5070 Ti, batch 8,
+compile + amp, hybrid. The profiling scripts lived in the session scratchpad.
+
+| kernel ms/step | GEMM | attention bwd | attention fwd | fused LN/GELU | other elementwise | memcpy |
+|---|---|---|---|---|---|---|
+| hybrid | 165 | 112 | 43 | 44 | 60 | 11 |
+| hybrid + `--fp16-accumulation` | 109 | 113 | 43 | 44 | 59 | 11 |
+
+- **The CPU matcher was the biggest idle sink:** 72 ms/step on real batches.
+  scipy itself took 50 ms, and per-image syncs and cost copies took ~22 ms.
+  Images with ≥150 GT took 59% of the scipy time. scipy holds the GIL, so
+  threads did not help.
+- **`hungarian_match_text` now solves the batch on the GPU.** It uses the
+  Triton solver from `--batched-loss` with rows padded to a power of two. It
+  runs at 16 warps for the 14,400-slot width; at 4 warps it spills and is no
+  faster than scipy.
+  - Smoke test, steps 30-130: P3 pairs were identical to scipy on 796 images,
+    including a 1,499-GT batch. P0 had 5 tie swaps at equal cost.
+  - The matcher went from 72 to 22 ms. The step went from 429 to 401 ms on the
+    same window.
+- **The step is now ~96% GPU-busy** (~383 ms of kernels). A sync-free
+  batched point loss would add at most ~15-25 ms.
+- **The run script now passes `--fp16-accumulation`.** The hybrid step went
+  490 → 401 ms with it and the GPU matcher, so a 7400-step train_all run takes
+  about 50 min.
+- **FP8 GEMMs would add ~5-10 ms on top of fp16 accumulation.** fp8 at fp32
+  accumulation (182 TFLOPS in Triton) is barely faster than fp16 at fp16
+  accumulation (167). A SageAttention forward is worth at most ~25 ms of the
+  43 ms attention forward, and it has no matching backward. The next lever is
+  the fp16-accumulate attention backward (~-26 ms).
 
 ## Known limits
 

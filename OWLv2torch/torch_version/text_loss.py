@@ -83,26 +83,28 @@ def hungarian_match_text(
 
     With ``point_sigma`` only centres are compared: ``bbox_cost`` weighs the L1
     centre distance and ``giou_cost`` weighs ``1 - OKS`` in place of ``1 - GIoU``.
-    """
-    try:
-        from scipy.optimize import linear_sum_assignment
-    except ImportError:  # pragma: no cover - scipy is a project dependency
-        linear_sum_assignment = None
 
-    _, _, num_classes = class_logits.shape
-    matches = []
+    On CUDA all images are solved in one launch of the Triton solver in
+    :mod:`OWLv2torch.torch_version.linear_assignment`, which reproduces SciPy's
+    optimum without a host round trip per image; elsewhere SciPy solves each image.
+    """
+    _, num_patches, num_classes = class_logits.shape
+    labels = [target["labels"] for target in targets if target["labels"].numel()]
+    if labels:
+        all_labels = torch.cat([label.to(class_logits.device) for label in labels])
+        if ((all_labels < 0) | (all_labels >= num_classes)).any():
+            raise ValueError(
+                f"Text-query labels must be in [0, {num_classes}); "
+                f"got {all_labels.detach().cpu().tolist()}"
+            )
+
+    costs: list[torch.Tensor | None] = []
     for logits, boxes, target in zip(class_logits, pred_boxes, targets):
         target_boxes = target["boxes"].to(device=boxes.device, dtype=boxes.dtype)
         target_labels = target["labels"].to(device=logits.device, dtype=torch.long)
         if target_boxes.numel() == 0:
-            empty = torch.empty(0, dtype=torch.long, device=boxes.device)
-            matches.append((empty, empty))
+            costs.append(None)
             continue
-        if (target_labels < 0).any() or (target_labels >= num_classes).any():
-            raise ValueError(
-                f"Text-query labels must be in [0, {num_classes}); "
-                f"got {target_labels.detach().cpu().tolist()}"
-            )
 
         cost = boxes.new_zeros((boxes.shape[0], target_boxes.shape[0]), dtype=torch.float32)
         if class_cost:
@@ -126,15 +128,65 @@ def hungarian_match_text(
                     box_cxcywh_to_xyxy(target_boxes.float()),
                 )
                 cost = cost + giou_cost * (1.0 - giou)
+        costs.append(cost)
 
-        cost_cpu = cost.cpu()
-        if linear_sum_assignment is not None:
-            pred_indices, target_indices = linear_sum_assignment(cost_cpu)
-            pred_indices = torch.as_tensor(pred_indices, dtype=torch.long, device=boxes.device)
-            target_indices = torch.as_tensor(target_indices, dtype=torch.long, device=boxes.device)
-        else:
-            pred_indices, target_indices = _greedy_assignment(cost_cpu, boxes.device)
-        matches.append((pred_indices, target_indices))
+    max_targets = max((cost.shape[1] for cost in costs if cost is not None), default=0)
+    if class_logits.is_cuda and 0 < max_targets <= num_patches:
+        return _match_on_gpu(costs, num_patches, max_targets)
+    return [_match_on_cpu(cost, pred_boxes.device) for cost in costs]
+
+
+def _match_on_cpu(cost: torch.Tensor | None, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Solve one ``[num_patches, num_targets]`` cost with SciPy (greedy without it)."""
+    if cost is None:
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        return empty, empty
+    try:
+        from scipy.optimize import linear_sum_assignment
+    except ImportError:  # pragma: no cover - scipy is a project dependency
+        return _greedy_assignment(cost.cpu(), device)
+    pred_indices, target_indices = linear_sum_assignment(cost.cpu())
+    return (
+        torch.as_tensor(pred_indices, dtype=torch.long, device=device),
+        torch.as_tensor(target_indices, dtype=torch.long, device=device),
+    )
+
+
+def _match_on_gpu(
+    costs: list[torch.Tensor | None], num_patches: int, max_targets: int
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Solve every image's cost in one Triton launch, in SciPy's output layout.
+
+    Target rows are padded to a power of two with zero cost, which cannot change
+    the real rows' optimum (see :func:`batched_match_cost`); the row count is a
+    compile-time constant of the kernel, so this bounds the number of recompiles.
+    The only host sync is the check for rows the solver left unassigned, and those
+    images are re-solved with SciPy.
+    """
+    from OWLv2torch.torch_version.linear_assignment import batch_linear_assignment
+
+    reference = next(cost for cost in costs if cost is not None)
+    rows = min(1 << (max_targets - 1).bit_length(), num_patches)
+    batch = reference.new_zeros((len(costs), rows, num_patches))
+    for index, cost in enumerate(costs):
+        if cost is not None:
+            batch[index, : cost.shape[1]] = cost.T
+    assigned = batch_linear_assignment(batch)
+    sizes = torch.tensor(
+        [0 if cost is None else cost.shape[1] for cost in costs], device=assigned.device
+    )
+    real_rows = torch.arange(rows, device=assigned.device)[None] < sizes[:, None]
+    failed = ((assigned < 0) & real_rows).any(1).tolist()
+
+    matches = []
+    for index, cost in enumerate(costs):
+        if cost is None or failed[index]:
+            matches.append(_match_on_cpu(cost, reference.device))
+            continue
+        # SciPy returns the pairs sorted by patch index.
+        patches = assigned[index, : cost.shape[1]]
+        target_indices = patches.argsort()
+        matches.append((patches[target_indices], target_indices))
     return matches
 
 
