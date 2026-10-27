@@ -630,6 +630,20 @@ class ClassPredictionHead(nn.Module):
         return (pred_logits, image_class_embeds)
 
 
+# Bumped whenever any module registers a parameter or submodule, so cached
+# parameter lists (OwlV2.parameter_state) notice replaced weights.
+_parameter_generation = 0
+
+
+def _bump_parameter_generation(*args):
+    global _parameter_generation
+    _parameter_generation += 1
+
+
+nn.modules.module.register_module_parameter_registration_hook(_bump_parameter_generation)
+nn.modules.module.register_module_module_registration_hook(_bump_parameter_generation)
+
+
 def _same_tensor(a: Optional[torch.Tensor], b: Optional[torch.Tensor]) -> bool:
     if a is None or b is None:
         return a is b
@@ -731,6 +745,7 @@ class OwlV2(nn.Module):
         # forward_object_detection_from_embeddings.
         self.detection_token_index = None
         self._query_cache = None
+        self._parameter_lists = {}
 
         self._load_model(self.model_string)
 
@@ -927,6 +942,20 @@ class OwlV2(nn.Module):
             )
         return self.get_text_features(token_ids, attention_mask), token_ids[..., 0] > 0
 
+    def parameter_state(self, key, parameters) -> tuple:
+        """``(id, data_ptr, version)`` of each parameter ``parameters()`` yields.
+
+        It changes whenever one is replaced, moved or written in place, so
+        comparing it tells whether weights changed since an engine or a cache was
+        made. Walking the modules costs ~0.15 ms on base, so the list is kept per
+        ``key`` until a parameter or submodule is registered anywhere.
+        """
+        cached = self._parameter_lists.get(key)
+        if cached is None or cached[0] != _parameter_generation:
+            cached = (_parameter_generation, list(parameters()))
+            self._parameter_lists[key] = cached
+        return tuple((id(p), p.data_ptr(), p._version) for p in cached[1])
+
     def _detection_query_features(self, token_ids, attention_mask):
         """:meth:`get_text_features`, reusing the last result for the same queries.
 
@@ -939,9 +968,8 @@ class OwlV2(nn.Module):
             return self.get_text_features(token_ids, attention_mask)
         device_type = token_ids.device.type
         autocast = torch.is_autocast_enabled(device_type) and torch.get_autocast_dtype(device_type)
-        state = (autocast, tuple(
-            (id(p), p.data_ptr(), p._version)
-            for module in (self.text_model, self.text_projection) for p in module.parameters()
+        state = (autocast, self.parameter_state(
+            "text", lambda: (p for m in (self.text_model, self.text_projection) for p in m.parameters())
         ))
         cache = self._query_cache
         if cache is not None and cache[0] == state and _same_tensor(cache[1], token_ids) \

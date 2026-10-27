@@ -356,8 +356,7 @@ class OwlV2TRT(OwlV2):
             return torch.stack(stats).flatten().cpu().tolist()
 
     def _heads_state(self):
-        # Changes whenever a head parameter is replaced, moved, or written in place.
-        return tuple((id(p), p.data_ptr(), p._version) for p in self._head_parameters())
+        return self.parameter_state("heads", self._head_parameters)
 
     def _fingerprint_path(self) -> Path:
         return self.heads_engine_path.with_name(self.heads_engine_path.name + ".json")
@@ -659,7 +658,7 @@ class OwlV2TRT(OwlV2):
             return torch.stack(stats).flatten().cpu().tolist()
 
     def _vision_state(self):
-        return tuple((id(p), p.data_ptr(), p._version) for p in self._vision_parameters())
+        return self.parameter_state("vision", self._vision_parameters)
 
     def _vision_fingerprint_path(self) -> Path:
         return self.engine_path.with_name(self.engine_path.name + ".json")
