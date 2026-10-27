@@ -755,6 +755,7 @@ def run_owlv2_inference(
     query_aliases: dict[str, list[str]] | None = None,
     pad_drop: bool = False,
     detector_engine=None,
+    multi_label: bool = False,
 ) -> list[dict]:
     queries, indices_by_class = build_query_plan(
         class_names, query_template, query_aliases
@@ -792,6 +793,7 @@ def run_owlv2_inference(
         predict_fn=_predict,
         postprocess_model=model,
         pad_drop=pad_drop,
+        multi_label=multi_label,
     )
 
 
@@ -843,8 +845,11 @@ def run_detection_inference(
     postprocess_model,
     preprocess_model=None,
     pad_drop: bool = False,
+    multi_label: bool = False,
 ) -> list[dict]:
     preprocess_model = preprocess_model or model
+    # set_preprocessing(pad_drop=/long_side=) crops inside preprocess_image.
+    pad_drop = pad_drop or getattr(preprocess_model, "preprocess_pad_drop", False)
 
     loader_kwargs = {
         "batch_size": batch_size,
@@ -894,12 +899,18 @@ def run_detection_inference(
                 pred_logits, objectness_logits, pred_boxes = predict_fn(model, pixel_values)
                 boxes_xyxy_batch = postprocess_model.postprocess_boxes(pred_boxes.float(), target_sizes)
 
-        pred_logits = pred_logits.float()
-        objectness_logits = objectness_logits.float()
-        class_probs = torch.sigmoid(pred_logits)
-        obj_probs = torch.sigmoid(objectness_logits)
-        scores_per_class = class_probs * obj_probs.unsqueeze(-1)
-        max_scores, max_labels = scores_per_class.max(dim=-1)
+        if multi_label:
+            max_scores, max_labels, token_index = OwlV2.select_detections(
+                pred_logits, objectness_logits, top_k=top_k or 300, multi_label=True
+            )
+            boxes_xyxy_batch = boxes_xyxy_batch.gather(1, token_index[..., None].expand(-1, -1, 4))
+        else:
+            pred_logits = pred_logits.float()
+            objectness_logits = objectness_logits.float()
+            class_probs = torch.sigmoid(pred_logits)
+            obj_probs = torch.sigmoid(objectness_logits)
+            scores_per_class = class_probs * obj_probs.unsqueeze(-1)
+            max_scores, max_labels = scores_per_class.max(dim=-1)
 
         for b, img_id in enumerate(image_ids):
             scores_b = max_scores[b]
@@ -1223,6 +1234,20 @@ def main() -> None:
         "sorted by aspect ratio for COCO-format datasets).",
     )
     parser.add_argument(
+        "--blur", type=float, default=0.0,
+        help="Gaussian blur sigma (pixels of the resized image); 0.5 helps natural images zero-shot.",
+    )
+    parser.add_argument(
+        "--long-side", type=int, default=None,
+        help="Resize the long side to this inside the original canvas (keeps the position "
+        "embeddings; implies --pad-drop). 768 is the speed knob for natural and aerial images.",
+    )
+    parser.add_argument(
+        "--multi-label", action="store_true",
+        help="Rank every (token, class) pair by class x sqrt(objectness) instead of one class per "
+        "token. Helps natural images, slightly hurts DIOR.",
+    )
+    parser.add_argument(
         "--prune-scorer", type=Path, default=None,
         help="Token pruning with a scorer from tools/arch_speedup/distill_scorer.py.",
     )
@@ -1240,8 +1265,8 @@ def main() -> None:
     if args.trt_detector_engine is not None and (args.tensorrt or args.prune_scorer or args.checkpoint):
         raise SystemExit("--trt-detector-engine already holds the tower, heads and pruning of the "
                          "original weights; drop --tensorrt/--prune-scorer/--checkpoint.")
-    if args.tensorrt and (args.pad_drop or args.prune_scorer):
-        raise SystemExit("--pad-drop/--prune-scorer run the torch tower; the TensorRT vision engine "
+    if args.tensorrt and (args.pad_drop or args.long_side or args.prune_scorer):
+        raise SystemExit("--pad-drop/--long-side/--prune-scorer run the torch tower; the TensorRT vision engine "
                          "is fixed-size. Use tools/arch_speedup/export_pruned.py for a pruned engine.")
 
     checkpoint = None
@@ -1298,6 +1323,7 @@ def main() -> None:
     if args.prune_scorer is not None:
         model.load_token_scorer(args.prune_scorer, keep=args.prune_keep, threshold=args.prune_threshold)
         print(f"Token pruning: {model.vision_model.encoder.prune}")
+    model.set_preprocessing(blur=args.blur, long_side=args.long_side, pad_drop=args.pad_drop)
     detector_engine = None
     if args.trt_detector_engine is not None:
         from OWLv2torch.torch_version.owlv2_tensorrt import PaddingFreeDetectorTRT
@@ -1332,8 +1358,8 @@ def main() -> None:
         desc=f"{title} inference",
         query_template=query_template,
         query_aliases=(eval_spec.get("query_aliases") if args.alias_pooling else None),
-        pad_drop=args.pad_drop,
         detector_engine=detector_engine,
+        multi_label=args.multi_label,
     )
 
     if args.tile_size and args.tile_nms_iou > 0:
@@ -1379,6 +1405,10 @@ def main() -> None:
             "eval_spec_version": eval_spec.get("version") if eval_spec else None,
             "buckets_definition": eval_spec.get("buckets") if eval_spec else None,
             "inference_top_k": args.top_k,
+            "blur": args.blur,
+            "long_side": args.long_side,
+            "pad_drop": args.pad_drop or args.long_side is not None,
+            "multi_label": args.multi_label,
             "eval_max_detections": args.eval_max_detections,
             "full": full_metrics,
             "buckets": bucket_metrics,

@@ -713,7 +713,13 @@ class OwlV2(nn.Module):
         self.image_transform_unnormed = TorchScipyResize(self.image_size)
 
         self.owlv2_img_normalize = T.Normalize(mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD)
-        
+
+        # Inference-only options of preprocess_image/postprocess_boxes (set_preprocessing);
+        # the defaults are HF's pipeline.
+        self.preprocess_blur = 0.0
+        self.preprocess_long_side = None
+        self.preprocess_pad_drop = False
+
         self._load_model(self.model_string)
 
     def _load_model(self, model_path):
@@ -792,16 +798,57 @@ class OwlV2(nn.Module):
         if device is not None and not fast:
             raise ValueError("device needs fast=True; the scipy path runs on the CPU only")
 
-        if isinstance(image, (list, tuple)):
-            tensors = [
-                self.preprocess_image(img, fast=fast, device=device).squeeze(0)
-                for img in image
-            ]
-            return torch.stack(tensors, dim=0)
+        images = list(image) if isinstance(image, (list, tuple)) else [image]
+        images = [Image.open(img) if isinstance(img, str) else img for img in images]
+        pixel_values = torch.stack([self._preprocess_one(img, fast, device) for img in images])
+        if self.preprocess_pad_drop:
+            # Drop the patches that are all padding; the batch shares its largest grid.
+            sizes = [(img.height, img.width) if isinstance(img, Image.Image) else tuple(img.shape[-2:])
+                     for img in images]
+            rows, cols = self.padding_free_grid(sizes)
+            pixel_values = pixel_values[..., : rows * self.patch_size, : cols * self.patch_size]
+        return pixel_values
 
-        if isinstance(image, str):
-            image = Image.open(image)
+    def set_preprocessing(self, blur: float = 0.0, long_side: Optional[int] = None,
+                          pad_drop: bool = False) -> "OwlV2":
+        """Inference preprocessing that departs from HF's, for the original weights.
 
+        Applies to :meth:`preprocess_image` and :meth:`postprocess_boxes` only
+        (training transforms are untouched); call with no arguments to reset.
+
+        - ``blur``: Gaussian sigma in pixels of the resized image. OWLv2 wants
+          slightly soft input: 0.5 gave +0.011 COCO val mAP zero-shot and +0.018
+          on Fashionpedia, nothing on DIOR.
+        - ``long_side``: resize the long side to this (a multiple of the patch
+          size, at most ``image_size``) and place it in the top-left of the
+          ``image_size`` canvas, keeping the original position embeddings and box
+          priors. Implies ``pad_drop``, so the tower sees fewer tokens. With
+          blur, 768 runs 1.6x faster than 960 and costs COCO val 0.007 mAP (still
+          +0.007 over HF's pipeline), Fashionpedia 0.003-0.011, DIOR nothing. Unlike
+          :meth:`set_image_size`, which resamples the position embeddings and
+          loses 0.05-0.2 mAP zero-shot.
+        - ``pad_drop``: crop the patches that are all square padding (free in
+          accuracy; see :meth:`padding_free_grid`).
+
+        Cropped inputs need the torch tower or ``PaddingFreeDetectorTRT``; the
+        fixed-size ``OwlV2TRT`` engine takes ``blur`` only.
+        """
+        if long_side is not None:
+            if long_side % self.patch_size or not 0 < long_side <= self.image_size:
+                raise ValueError(f"long_side must be a multiple of {self.patch_size} "
+                                 f"up to {self.image_size}, got {long_side}")
+            if long_side < self.image_size and self.point_slot_head is not None:
+                raise ValueError("Point slots need the full square grid")
+            pad_drop = True
+        if pad_drop and self.point_slot_head is not None:
+            raise ValueError("Point slots need the full square grid; do not crop the padding")
+        self.preprocess_blur = float(blur)
+        self.preprocess_long_side = None if long_side == self.image_size else long_side
+        self.preprocess_pad_drop = pad_drop
+        return self
+
+    def _preprocess_one(self, image, fast, device):
+        """One image (PIL or ``(C, H, W)`` tensor) to a normalised ``(3, S, S)`` canvas."""
         if device is not None and isinstance(image, Image.Image):
             # np.asarray is 5x cheaper than np.array but read-only; the array is
             # only ever copied to the device, so torch's warning doesn't apply.
@@ -814,10 +861,18 @@ class OwlV2(nn.Module):
         if device is not None:
             image = image.to(device)
 
-        transform = self.image_transform_fast if fast else self.image_transform_accurate
-        pixel_values = transform(image)
-        pixel_values = pixel_values.unsqueeze(0)
-
+        long_side = self.preprocess_long_side
+        if long_side is None:
+            transform = self.image_transform_fast if fast else self.image_transform_accurate
+            pixel_values = transform(image)
+        elif fast:
+            pixel_values = self.owlv2_img_normalize(TorchScipyResize(long_side)(image))
+        else:
+            pixel_values = self.owlv2_img_normalize(ScipyResize(long_side)(SquarePad()(
+                TF.to_dtype(TF.to_image(image), torch.float32, scale=True))))
+        if self.preprocess_blur > 0:
+            radius = max(1, int(3 * self.preprocess_blur + 0.5))
+            pixel_values = TF.gaussian_blur(pixel_values, [2 * radius + 1] * 2, [self.preprocess_blur] * 2)
         return pixel_values
 
 
@@ -1227,7 +1282,10 @@ class OwlV2(nn.Module):
                 f"{boxes.shape[0]}"
             )
         image_height, image_width = target_sizes.unbind(1)
-        
+        if self.preprocess_long_side is not None:
+            # Boxes are normalised to the image_size canvas; the image spans long_side of it.
+            boxes = boxes * (self.image_size / self.preprocess_long_side)
+
         center_x, center_y, width, height = boxes.unbind(-1)
         x_coords = torch.stack(
             (center_x - 0.5 * width, center_x + 0.5 * width), dim=-1
@@ -1260,6 +1318,27 @@ class OwlV2(nn.Module):
         ).unsqueeze(1)
         return boxes_xyxy * scale_factor
 
+    @staticmethod
+    def select_detections(pred_logits, objectness_logits, top_k: int = 300, multi_label: bool = False):
+        """Best ``top_k`` detections per image as ``(scores, labels, token_index)``, each ``[B, K]``.
+
+        By default each token is one detection of its best class, scored
+        ``sigmoid(class) * sigmoid(objectness)``. ``multi_label`` ranks every
+        (token, class) pair by ``sigmoid(class) * sqrt(sigmoid(objectness))``
+        instead, so a token can report several classes: zero-shot +0.004 COCO and
+        +0.032 Fashionpedia mAP, but -0.002 on DIOR (keep it off for aerial).
+        Take the boxes with ``boxes.gather(1, token_index[..., None].expand(-1, -1, 4))``.
+        """
+        cls = pred_logits.float().sigmoid()
+        obj = objectness_logits.float().sigmoid().unsqueeze(-1)
+        if multi_label:
+            scores = (cls * obj.sqrt()).flatten(1)
+            scores, index = scores.topk(min(top_k, scores.shape[1]), dim=1)
+            return scores, index % cls.shape[-1], index // cls.shape[-1]
+        scores, labels = (cls * obj).max(-1)
+        scores, index = scores.topk(min(top_k, scores.shape[1]), dim=1)
+        return scores, labels.gather(1, index), index
+
     def attach_prototype_bank(self, proto_bank: "VisualPrototypeBank"):
         self.prototype_bank = proto_bank
         return self
@@ -1288,8 +1367,9 @@ class OwlV2(nn.Module):
         bottom and right; patches that are all padding can be dropped, which is
         free in accuracy (COCO zero-shot even gains ~0.008 mAP). A batch shares
         the largest grid: crop ``pixel_values[..., :rows * patch, :cols * patch]``.
+        With ``set_preprocessing(long_side=...)`` the long side spans that many pixels.
         """
-        P = self.sqrt_num_patches
+        P = (self.preprocess_long_side or self.image_size) // self.patch_size
         rows = cols = 1
         for height, width in image_sizes:
             side = max(height, width)

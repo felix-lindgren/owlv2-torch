@@ -362,6 +362,51 @@ and the mAP to 0.0003. Fine-tuned checkpoints export through the same class
 once their pruning config (fixed keep) is loaded; point-slot heads and the
 adaptive threshold do not export yet.
 
+### Blur, shrinking inside the canvas, multi-label scoring
+
+Three more inference-only changes, all in `OwlV2.set_preprocessing` /
+`OwlV2.select_detections` and `ovd_eval.py --blur/--long-side/--multi-label`.
+They run on the padding-free engine above unchanged.
+
+- **Blur (σ 0.5 px on the resized image).** OWLv2 wants slightly soft input.
+  COCO fed at exactly native scale loses 0.04 mAP; a 0.5 px blur recovers most
+  of it, while a 4–8 px shift does not, so it is softness rather than JPEG
+  block alignment. Inputs whose long side is already ~960 px probably lose
+  accuracy today as well (not tested directly).
+- **Shrink inside the canvas (`long_side`).** Resize the long side to 768 or
+  704, keep the 60 x 60 position embeddings and box priors, crop the padding,
+  and scale boxes by 960 / long side. Resampling the position embeddings
+  instead (`set_image_size`) breaks zero-shot: −0.046 at 896, −0.20 at 768.
+- **Multi-label scoring.** The top 300 (token, class) pairs ranked by class x
+  √objectness, instead of each token's best class x objectness.
+
+| configuration (padding drop on) | COCO val (5000) argmax / multi-label | COCO mini500 argmax / multi-label | Fashionpedia (500) argmax / multi-label | DIOR (500) argmax / multi-label | TRT ms, COCO mean B=1 |
+|---|---|---|---|---|---|
+| original (HF pipeline, square) | 0.4556 / 0.4596 | 0.4966 | 0.2091 | 0.0781 | 9.17 |
+| padding drop | 0.4588 / 0.4629 | 0.5060 / 0.5127 | 0.2105 / 0.2427 | 0.0770 / 0.0748 | 6.54 |
+| + blur 0.5 | **0.4695 / 0.4741** | 0.5141 / 0.5197 | 0.2126 / **0.2603** | 0.0766 / 0.0752 | 6.53 |
+| + blur 0.5, long side 768 | 0.4630 / 0.4655 | 0.5115 / 0.5156 | 0.2099 / 0.2495 | **0.0782 / 0.0791** | 4.07 |
+| + blur 0.5, long side 704 | 0.4597 / 0.4625 | 0.5065 / 0.5109 | | | 3.32 |
+| + blur 0.5, block 4 keep 60% | | 0.5113 / 0.5191 | | | 5.62 |
+
+The engine reproduces torch within 0.002. `ovd_eval.py` through the new API
+gives 0.5117 / 0.5156 for the 768 row (probe 0.5115 / 0.5156). Multi-label
+scoring with class alone (no objectness) is slightly better on mini500 but
+worse on full val and Fashionpedia, so √objectness is the default.
+
+- Shrinking is the better speed lever. Against 960 + blur, 768 costs COCO
+  0.0065 and Fashionpedia 0.003 / 0.011 (argmax / multi-label), both still
+  above the original, and gains on DIOR, where 60% pruning cost 0.008.
+  Pruning is only worth it at 960 for near-maximum accuracy.
+- Keep the one-class-per-token scoring for aerial (DIOR −0.002 at 960).
+- Dead ends. The engine at 960² is 51% GEMMs, 42% fused attention and 7%
+  the rest. INT8 GEMMs are 1.9x in isolation, but static INT8 on the MLP's
+  second layer collapses COCO to 0.42, and Q/DQ nodes broke TensorRT's
+  attention fusion (10.4–10.6 vs 9.45 ms). FP8 GEMMs are no faster than the
+  fp16 math TensorRT already uses; FP8 attention is 1.16x. Adaptive pruning
+  lands on the fixed-keep curve, prompt ensembles change ±0.001, and NMS
+  hurts.
+
 ## Recommendations
 
 1. **Adopt learned token pruning with a per-image threshold.** All three prune
@@ -378,12 +423,14 @@ adaptive threshold do not export yet.
    against 1.99x packed for 1120 px at −3). FlashAttention's `cu_seqlens` or
    PyTorch's jagged nested tensors pack each image's kept tokens. Everything
    but attention is per token, so only attention needs the varlen kernel.
-3. **Zero-shot (original weights): drop the all-padding tokens, and prune only
-   for natural images.** Padding drop is free (+0.0095 COCO) and 1.40x on
-   COCO's aspect mix in TensorRT, 1.9x for 16:9 video. Block-4 pruning with
-   the distilled objectness scorer at 60% adds 1.63x total at +0.006 over the
-   original, but costs ~10% relative on aerial tiles. Ship it as the one
-   padding-free TensorRT engine.
+3. **Zero-shot (original weights): drop the all-padding tokens and blur by
+   0.5 px; shrink to a 768 long side for speed.** Padding drop is free (+0.0095
+   COCO) and 1.40x on COCO's aspect mix in TensorRT, 1.9x for 16:9 video. Blur
+   adds +0.011 on COCO val. A 768 long side is 1.6x faster again for −0.0065
+   COCO, −0.003 to −0.011 Fashionpedia and nothing on aerial, and beats pruning
+   as the speed knob. Add
+   multi-label scoring for natural images. Ship it as the one padding-free
+   TensorRT engine.
 4. **Training-time patch dropout only with a full-token tail, and only where
    pruning cannot be used** (dense scenes, a fixed deployment graph): 1.5x
    training for −0.006, no inference gain. Do not use the density correction.
@@ -431,6 +478,8 @@ from the zero-shot model holds −0.005 at 50% keep.
   `text_checkpoints/zeroshot_scorers/objectness_scorer_b{3,4,6}.pt`),
   `tools/arch_speedup/export_pruned.py` (engines in `trt_engines/owlv2_base_padfree*.engine`),
   and `tools/ovd_eval.py --pad-drop/--prune-scorer/--prune-keep/--prune-threshold/--trt-detector-engine`.
+  Blur, long side and multi-label: `OwlV2.set_preprocessing`,
+  `OwlV2.select_detections`, `ovd_eval.py --blur/--long-side/--multi-label`.
 - `tools/arch_speedup/run_exp.sh`: the P3 `train_all` recipe from
   `tools/run_aitod_points.sh`, without MLflow; `NAME=<arm> tools/arch_speedup/run_exp.sh <flags>`.
   Arm flags: E2 `--prune-after 6 --prune-keep 0.25 --prune-mode drop --prune-registers 16`;

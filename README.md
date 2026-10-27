@@ -86,6 +86,37 @@ Two-dimensional token tensors are treated as queries shared by every image.
 Use `[batch_size, num_queries, sequence_length]` token tensors when each image
 has a different query set.
 
+### Faster and more accurate zero-shot inference
+
+The default preprocessing is HuggingFace's. `set_preprocessing` changes
+`preprocess_image` and `postprocess_boxes` (training transforms are
+untouched), so the code above runs as is:
+
+```python
+model.set_preprocessing(blur=0.5)                 # +0.011 COCO val mAP, same speed
+model.set_preprocessing(blur=0.5, pad_drop=True)  # also drop the padding: 1.4x on COCO's aspect mix
+model.set_preprocessing(blur=0.5, long_side=768)  # 1.6x faster again, -0.0065 COCO, nothing on DIOR
+
+pixel_values = model.preprocess_image([image_a, image_b])  # cropped to the batch's largest grid
+...
+boxes = model.postprocess_boxes(pred_boxes, target_sizes)
+scores, labels, token = model.select_detections(pred_logits, objectness, top_k=300, multi_label=True)
+boxes = boxes.gather(1, token[..., None].expand(-1, -1, 4))
+```
+
+- `blur` softens the resized image (sigma in pixels); OWLv2 does better on
+  slightly soft input. It helps natural images and is neutral on aerial.
+- `long_side` shrinks the image inside the original canvas and drops the
+  padding, keeping the pretrained position embeddings (unlike
+  `set_image_size`, which resamples them and breaks zero-shot accuracy).
+- `multi_label=True` lets a token report several classes: +0.004 COCO and
+  +0.03 Fashionpedia mAP, −0.002 on DIOR, so leave it off for aerial images.
+
+Cropped (non-square) inputs run on the torch tower or a padding-free engine
+(`PaddingFreeDetectorTRT`, see `tools/arch_speedup/export_pruned.py`); the
+fixed-size `OwlV2TRT` engine takes `blur` only. Batch images of similar aspect
+ratio together. Measurements are in `docs/arch-speedup-findings.md`.
+
 ### TensorRT vision tower
 
 ```python

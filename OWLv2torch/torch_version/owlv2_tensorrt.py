@@ -535,6 +535,12 @@ class OwlV2TRT(OwlV2):
             )
         return pooled_output, full_vision
 
+    def set_preprocessing(self, blur: float = 0.0, long_side: int | None = None, pad_drop: bool = False):
+        if self.trt is not None and (pad_drop or (long_side or self.image_size) != self.image_size):
+            raise ValueError("The TensorRT vision engine is fixed-size; crop the padding with "
+                             "PaddingFreeDetectorTRT or an OwlV2 (torch) model instead")
+        return super().set_preprocessing(blur=blur, long_side=long_side, pad_drop=pad_drop)
+
     def _get_vision_outputs(self, pixel_values):
         if self.trt is not None and self.trt_vision_matches_weights():
             return self.trt_inference(pixel_values)
