@@ -1,4 +1,5 @@
 import functools
+import math
 import warnings
 
 from huggingface_hub.file_download import hf_hub_download
@@ -223,15 +224,27 @@ class Attention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         causal_attention_mask: Optional[torch.Tensor] = None,
+        extra_states: Optional[torch.Tensor] = None,
+        window=None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
 
         bsz, tgt_len, _ = hidden_states.size()
         # project the hidden states to the query, key, and value states
         query_states = self.q_proj(hidden_states) #* self.scale
-        key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
-        value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+        if extra_states is not None:
+            key_states = torch.cat([key_states, self.k_proj(extra_states)], dim=1)
+            value_states = torch.cat([value_states, self.v_proj(extra_states)], dim=1)
+        key_states = self._shape(key_states, -1, bsz)
+        value_states = self._shape(value_states, -1, bsz)
         query_states = self._shape(query_states, tgt_len, bsz)
+        if window is not None:
+            grid, size, registers = window
+            out = window_attention(query_states, key_states, value_states, grid, size, self.scale, registers)
+            out = out.transpose(1, 2).reshape(bsz, tgt_len, self.embed_dim)
+            return self.out_proj(out), None
         
         # compute the attention weights
         sdpa_attn_output = torch.nn.functional.scaled_dot_product_attention(
@@ -264,11 +277,19 @@ class EncoderLayer(nn.Module):
         self.layer_norm2 = nn.LayerNorm(hidden_size, eps=1e-5)
 
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, extra=None, window=None):
         residual = x
+        if window is not None:
+            grid, size, num_registers = window
+            registers = None
+            if num_registers:
+                # The highest-norm patch tokens act as registers: they keep global attention.
+                with torch.no_grad():
+                    registers = x[:, 1:].norm(dim=-1).topk(num_registers, dim=1).indices + 1
+            window = (grid, size, registers)
         
         x = self.layer_norm1(x)
-        x, _ = self.self_attn(x, mask)
+        x, _ = self.self_attn(x, mask, None if extra is None else self.layer_norm1(extra), window)
         x = x + residual
         
         residual = x
@@ -278,6 +299,78 @@ class EncoderLayer(nn.Module):
         x = x + residual
 
         return x
+
+def window_attention(q, k, v, grid, size, scale, registers=None):
+    """Patch queries attend within their ``size`` x ``size`` window, plus the CLS key and
+    the ``registers`` tokens (sequence indices, [B, R]); CLS and registers attend globally."""
+    batch, heads, _, dim = q.shape
+    count = grid // size
+
+    def windows(t):
+        return (
+            t.reshape(batch, heads, count, size, count, size, dim)
+            .permute(0, 2, 4, 1, 3, 5, 6)
+            .reshape(batch * count * count, heads, size * size, dim)
+        )
+
+    def per_window(t):  # [B, H, R, D] -> [B * windows, H, R, D]
+        return t.unsqueeze(1).expand(-1, count * count, -1, -1, -1).reshape(batch * count * count, heads, -1, dim)
+
+    def take(t, index):
+        return t.gather(2, index[:, None, :, None].expand(-1, heads, -1, dim))
+
+    shared = torch.zeros(batch, 1, dtype=torch.long, device=q.device)
+    if registers is not None:
+        shared = torch.cat([shared, registers], 1)
+    keys = torch.cat([per_window(take(k, shared)), windows(k[:, :, 1:])], 2)
+    values = torch.cat([per_window(take(v, shared)), windows(v[:, :, 1:])], 2)
+    out = F.scaled_dot_product_attention(windows(q[:, :, 1:]), keys, values, scale=scale)
+    out = out.reshape(batch, count, count, heads, size, size, dim).permute(0, 3, 1, 4, 2, 5, 6)
+    out = torch.cat([q.new_zeros(batch, heads, 1, dim), out.reshape(batch, heads, grid * grid, dim)], 2)
+    global_out = F.scaled_dot_product_attention(take(q, shared), k, v, scale=scale)
+    return out.scatter(2, shared[:, None, :, None].expand(-1, heads, -1, dim), global_out)
+
+
+def merge_blocks(h, grid, frac):
+    """Average the ``frac`` most uniform 2x2 patch blocks into one token each.
+
+    Returns the shorter sequence ``[CLS, merged..., unmerged...]``, an additive
+    ``[B, 1, 1, N]`` key bias (log of each token's size, for proportional
+    attention) and what :func:`unmerge_blocks` needs to undo it.
+    """
+    batch, _, dim = h.shape
+    half = grid // 2
+    blocks = h[:, 1:].reshape(batch, half, 2, half, 2, dim).permute(0, 1, 3, 2, 4, 5)
+    blocks = blocks.reshape(batch, half * half, 4, dim)
+    with torch.no_grad():
+        unit = F.normalize(F.layer_norm(blocks.float(), (dim,)), dim=-1)
+        similarity = (unit @ unit.transpose(-1, -2)).sum((-1, -2))
+    num_merged = int(round(frac * half * half))
+    order = similarity.argsort(dim=1, descending=True)
+    merged_idx, kept_idx = order[:, :num_merged], order[:, num_merged:]
+    merged = blocks.gather(1, merged_idx[..., None, None].expand(-1, -1, 4, dim)).mean(2)
+    kept = blocks.gather(1, kept_idx[..., None, None].expand(-1, -1, 4, dim)).reshape(batch, -1, dim)
+    out = torch.cat([h[:, :1], merged, kept], 1)
+    bias = torch.zeros(batch, out.shape[1], device=h.device, dtype=h.dtype)
+    bias[:, 1:1 + num_merged] = math.log(4)
+    return out, bias[:, None, None, :], (merged_idx, kept_idx, num_merged)
+
+
+def unmerge_blocks(h, grid, info):
+    merged_idx, kept_idx, num_merged = info
+    batch, _, dim = h.shape
+    half = grid // 2
+    blocks = torch.empty(batch, half * half, 4, dim, device=h.device, dtype=h.dtype)
+    blocks = blocks.scatter(
+        1, merged_idx[..., None, None].expand(-1, -1, 4, dim),
+        h[:, 1:1 + num_merged, None, :].expand(-1, -1, 4, -1),
+    )
+    blocks = blocks.scatter(
+        1, kept_idx[..., None, None].expand(-1, -1, 4, dim), h[:, 1 + num_merged:].reshape(batch, -1, 4, dim)
+    )
+    patches = blocks.view(batch, half, half, 2, 2, dim).permute(0, 1, 3, 2, 4, 5).reshape(batch, grid * grid, dim)
+    return torch.cat([h[:, :1], patches], 1)
+
 
 class Encoder(nn.Module):
     def __init__(self, hidden_size, num_layers, num_heads, mlp_dim, dropout):
@@ -300,13 +393,60 @@ class Encoder(nn.Module):
         # skips the frozen prefix of the tower.
         return x.requires_grad or any(p.requires_grad for p in layer.parameters())
 
-    def forward(self, x, mask=None):
-        for layer in self.layers:
+    def forward(self, x, mask=None, force=None):
+        prune = getattr(self, "prune", None)
+        merge = getattr(self, "merge", None)
+        extra = aux = merge_info = None
+        for index, layer in enumerate(self.layers):
+            if merge is not None and index == merge["after"]:
+                grid = math.isqrt(x.shape[1] - 1)
+                x, bias, merge_info = merge_blocks(x, grid, merge["frac"])
+                if merge["prop"]:
+                    mask = bias.to(x.dtype if not torch.is_autocast_enabled() else torch.get_autocast_gpu_dtype())
+            if prune is not None and index == prune["after"]:
+                x, extra, aux = self._prune(x, force, prune)
+            window = None
+            spec = getattr(self, "window", None)
+            if spec is not None and index in spec["layers"]:
+                window = (math.isqrt(x.shape[1] - 1), spec["size"], spec["registers"])
             if self._should_checkpoint(layer, x):
-                x = checkpoint(layer, x, mask, use_reentrant=False)
+                x = checkpoint(layer, x, mask, extra, window, use_reentrant=False)
             else:
-                x = layer(x, mask)
-        return x
+                x = layer(x, mask, extra, window)
+        if merge_info is not None:
+            x = unmerge_blocks(x, grid, merge_info)
+        if prune is None:
+            return x
+        return x, aux
+
+    def _prune(self, x, force, prune):
+        """Keep the CLS token and the top-scored ``keep`` of the patch tokens.
+
+        ``force`` ([B, P], training only) lifts those tokens above every score.
+        In ``kv`` mode the dropped tokens' current states are returned as
+        ``extra``: later blocks still attend to them but never update them.
+        """
+        scores = self.token_scorer(x[:, 1:]).squeeze(-1).float()
+        num_patches = scores.shape[1]
+        keep = max(1, round(prune["keep"] * num_patches))
+        priority = scores.detach()
+        if force is not None:
+            priority = priority + force.float() * 1e4
+        registers = prune.get("registers", 0)
+        if registers:
+            # High-norm "register" tokens carry global context; never drop them.
+            reg = x[:, 1:].norm(dim=-1).topk(registers, dim=1).indices
+            priority = priority.scatter_add(1, reg, torch.full_like(reg, 1, dtype=priority.dtype) * 2e4)
+        order = priority.argsort(dim=1, descending=True)
+        top = order[:, :keep].sort(dim=1).values
+        gather = torch.cat([torch.zeros_like(top[:, :1]), top + 1], dim=1)
+        width = x.shape[-1]
+        kept = x.gather(1, gather.unsqueeze(-1).expand(-1, -1, width))
+        extra = None
+        if prune["mode"] == "kv":
+            rest = order[:, keep:] + 1
+            extra = x.gather(1, rest.unsqueeze(-1).expand(-1, -1, width))
+        return kept, extra, (scores, top)
 
 class VisionTower(nn.Module):
     def __init__(self, hidden_size, patch_size, image_size, num_layers, num_heads, mlp_dim):
@@ -333,7 +473,7 @@ class VisionTower(nn.Module):
         self.encoder = Encoder(hidden_size, num_layers=num_layers, num_heads=num_heads, mlp_dim=mlp_dim, dropout=0.0)
 
 
-    def forward(self, x):
+    def forward(self, x, keep_idx=None, prune_force=None, key_bias=None):
         batch_size = x.shape[0]
         patch_embeds = self.patch_embedding(x)  # shape = [batch_size, num_channels, height, width]
         patch_embeds = patch_embeds.flatten(2).transpose(1, 2)
@@ -342,8 +482,20 @@ class VisionTower(nn.Module):
         embeddings = torch.cat([class_embeds, patch_embeds], dim=1)
         embeddings = embeddings + self.position_embedding(self.position_ids)
         embeddings = self.pre_layernorm(embeddings)
+        if keep_idx is not None:
+            # Token drop: only the CLS token and the listed patches enter the encoder.
+            gather = torch.cat([torch.zeros_like(keep_idx[:, :1]), keep_idx + 1], dim=1)
+            embeddings = embeddings.gather(1, gather.unsqueeze(-1).expand(-1, -1, embeddings.shape[-1]))
         
-        x = self.encoder(embeddings, None) # no mask for vision transformer
+        mask = None
+        if key_bias is not None:
+            # [B, 1 + M] additive key bias (token drop with density correction)
+            dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled() else embeddings.dtype
+            mask = key_bias[:, None, None, :].to(dtype)
+        x = self.encoder(embeddings, mask, force=prune_force) # no mask for vision transformer
+        self.prune_aux = None
+        if isinstance(x, tuple):
+            x, self.prune_aux = x
         pooled_output = x[:, 0, :]
         pooled_output = self.post_layernorm(pooled_output)
 
@@ -698,7 +850,8 @@ class OwlV2(nn.Module):
 
         return logits_per_image, logits_per_text, vision_features, text_features, vision_full
 
-    def forward_object_detection(self, pixel_values, token_ids, attention_mask=None):
+    def forward_object_detection(self, pixel_values, token_ids, attention_mask=None, keep_idx=None, prune_force=None,
+                                 key_bias=None):
         batch_size = pixel_values.shape[0]
         shared_queries = token_ids.ndim == 2
         token_ids, attention_mask, max_text_queries = normalize_detection_queries(
@@ -721,7 +874,8 @@ class OwlV2(nn.Module):
             query_mask = token_ids[..., 0] > 0
 
         return self.forward_object_detection_from_embeddings(
-            pixel_values, text_features, query_mask
+            pixel_values, text_features, query_mask, keep_idx=keep_idx, prune_force=prune_force,
+            key_bias=key_bias,
         )
 
     def forward_object_detection_from_embeddings(
@@ -729,6 +883,9 @@ class OwlV2(nn.Module):
         pixel_values: torch.Tensor,
         query_embeds: torch.Tensor,
         query_mask: Optional[torch.Tensor] = None,
+        keep_idx: Optional[torch.Tensor] = None,
+        prune_force: Optional[torch.Tensor] = None,
+        key_bias: Optional[torch.Tensor] = None,
     ):
         """Run detection with projected text embeddings.
 
@@ -786,9 +943,21 @@ class OwlV2(nn.Module):
             query_mask = query_mask.to(device=text_features.device, dtype=torch.bool)
 
         # Detection needs dense vision states, not the pooled visual projection.
-        _, vision_full = self._get_vision_outputs(pixel_values)
-        image_feats, feature_map = self._detection_image_features_from_vision(vision_full)
-        image_feats = self.point_slot_features(image_feats)
+        pruning = getattr(self.vision_model.encoder, "prune", None) is not None
+        if keep_idx is not None or pruning:
+            # Predictions for the kept tokens only, in keep_idx order (slots token-major).
+            _, vision_full = self.vision_model(pixel_values, keep_idx, prune_force, key_bias)
+            if pruning:
+                keep_idx = self.vision_model.prune_aux[1]
+            feature_map = self.vision_model.post_layernorm(vision_full)
+            image_feats = self.layer_norm(feature_map[:, 1:, :] * feature_map[:, :1, :])
+            image_feats = self.point_slot_features(image_feats, kept=True)
+            box_bias = self.kept_box_bias(keep_idx)
+        else:
+            _, vision_full = self._get_vision_outputs(pixel_values)
+            image_feats, feature_map = self._detection_image_features_from_vision(vision_full)
+            image_feats = self.point_slot_features(image_feats)
+            box_bias = self.detection_box_bias
         if text_features.dtype != image_feats.dtype:
             text_features = text_features.to(dtype=image_feats.dtype)
 
@@ -802,9 +971,82 @@ class OwlV2(nn.Module):
         # Predict object boxes. Use functional add (not +=) so autograd is
         # happy during training.
         pred_boxes = self.box_head(image_feats)
-        pred_boxes = torch.sigmoid(pred_boxes + self.detection_box_bias)
+        pred_boxes = torch.sigmoid(pred_boxes + box_bias)
 
         return pred_logits, objectness_logits, pred_boxes, class_embeds, (feature_map, text_features)
+
+    def set_image_size(self, image_size: int) -> "OwlV2":
+        """Run at another input size: resample the position grid (bicubic) and rebuild
+        the box priors and image transforms. Call before :meth:`enable_point_slots`."""
+        if self.point_slot_head is not None:
+            raise RuntimeError("Set the image size before enabling point slots")
+        old_grid, grid = self.sqrt_num_patches, image_size // self.patch_size
+        if grid * self.patch_size != image_size:
+            raise ValueError(f"image_size must be a multiple of {self.patch_size}")
+        vision = self.vision_model
+        weight = vision.position_embedding.weight.detach()
+        patches = weight[1:].T.reshape(1, -1, old_grid, old_grid).float()
+        patches = F.interpolate(patches, size=(grid, grid), mode="bicubic", align_corners=False)
+        patches = patches.reshape(weight.shape[1], grid * grid).T.to(weight.dtype)
+        vision.position_embedding = nn.Embedding(grid * grid + 1, weight.shape[1]).to(weight.device, weight.dtype)
+        with torch.no_grad():
+            vision.position_embedding.weight.copy_(torch.cat([weight[:1], patches], 0))
+        vision.num_patches, vision.num_positions = grid * grid, grid * grid + 1
+        vision.register_buffer(
+            "position_ids", torch.arange(grid * grid + 1, device=weight.device).expand((1, -1)), persistent=False
+        )
+        self.image_size, self.sqrt_num_patches = image_size, grid
+        self.register_buffer("box_bias", self.compute_box_bias(grid).to(weight.device), persistent=False)
+        self.image_transform_fast = T.Compose([
+            TorchScipyResize(image_size), T.Normalize(mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD)
+        ])
+        self.image_transform = self.image_transform_fast
+        self.image_transform_unnormed = TorchScipyResize(image_size)
+        return self
+
+    def enable_window_attention(self, layers, size: int, registers: int = 16) -> "OwlV2":
+        """Windowed attention in ``layers``: ``size`` x ``size`` patch windows, plus the
+        CLS token and the ``registers`` highest-norm patch tokens, which stay global."""
+        if self.sqrt_num_patches % size:
+            raise ValueError(f"window {size} does not tile the {self.sqrt_num_patches} grid")
+        self.vision_model.encoder.window = {"layers": set(layers), "size": size, "registers": registers}
+        return self
+
+    def enable_token_merging(self, after: int, frac: float, prop: bool = True) -> "OwlV2":
+        """From block ``after`` on, the ``frac`` most uniform 2x2 patch blocks run as one
+        token each; their output is copied back to all four positions at the end."""
+        self.vision_model.encoder.merge = {"after": after, "frac": frac, "prop": prop}
+        return self
+
+    def enable_token_pruning(self, after: int, keep: float, mode: str = "drop", registers: int = 0) -> "OwlV2":
+        """From block ``after`` on, update only the top-scored ``keep`` of the patch tokens.
+
+        A small MLP on the residual stream scores the tokens; detections come
+        from the kept tokens only. ``mode="kv"`` lets the dropped tokens' frozen
+        states still serve as keys/values in the later blocks.
+        """
+        if mode not in ("drop", "kv"):
+            raise ValueError(f"mode must be drop or kv, got {mode!r}")
+        encoder = self.vision_model.encoder
+        dim = self.vision_dim
+        device, dtype = self.box_bias.device, self.layer_norm.weight.dtype
+        encoder.token_scorer = nn.Sequential(
+            nn.LayerNorm(dim), nn.Linear(dim, dim // 4), nn.GELU(), nn.Linear(dim // 4, 1)
+        ).to(device=device, dtype=dtype)
+        encoder.prune = {"after": after, "keep": keep, "mode": mode, "registers": registers}
+        return self
+
+    def kept_box_bias(self, keep_idx: torch.Tensor) -> torch.Tensor:
+        """``[B, M * grid**2, 4]`` box bias for the slots of the kept patch tokens."""
+        S, P = self.point_slot_grid, self.sqrt_num_patches
+        if S == 1:
+            return self.box_bias[keep_idx]
+        r, c = keep_idx // P, keep_idx % P
+        sub = torch.arange(S, device=keep_idx.device)
+        rows = (r[..., None, None] * S + sub[:, None]) * (P * S)
+        cols = c[..., None, None] * S + sub[None, :]
+        slot_index = (rows + cols).flatten(-2)  # [B, M, S*S], (sy, sx) row-major
+        return self.point_slot_box_bias[slot_index.flatten(1)]
 
     def enable_point_slots(self, grid: int) -> "OwlV2":
         """Give every patch token ``grid x grid`` point slots instead of one prediction.
@@ -851,15 +1093,17 @@ class OwlV2(nn.Module):
         size_bias = self.compute_box_bias(P)[:1, 2:].expand(coord_bias.shape[0], 2)
         return torch.cat([coord_bias, size_bias], dim=-1)
 
-    def point_slot_features(self, image_feats: torch.Tensor) -> torch.Tensor:
+    def point_slot_features(self, image_feats: torch.Tensor, kept: bool = False) -> torch.Tensor:
         """``[B, P*P, D]`` token features to ``[B, (P*grid)**2, D]`` slot features.
 
         Returns ``image_feats`` unchanged when point slots are not enabled.
         """
         if self.point_slot_head is None:
             return image_feats
-        batch_size, _, dim = image_feats.shape
+        batch_size, num_tokens, dim = image_feats.shape
         P, S = self.sqrt_num_patches, self.point_slot_grid
+        if kept:
+            return self.point_slot_head(image_feats).view(batch_size, num_tokens * S * S, dim)
         slots = self.point_slot_head(image_feats).view(batch_size, P, P, S, S, dim)
         return slots.permute(0, 1, 3, 2, 4, 5).reshape(batch_size, (P * S) ** 2, dim)
 

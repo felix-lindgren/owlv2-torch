@@ -354,13 +354,90 @@ class TextQueryDetector(nn.Module):
             token_ids = token_ids.pin_memory()
         return token_ids.to(device, non_blocking=True)
 
-    def forward(self, pixel_values: torch.Tensor, prompts: list[str] | None = None):
+    def forward(self, pixel_values: torch.Tensor, prompts: list[str] | None = None, targets=None):
         if prompts is None:
             token_ids = self.evaluation_token_ids
         else:
             token_ids = self.tokenize_prompts(prompts, pixel_values.device)
         attention_mask = token_ids == 0
-        return self.owl.forward_object_detection(pixel_values, token_ids, attention_mask)
+        keep_idx = prune_force = None
+        self.aux_loss = None
+        pruning = getattr(self.owl.vision_model.encoder, "prune", None) is not None
+        key_bias = None
+        if self.training and targets is not None and getattr(self, "token_keep", 1.0) < 1.0:
+            keep_idx = self.choose_tokens(targets, pixel_values.device)
+            if getattr(self, "token_density_bias", False):
+                keep_idx, key_bias = keep_idx
+        if self.training and targets is not None and pruning:
+            prune_force = self.gt_token_mask(targets, pixel_values.device, self.prune_target_dilate)
+        outputs = self.owl.forward_object_detection(
+            pixel_values, token_ids, attention_mask, keep_idx=keep_idx, prune_force=prune_force,
+            key_bias=key_bias,
+        )
+        if prune_force is not None:
+            scores = self.owl.vision_model.prune_aux[0]
+            self.aux_loss = torch.nn.functional.binary_cross_entropy_with_logits(scores, prune_force)
+        return outputs
+
+    def gt_token_mask(self, targets, device, dilate):
+        """[B, P*P] float mask of patches within ``dilate`` patches of a GT centre."""
+        P = self.owl.sqrt_num_patches
+        grid = torch.zeros(len(targets), 1, P, P, device=device)
+        for i, target in enumerate(targets):
+            boxes = target["boxes"]
+            if len(boxes):
+                centre = (boxes[:, :2].to(device) * P).long().clamp_(0, P - 1)
+                grid[i, 0, centre[:, 1], centre[:, 0]] = 1.0
+        if dilate > 0:
+            grid = torch.nn.functional.max_pool2d(grid, 2 * dilate + 1, 1, dilate)
+        return grid.flatten(1)
+
+    def choose_tokens(self, targets, device):
+        """Keep every patch within ``token_keep_dilate`` patches of a GT centre, then
+        random others up to ``token_keep`` of the grid (fixed count per image).
+
+        ``token_mode == "crop"`` keeps a random contiguous square sub-grid instead
+        and removes (in place) the targets whose centres fall outside it."""
+        P = self.owl.sqrt_num_patches
+        if getattr(self, "token_mode", "scatter") == "crop":
+            side = max(1, round(self.token_keep ** 0.5 * P))
+            offsets = torch.randint(0, P - side + 1, (len(targets), 2))
+            local = torch.arange(side, device=device)
+            for i, target in enumerate(targets):
+                r0, c0 = offsets[i].tolist()
+                boxes = target["boxes"]
+                if len(boxes):
+                    centre = boxes[:, :2] * P
+                    inside = (
+                        (centre[:, 0] >= c0) & (centre[:, 0] < c0 + side)
+                        & (centre[:, 1] >= r0) & (centre[:, 1] < r0 + side)
+                    )
+                    for key in ("boxes", "labels"):
+                        target[key] = target[key][inside.to(target[key].device)]
+            rows = offsets[:, 0].to(device)[:, None, None] + local[None, :, None]
+            cols = offsets[:, 1].to(device)[:, None, None] + local[None, None, :]
+            return (rows * P + cols).flatten(1)
+        M = max(1, round(self.token_keep * P * P))
+        grid = torch.zeros(len(targets), 1, P, P, device=device)
+        for i, target in enumerate(targets):
+            boxes = target["boxes"]
+            if len(boxes):
+                centre = (boxes[:, :2].to(device) * P).long().clamp_(0, P - 1)
+                grid[i, 0, centre[:, 1], centre[:, 0]] = 1.0
+        r = self.token_keep_dilate
+        if r > 0:
+            grid = torch.nn.functional.max_pool2d(grid, 2 * r + 1, 1, r)
+        priority = grid.flatten(1) * 2 + torch.rand(len(targets), P * P, device=device)
+        keep_idx = priority.topk(M, dim=1).indices.sort(dim=1).values
+        if not getattr(self, "token_density_bias", False):
+            return keep_idx
+        # Each kept background token stands in for the dropped ones: weight its key by
+        # (background tokens) / (kept background tokens), as proportional attention does.
+        forced = grid.flatten(1).gather(1, keep_idx) > 0
+        num_forced = forced.sum(1, keepdim=True).float()
+        ratio = (P * P - num_forced) / (M - num_forced).clamp_min(1)
+        bias = torch.where(forced, torch.zeros_like(ratio), ratio.clamp_min(1).log())
+        return keep_idx, torch.cat([torch.zeros_like(bias[:, :1]), bias], 1)
 
 
 def _vision_lora_target_name(layer_index: int, target: str) -> str:
@@ -845,8 +922,10 @@ def apply_text_checkpoint(model: OwlV2, checkpoint: dict) -> dict:
         checkpoint["model_state_dict"],
         strict=checkpoint_format in full_formats,
     )
-    if checkpoint_format in delta_formats and incompatible.unexpected_keys:
-        raise RuntimeError(f"Unexpected checkpoint keys: {incompatible.unexpected_keys}")
+    # Token-scorer weights are loaded after enable_token_pruning() recreates the scorer.
+    unexpected = [key for key in incompatible.unexpected_keys if "token_scorer." not in key]
+    if checkpoint_format in delta_formats and unexpected:
+        raise RuntimeError(f"Unexpected checkpoint keys: {unexpected}")
     return checkpoint
 
 
@@ -1518,6 +1597,36 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "applies to every evaluation in the run -- intended for --eval-only."
         ),
     )
+    parser.add_argument(
+        "--train-token-keep",
+        type=float,
+        default=1.0,
+        help="Training-only token drop: fraction of patch tokens kept per image "
+        "(GT-adjacent first, the rest random). Evaluation always uses every token.",
+    )
+    parser.add_argument("--train-token-keep-dilate", type=int, default=1)
+    parser.add_argument("--train-token-mode", choices=("scatter", "crop"), default="scatter")
+    parser.add_argument("--train-token-density-bias", action="store_true",
+                        help="Bias kept background keys by log(background / kept background).")
+    parser.add_argument("--train-token-keep-steps", type=int, default=None,
+                        help="Use --train-token-keep only before this optimizer step; full tokens after.")
+    parser.add_argument("--image-size", type=int, default=None,
+                        help="Input size; the position grid is resampled from the pretrained one.")
+    parser.add_argument("--prune-after", type=int, default=None,
+                        help="Token pruning: blocks from this index on update only the kept tokens.")
+    parser.add_argument("--window-layers", type=int, nargs="+", default=None)
+    parser.add_argument("--window-size", type=int, default=15)
+    parser.add_argument("--window-registers", type=int, default=16)
+    parser.add_argument("--merge-after", type=int, default=None)
+    parser.add_argument("--merge-frac", type=float, default=0.5)
+    parser.add_argument("--merge-noprop", action="store_true")
+    parser.add_argument("--prune-keep", type=float, default=0.25)
+    parser.add_argument("--prune-registers", type=int, default=0)
+    parser.add_argument("--drop-vision-layers", type=int, nargs="+", default=None,
+                        help="Remove these vision blocks (pretrained indices) before training.")
+    parser.add_argument("--prune-mode", choices=("drop", "kv"), default="drop")
+    parser.add_argument("--prune-loss-weight", type=float, default=1.0)
+    parser.add_argument("--prune-target-dilate", type=int, default=1)
     parser.add_argument("--output-dir", default="text_checkpoints")
     parser.add_argument("--save-full-model", action="store_true")
     parser.add_argument("--mlflow", action=argparse.BooleanOptionalAction, default=False)
@@ -1717,6 +1826,15 @@ def main(argv: list[str] | None = None) -> None:
                         f"{initial_lora.get('full_vision_blocks', 0)}, requested "
                         f"{args.vision_blocks}"
                     )
+        if args.drop_vision_layers:
+            dropped = set(args.drop_vision_layers)
+            model.vision_model.encoder.layers = nn.ModuleList(
+                layer for index, layer in enumerate(model.vision_model.encoder.layers) if index not in dropped
+            )
+            print(f"Dropped vision blocks {sorted(dropped)}; {len(model.vision_model.encoder.layers)} remain")
+        if args.image_size is not None and args.image_size != model.image_size:
+            model.set_image_size(args.image_size)
+            print(f"Image size set to {args.image_size} ({model.sqrt_num_patches}x{model.sqrt_num_patches} patches)")
         if model.point_slot_grid == 1:
             model.enable_point_slots(args.point_slot_grid)
         elif args.point_slot_grid == 1:
@@ -1727,7 +1845,26 @@ def main(argv: list[str] | None = None) -> None:
                 f"--point-slot-grid {args.point_slot_grid} does not match the "
                 f"checkpoint's {model.point_slot_grid}"
             )
+        if args.window_layers:
+            model.enable_window_attention(args.window_layers, args.window_size, args.window_registers)
+        if args.merge_after is not None:
+            model.enable_token_merging(args.merge_after, args.merge_frac, not args.merge_noprop)
+        if args.prune_after is not None:
+            model.enable_token_pruning(args.prune_after, args.prune_keep, args.prune_mode, args.prune_registers)
+            if initial_checkpoint is not None:
+                scorer_state = {
+                    key.split("token_scorer.", 1)[1]: value
+                    for key, value in initial_checkpoint["model_state_dict"].items()
+                    if "token_scorer." in key
+                }
+                if scorer_state:
+                    model.vision_model.encoder.token_scorer.load_state_dict(scorer_state)
         parameter_groups = configure_trainable_parameter_groups(model, args)
+        if args.prune_after is not None:
+            scorer = list(model.vision_model.encoder.token_scorer.parameters())
+            for parameter in scorer:
+                parameter.requires_grad_(True)
+            parameter_groups.append({"params": scorer, "lr": args.head_learning_rate * 10, "name": "token_scorer"})
         if not parameter_groups:
             raise RuntimeError("No trainable parameter groups were configured")
         if args.grad_checkpointing:
@@ -1850,6 +1987,11 @@ def main(argv: list[str] | None = None) -> None:
             "evaluation_prompt_template": eval_prompt_template,
         }
         detector = TextQueryDetector(model, eval_prompts).to(device)
+        detector.token_keep = args.train_token_keep
+        detector.token_keep_dilate = args.train_token_keep_dilate
+        detector.token_mode = args.train_token_mode
+        detector.token_density_bias = args.train_token_density_bias
+        detector.prune_target_dilate = args.prune_target_dilate
         general_detector = None
         if args.general_val_annotations:
             general_dataset = CocoDetection(
@@ -2453,7 +2595,7 @@ def main(argv: list[str] | None = None) -> None:
                             no_negative_classes,
                         )
                     else:
-                        outputs = detector(images, prompts=prompts)
+                        outputs = detector(images, prompts=prompts, targets=targets)
                         losses = compute_text_query_losses(
                             outputs,
                             targets,
@@ -2469,6 +2611,9 @@ def main(argv: list[str] | None = None) -> None:
                             ),
                             **loss_options,
                         )
+                        if detector.aux_loss is not None:
+                            losses["L_prune"] = detector.aux_loss
+                            losses["loss"] = losses["loss"] + args.prune_loss_weight * detector.aux_loss
                 scaler.scale(losses["loss"] / window_size).backward()
                 for name, value in losses.items():
                     window_losses[name] = (
@@ -2492,6 +2637,8 @@ def main(argv: list[str] | None = None) -> None:
                 current_loss = window_losses["loss"]
                 running_loss += current_loss
                 global_step += 1
+                if args.train_token_keep_steps is not None and global_step >= args.train_token_keep_steps:
+                    detector.token_keep = 1.0  # FLIP-style full-token tail
                 epoch_steps += 1
                 if args.max_steps is not None:
                     scheduler.step()
