@@ -144,6 +144,123 @@ def export_detection_heads(model: OwlV2, onnx_path: str, fp16: bool = True):
         )
 
 
+DETECTOR_OUTPUTS = ["pred_logits", "objectness_logits", "pred_boxes", "token_index"]
+
+
+class PaddingFreeDetector(nn.Module):
+    """Image + shared queries -> detections, for padding-free inputs and pruned towers.
+
+    ``image`` may be any multiple of the patch size up to the model's square input
+    size. OWLv2 pads at the bottom and right, so an image with that padding
+    cropped off keeps every patch's position embedding and box prior; see
+    ``OwlV2.padding_free_grid``. If the model prunes tokens
+    (``OwlV2.load_token_scorer``), blocks from ``prune["after"]`` on run on the
+    ``keep * image_size**2 / patch**2`` best-scored tokens, capped at the tokens
+    present, with the highest-norm register tokens always kept: the same budget as
+    ``Encoder._prune``. The count follows from the input shape, so TensorRT
+    resolves it at runtime; the adaptive ``threshold`` would not, and is refused.
+
+    Outputs cover the tokens that reach the heads. ``token_index`` (int32) is each
+    one's index in the full square grid, in no particular order.
+    """
+
+    def __init__(self, model: OwlV2):
+        super().__init__()
+        vision = model.vision_model
+        P, dim = model.sqrt_num_patches, model.vision_dim
+        self.patch_embedding = vision.patch_embedding
+        self.class_embedding = vision.class_embedding
+        positions = vision.position_embedding.weight.detach()
+        self.register_buffer("position_cls", positions[:1].clone())
+        self.register_buffer("position_grid", positions[1:].reshape(P, P, dim).clone())
+        self.pre_layernorm = vision.pre_layernorm
+        self.layers = vision.encoder.layers
+        self.post_layernorm = vision.post_layernorm
+        self.layer_norm = model.layer_norm
+        self.class_head = model.class_head
+        self.objectness_head = model.objectness_head
+        self.box_head = model.box_head
+        self.register_buffer("box_bias_grid", model.box_bias.detach().reshape(P, P, 4).clone())
+        self.grid_side = P
+        prune = getattr(vision.encoder, "prune", None)
+        self.prune_after = None
+        if prune is not None:
+            if prune.get("mode", "drop") != "drop" or prune.get("threshold") is not None:
+                raise ValueError("Only fixed-budget drop pruning exports; unset the threshold")
+            if model.point_slot_head is not None:
+                raise ValueError("Point-slot heads do not export")
+            self.prune_after = prune["after"]
+            self.keep_tokens = max(1, round(prune["keep"] * prune.get("full_tokens", P * P)))
+            self.registers = prune.get("registers", 0)
+            self.token_scorer = vision.encoder.token_scorer
+
+    def forward(self, image, query_embeds):
+        dtype = self.position_grid.dtype
+        patches = self.patch_embedding(image.to(dtype))
+        rows, cols = patches.shape[-2], patches.shape[-1]
+        batch, dim = patches.shape[0], patches.shape[1]
+        x = patches.flatten(2).transpose(1, 2) + self.position_grid[:rows, :cols].reshape(1, rows * cols, dim)
+        cls = (self.class_embedding.to(dtype) + self.position_cls).expand(batch, 1, dim)
+        x = self.pre_layernorm(torch.cat([cls, x], dim=1))
+        token_index = None
+        for index, layer in enumerate(self.layers):
+            if index == self.prune_after:
+                priority = self.token_scorer(x[:, 1:]).squeeze(-1).float()
+                if self.registers:
+                    # Lift the highest-norm tokens above every score, as Encoder._prune
+                    # does with scatter_add, which TensorRT only has as a plugin.
+                    norms = x[:, 1:].float().norm(dim=-1)
+                    cutoff = norms.topk(self.registers, dim=1).values[:, -1:]
+                    priority = torch.where(norms >= cutoff, priority + 2e4, priority)
+                count = torch.sym_min(self.keep_tokens, rows * cols)
+                token_index = priority.topk(count, dim=1).indices
+                kept = x[:, 1:].gather(1, token_index.unsqueeze(-1).expand(-1, -1, dim))
+                x = torch.cat([x[:, :1], kept], dim=1)
+            x = layer(x)
+        features = self.post_layernorm(x)
+        image_feats = self.layer_norm(features[:, 1:] * features[:, :1])
+        box_bias = self.box_bias_grid[:rows, :cols].reshape(rows * cols, 4)
+        if token_index is None:
+            token_index = torch.arange(rows * cols, device=image.device).expand(batch, -1)
+            box_bias = box_bias.expand(batch, -1, -1)
+        else:
+            box_bias = box_bias[token_index]
+        text = query_embeds.to(dtype).unsqueeze(0).expand(batch, -1, -1)
+        pred_logits, _ = self.class_head(image_feats, text, None)
+        objectness_logits = self.objectness_head(image_feats)[..., 0]
+        pred_boxes = torch.sigmoid(self.box_head(image_feats) + box_bias)
+        # row * side + col, written without a modulo by the symbolic width (the ONNX
+        # exporter cannot translate one).
+        full_index = token_index + token_index // cols * (self.grid_side - cols)
+        return pred_logits.float(), objectness_logits.float(), pred_boxes.float(), full_index.to(torch.int32)
+
+
+def export_padding_free_detector(model: OwlV2, onnx_path: str, fp16: bool = True, max_batch: int = 8):
+    """Export :class:`PaddingFreeDetector` with dynamic batch, image height/width and query count."""
+    detector = _prepare(PaddingFreeDetector(model), fp16)
+    side = model.sqrt_num_patches
+    batch = torch.export.Dim("batch", min=1, max=max_batch)
+    rows = torch.export.Dim("rows", min=1, max=side)
+    cols = torch.export.Dim("cols", min=1, max=side)
+    queries = torch.export.Dim("queries", min=1, max=4096)
+    patch = model.patch_size
+    dummies = (torch.rand(2, 3, model.image_size, model.image_size * 3 // 4 // patch * patch),
+               torch.randn(16, model.text_dim))
+    onnx_path = Path(onnx_path)
+    with torch.no_grad():
+        torch.onnx.export(
+            detector, dummies, str(onnx_path),
+            input_names=["image", "query_embeds"], output_names=DETECTOR_OUTPUTS,
+            dynamic_shapes={"image": {0: batch, 2: patch * rows, 3: patch * cols}, "query_embeds": {0: queries}},
+            opset_version=OPSET, dynamo=True,
+        )
+    # Fold the exporter's side ``.data`` file back into one self-contained ONNX.
+    onnx.save_model(onnx.load(str(onnx_path)), str(onnx_path))
+    sidecar = onnx_path.with_name(onnx_path.name + ".data")
+    if sidecar.exists():
+        sidecar.unlink()
+
+
 def _parse_args():
     p = argparse.ArgumentParser(description="Export OWLv2 vision tower and heads to ONNX.")
     p.add_argument("--model-type", default="base", choices=["base", "large"])

@@ -28,7 +28,7 @@ from torch import nn
 
 import os
 
-# OWL_REPO points the harness at another checkout (the scratch copy has OwlV2.set_image_size)
+# OWL_REPO points the harness at another checkout of this repo (default: this one)
 REPO = Path(os.environ.get("OWL_REPO", "/home/fellin/repos/openvocab/owlv2-torch"))
 sys.path.insert(0, str(REPO))
 

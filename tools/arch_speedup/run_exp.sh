@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P3 train_all recipe from tools/run_aitod_points.sh (no MLflow). Run with tools/arch_speedup/arch_speedup_experiments.patch applied.
+# P3 train_all recipe from tools/run_aitod_points.sh (no MLflow), with the arch-speedup flags.
 #   NAME=E1_keep50 STEPS=7400 tools/arch_speedup/run_exp.sh --train-token-keep 0.5
 set -euo pipefail
 cd "$(dirname "$0")/../.."

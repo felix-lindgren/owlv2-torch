@@ -1,7 +1,7 @@
 """Re-score a pruning checkpoint with its own trained scorer: all tokens, fixed keeps, adaptive thresholds.
 
 python prune_sweep.py <final.pth> <prune block> [keeps, e.g. 0.1,0.25,0.4] [thresholds, e.g. -4,-3,-2]
-For --image-size checkpoints set IMAGE_SIZE and OWL_REPO (a checkout with the patch applied)."""
+For --image-size checkpoints (E8 at 1120) set IMAGE_SIZE."""
 import json, os, sys, torch
 from torch import nn
 from arch_probe import *

@@ -428,7 +428,10 @@ class Encoder(nn.Module):
         """
         scores = self.token_scorer(x[:, 1:]).squeeze(-1).float()
         num_patches = scores.shape[1]
-        keep = max(1, round(prune["keep"] * num_patches))
+        # ``keep`` is a fraction of the full square grid, so an input with its padding
+        # cropped off (fewer tokens) keeps the same token budget, capped at what it has.
+        budget = prune.get("full_tokens", num_patches)
+        keep = min(num_patches, max(1, round(prune["keep"] * budget)))
         priority = scores.detach()
         if force is not None:
             priority = priority + force.float() * 1e4
@@ -437,6 +440,11 @@ class Encoder(nn.Module):
             # High-norm "register" tokens carry global context; never drop them.
             reg = x[:, 1:].norm(dim=-1).topk(registers, dim=1).indices
             priority = priority.scatter_add(1, reg, torch.full_like(reg, 1, dtype=priority.dtype) * 2e4)
+        if prune.get("threshold") is not None:
+            # Adaptive: every token whose score clears the threshold (registers too),
+            # as many as the neediest image of the batch has; ``keep`` is the floor.
+            need = int((priority > prune["threshold"]).sum(1).max())
+            keep = min(num_patches, max(keep, need))
         order = priority.argsort(dim=1, descending=True)
         top = order[:, :keep].sort(dim=1).values
         gather = torch.cat([torch.zeros_like(top[:, :1]), top + 1], dim=1)
@@ -473,14 +481,26 @@ class VisionTower(nn.Module):
         self.encoder = Encoder(hidden_size, num_layers=num_layers, num_heads=num_heads, mlp_dim=mlp_dim, dropout=0.0)
 
 
+    def grid_position_embedding(self, rows: int, cols: int) -> torch.Tensor:
+        """``[1, 1 + rows * cols, D]`` position embeddings of the top-left ``rows`` x ``cols``
+        patches. OWLv2 pads images to a square at the bottom and right, so an input with
+        that padding cropped off keeps the positions its patches have in the full grid."""
+        positions = self.position_embedding(self.position_ids)
+        side = math.isqrt(self.num_patches)
+        if (rows, cols) == (side, side):
+            return positions
+        grid = positions[:, 1:].reshape(1, side, side, -1)[:, :rows, :cols]
+        return torch.cat([positions[:, :1], grid.reshape(1, rows * cols, -1)], dim=1)
+
     def forward(self, x, keep_idx=None, prune_force=None, key_bias=None):
         batch_size = x.shape[0]
         patch_embeds = self.patch_embedding(x)  # shape = [batch_size, num_channels, height, width]
+        rows, cols = patch_embeds.shape[-2:]
         patch_embeds = patch_embeds.flatten(2).transpose(1, 2)
 
         class_embeds = self.class_embedding.expand(batch_size, 1, -1)
         embeddings = torch.cat([class_embeds, patch_embeds], dim=1)
-        embeddings = embeddings + self.position_embedding(self.position_ids)
+        embeddings = embeddings + self.grid_position_embedding(rows, cols)
         embeddings = self.pre_layernorm(embeddings)
         if keep_idx is not None:
             # Token drop: only the CLS token and the listed patches enter the encoder.
@@ -943,6 +963,8 @@ class OwlV2(nn.Module):
             query_mask = query_mask.to(device=text_features.device, dtype=torch.bool)
 
         # Detection needs dense vision states, not the pooled visual projection.
+        # A smaller, non-square input is a padding-free crop (see padding_free_grid).
+        grid = (pixel_values.shape[-2] // self.patch_size, pixel_values.shape[-1] // self.patch_size)
         pruning = getattr(self.vision_model.encoder, "prune", None) is not None
         if keep_idx is not None or pruning:
             # Predictions for the kept tokens only, in keep_idx order (slots token-major).
@@ -952,12 +974,17 @@ class OwlV2(nn.Module):
             feature_map = self.vision_model.post_layernorm(vision_full)
             image_feats = self.layer_norm(feature_map[:, 1:, :] * feature_map[:, :1, :])
             image_feats = self.point_slot_features(image_feats, kept=True)
-            box_bias = self.kept_box_bias(keep_idx)
+            box_bias = self.kept_box_bias(keep_idx, grid[1])
         else:
             _, vision_full = self._get_vision_outputs(pixel_values)
-            image_feats, feature_map = self._detection_image_features_from_vision(vision_full)
-            image_feats = self.point_slot_features(image_feats)
-            box_bias = self.detection_box_bias
+            image_feats, feature_map = self._detection_image_features_from_vision(vision_full, grid)
+            if grid == (self.sqrt_num_patches,) * 2:
+                image_feats = self.point_slot_features(image_feats)
+                box_bias = self.detection_box_bias
+            elif self.point_slot_head is not None:
+                raise ValueError("Point slots need the full square grid; do not crop the padding")
+            else:
+                box_bias = self.grid_box_bias(*grid)
         if text_features.dtype != image_feats.dtype:
             text_features = text_features.to(dtype=image_feats.dtype)
 
@@ -1018,12 +1045,16 @@ class OwlV2(nn.Module):
         self.vision_model.encoder.merge = {"after": after, "frac": frac, "prop": prop}
         return self
 
-    def enable_token_pruning(self, after: int, keep: float, mode: str = "drop", registers: int = 0) -> "OwlV2":
+    def enable_token_pruning(self, after: int, keep: float, mode: str = "drop", registers: int = 0,
+                             threshold: Optional[float] = None) -> "OwlV2":
         """From block ``after`` on, update only the top-scored ``keep`` of the patch tokens.
 
         A small MLP on the residual stream scores the tokens; detections come
-        from the kept tokens only. ``mode="kv"`` lets the dropped tokens' frozen
-        states still serve as keys/values in the later blocks.
+        from the kept tokens only. ``keep`` is a fraction of the full grid.
+        With ``threshold``, every token scoring above it is kept too (``keep``
+        becomes the floor; a batch keeps as many as its neediest image).
+        ``mode="kv"`` lets the dropped tokens' frozen states still serve as
+        keys/values in the later blocks.
         """
         if mode not in ("drop", "kv"):
             raise ValueError(f"mode must be drop or kv, got {mode!r}")
@@ -1033,12 +1064,40 @@ class OwlV2(nn.Module):
         encoder.token_scorer = nn.Sequential(
             nn.LayerNorm(dim), nn.Linear(dim, dim // 4), nn.GELU(), nn.Linear(dim // 4, 1)
         ).to(device=device, dtype=dtype)
-        encoder.prune = {"after": after, "keep": keep, "mode": mode, "registers": registers}
+        encoder.prune = {
+            "after": after, "keep": keep, "mode": mode, "registers": registers,
+            "threshold": threshold, "full_tokens": self.sqrt_num_patches ** 2,
+        }
         return self
 
-    def kept_box_bias(self, keep_idx: torch.Tensor) -> torch.Tensor:
-        """``[B, M * grid**2, 4]`` box bias for the slots of the kept patch tokens."""
+    def load_token_scorer(self, path, keep: Optional[float] = None, threshold: Optional[float] = None,
+                          registers: Optional[int] = None) -> "OwlV2":
+        """Prune with a scorer saved by ``tools/arch_speedup/distill_scorer.py``.
+
+        Such a scorer is distilled from this model's own objectness on unlabelled
+        images, so the tower weights stay the original ones. ``keep``,
+        ``threshold`` and ``registers`` override the values stored with it.
+        """
+        saved = torch.load(path, map_location="cpu", weights_only=True)
+        config = saved["config"]
+        self.enable_token_pruning(
+            config["after"],
+            config["keep"] if keep is None else keep,
+            registers=config["registers"] if registers is None else registers,
+            threshold=config.get("threshold") if threshold is None else threshold,
+        )
+        self.vision_model.encoder.token_scorer.load_state_dict(saved["scorer"])
+        return self
+
+    def kept_box_bias(self, keep_idx: torch.Tensor, cols: Optional[int] = None) -> torch.Tensor:
+        """``[B, M * grid**2, 4]`` box bias for the slots of the kept patch tokens.
+
+        ``keep_idx`` indexes the input's patch grid; ``cols`` is its width when the
+        padding was cropped off (the full grid otherwise).
+        """
         S, P = self.point_slot_grid, self.sqrt_num_patches
+        if cols is not None and cols != P:
+            keep_idx = keep_idx // cols * P + keep_idx % cols
         if S == 1:
             return self.box_bias[keep_idx]
         r, c = keep_idx // P, keep_idx % P
@@ -1205,17 +1264,38 @@ class OwlV2(nn.Module):
         self.prototype_bank = proto_bank
         return self
 
-    def _detection_image_features_from_vision(self, vision_full):
+    def _detection_image_features_from_vision(self, vision_full, grid=None):
         feature_map = self.vision_model.post_layernorm(vision_full)
         class_token_out = torch.broadcast_to(feature_map[:, :1, :], feature_map[:, :-1].shape)
 
         feature_map = feature_map[:, 1:, :] * class_token_out
         feature_map = self.layer_norm(feature_map)
 
-        P = self.sqrt_num_patches
-        feature_map = feature_map.reshape(feature_map.shape[0], P, P, feature_map.shape[-1])
-        image_feats = feature_map.view(feature_map.shape[0], P * P, feature_map.shape[-1])
+        rows, cols = grid or (self.sqrt_num_patches, self.sqrt_num_patches)
+        feature_map = feature_map.reshape(feature_map.shape[0], rows, cols, feature_map.shape[-1])
+        image_feats = feature_map.view(feature_map.shape[0], rows * cols, feature_map.shape[-1])
         return image_feats, feature_map
+
+    def grid_box_bias(self, rows: int, cols: int) -> torch.Tensor:
+        """``[rows * cols, 4]`` box bias of the top-left ``rows`` x ``cols`` patches."""
+        P = self.sqrt_num_patches
+        return self.box_bias.view(P, P, 4)[:rows, :cols].reshape(rows * cols, 4)
+
+    def padding_free_grid(self, image_sizes) -> tuple[int, int]:
+        """Patch rows and columns that hold image content, for ``(height, width)`` sizes.
+
+        OWLv2 resizes the long side to ``image_size`` and pads the rest at the
+        bottom and right; patches that are all padding can be dropped, which is
+        free in accuracy (COCO zero-shot even gains ~0.008 mAP). A batch shares
+        the largest grid: crop ``pixel_values[..., :rows * patch, :cols * patch]``.
+        """
+        P = self.sqrt_num_patches
+        rows = cols = 1
+        for height, width in image_sizes:
+            side = max(height, width)
+            rows = max(rows, math.ceil(height * P / side - 1e-6))
+            cols = max(cols, math.ceil(width * P / side - 1e-6))
+        return rows, cols
 
     def _image_grid_features(self, pixel_values):
         """

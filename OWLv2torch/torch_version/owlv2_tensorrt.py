@@ -141,6 +141,30 @@ else:  # pragma: no cover - only hit when tensorrt isn't installed
     TRTRunner = None
 
 
+class PaddingFreeDetectorTRT:
+    """Runs an engine built from ``export.export_padding_free_detector``.
+
+    Takes padding-free (or square) images and shared query embeddings
+    ``[num_queries, text_dim]``; returns ``pred_logits``, ``objectness_logits``,
+    ``pred_boxes`` and ``token_index`` for the tokens that reach the heads (all of
+    them, or the pruned subset the engine was exported with).
+    """
+
+    def __init__(self, engine_path, device="cuda"):
+        if TRTRunner is None:
+            raise RuntimeError("TensorRT is not installed")
+        self.runner = TRTRunner(
+            engine_path,
+            input_names=["image", "query_embeds"],
+            output_names=["pred_logits", "objectness_logits", "pred_boxes", "token_index"],
+            device=device,
+            reuse_outputs=False,
+        )
+
+    def __call__(self, pixel_values: torch.Tensor, query_embeds: torch.Tensor):
+        return self.runner(image=pixel_values.float(), query_embeds=query_embeds.float())
+
+
 def _onnx_has_fp16_weights(path: Path) -> bool:
     import onnx
 

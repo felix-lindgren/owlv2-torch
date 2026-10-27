@@ -80,6 +80,43 @@ def build_engine(
     return runtime.deserialize_cuda_engine(engine_bytes)
 
 
+def build_detector_engine(
+    onnx_file_path: str,
+    engine_file_path: str,
+    image_size: int = 960,
+    patch_size: int = 16,
+    opt_hw: tuple[int, int] = (960, 960),
+    max_batch: int = DEFAULT_MAX_BATCH,
+    opt_queries: int = DEFAULT_OPT_QUERIES,
+    max_queries: int = 1024,
+    workspace_gb: int = DEFAULT_WORKSPACE_GB,
+):
+    """Engine for ``export.export_padding_free_detector``: dynamic batch, query count and
+    image height/width (multiples of ``patch_size`` up to ``image_size``)."""
+    logger = trt.Logger(trt.Logger.WARNING)
+    builder = trt.Builder(logger)
+    config = builder.create_builder_config()
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_gb * (1 << 30))
+    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED))
+    parser = trt.OnnxParser(network, logger)
+    if not parser.parse_from_file(str(onnx_file_path)):
+        for error in range(parser.num_errors):
+            print(parser.get_error(error))
+        return None
+    profile = builder.create_optimization_profile()
+    profile.set_shape("image", (1, 3, patch_size, patch_size), (1, 3, *opt_hw),
+                      (max_batch, 3, image_size, image_size))
+    text_dim = network.get_input(1).shape[1]
+    profile.set_shape(QUERY_INPUT, (1, text_dim), (opt_queries, text_dim), (max_queries, text_dim))
+    config.add_optimization_profile(profile)
+    engine_bytes = builder.build_serialized_network(network, config)
+    if engine_bytes is None:
+        return None
+    with open(engine_file_path, "wb") as f:
+        f.write(engine_bytes)
+    return trt.Runtime(logger).deserialize_cuda_engine(engine_bytes)
+
+
 def _parse_args():
     p = argparse.ArgumentParser(description="Build an OWLv2 TRT engine (vision tower or heads).")
     p.add_argument("--onnx", default="owlv2_vis_base.onnx")

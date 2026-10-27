@@ -9,7 +9,9 @@ Reference model for everything below: **P3** (point loss + 2x2 slots), hybrid
 (vb6 + first-six Q/V LoRA r8), AI-TOD vehicles `train_all`, 7400 steps, seed 0,
 `--fp16-accumulation --attention-bwd-fp16-accumulation`, retrained today:
 **0.8036 point AP** on val200 (earlier seeds with the same flags: 0.8030 / 0.8074).
-General-domain reference: zero-shot base on COCO mini500, **0.4960 box mAP**.
+General-domain reference: zero-shot base on COCO mini500, **0.4960 box mAP** in the
+probe harness (0.4966 with `tools/ovd_eval.py`'s standard metric, used in the
+zero-shot section).
 Code, checkpoints and logs are listed at the end. Nothing here is in MLflow.
 
 ## Summary
@@ -33,11 +35,22 @@ different token counts. It is not implemented. "Padded" is what a plain batch
 costs today. Training is measured steps/s for 1120 px, and the benchmark
 projection for 960 px.
 
-On COCO zero-shot, dropping the all-padding tokens of non-square images is free
-(+0.008 mAP, 1.49x at 4:3). Pruning stacks on it if its budget is set on the
-full grid (0.4959, 1.74x at 4:3). Lower resolution, windows, merging, pooled
-K/V, block skipping and width pruning all lose to pruning, and so does
-training-only patch dropout.
+**Zero-shot, on the original weights** (no fine-tuning; see the zero-shot
+section), TensorRT, batch 1, COCO mini500's mix of aspect ratios:
+
+| configuration | COCO mAP | Fashionpedia | latency | speedup |
+|---|---|---|---|---|
+| original, square 960 input | 0.4967 | 0.2091 | 9.17 ms | 1.00x |
+| **drop the all-padding tokens** | **0.5061** | 0.2101 | 6.54 ms | **1.40x** |
+| + prune after block 4 with a distilled objectness scorer, keep 60% | 0.5025 | 0.2115 | 5.62 ms | 1.63x |
+
+Padding drop is free and slightly better. Pruning on top is near-free on
+natural images, but costs ~10% relative on square aerial tiles (DIOR), so it is
+domain-dependent zero-shot. Both export to one TensorRT engine that takes any
+aspect ratio and matches torch to 0.0003 mAP.
+
+Lower resolution, windows, merging, pooled K/V, block skipping and width
+pruning all lose to pruning, and so does training-only patch dropout.
 
 ## Where the compute goes
 
@@ -275,6 +288,80 @@ benchmark is given.
 | two-stage pruning (block 3, then block 6) | small | After block-3 pruning, blocks 0–2 are ~70% of the remaining tower FLOPs. A second cut at block 6 from 23% to 11% saves ~10% at most, and less in time, since small token counts run less efficiently. |
 | windows + patch dropout / windows + resolution | not tested | Both cost −0.006 alone, for less speed than pruning. |
 
+## Zero-shot on the original weights
+
+Neither change below touches the tower or head weights, so open-vocabulary
+detection stays intact.
+
+- **Padding drop** has no parameters. OWLv2 resizes the long side to 960 and
+  pads the rest at the bottom and right. `OwlV2.padding_free_grid` gives the
+  content grid, and the model takes the cropped input directly: position
+  embeddings and box priors are sliced to the grid, and boxes stay normalised
+  to the padded square, so post-processing is unchanged.
+- **Pruning with a distilled objectness scorer.**
+  `tools/arch_speedup/distill_scorer.py` trains the 150k-parameter scorer of
+  `enable_token_pruning` on the frozen tower. It learns to predict the unpruned
+  model's final objectness, sigmoid(objectness logit), from the input of
+  block k. It uses 4200 unlabelled images: COCO train, Fashionpedia, LV-MHP,
+  DIOR, AI-TOD and AU-AIR. Training takes 3 epochs, ~12 min on the 5070 Ti, with
+  half of the images padding-free. No labels and no class names are involved,
+  so it prunes the same way for any query. Load it with
+  `OwlV2.load_token_scorer`. Held-out share of the confident tokens
+  (objectness > 0.1) inside the top 50%: 0.94 / 0.96 / 0.99 for blocks 3 / 4 / 6.
+
+`tools/ovd_eval.py --pad-drop --prune-scorer <file> --prune-keep <fraction>`,
+standard COCO metric (maxDets 100), batches of 8 sorted by aspect ratio:
+
+| configuration | COCO mini500 | Fashionpedia val (500) | DIOR test (500, square tiles) |
+|---|---|---|---|
+| original | 0.4966 | 0.2091 | 0.0781 |
+| padding drop | **0.5061** | 0.2101 | (nothing to drop) |
+| padding drop + block 4, keep 80% / 70% | | | 0.0756 / 0.0743 |
+| padding drop + block 4, keep 60% | 0.5028 | **0.2115** | 0.0697 |
+| padding drop + block 4, keep 50% | 0.4996 | 0.2103 | 0.0704 |
+| padding drop + block 4, keep 40% | 0.4931 | 0.2060 | 0.0648 |
+| padding drop + block 3, keep 50% | 0.4991 | | |
+| padding drop + block 6, keep 60% / 50% / 40% / 30% | 0.4922 / 0.4795 / 0.4660 / 0.4495 | | 0.0663 (60%) |
+| block 4, keep 50%, no padding drop | 0.4846 | | |
+
+1. **Padding drop is the zero-shot win:** +0.0095 on COCO and +0.001 on
+   Fashionpedia, while removing 28% / 33% of the tokens.
+2. **Zero-shot pruning wants an early cut.** Block 4 beats block 6 by 0.01–0.02
+   at every keep, although the block-6 scorer ranks objectness better. This is
+   the reverse of the fine-tuned model. Large objects suffer most at block 6
+   (COCO AP_L 0.623 against 0.646), which fits blocks 6–11 of the original model
+   still reading object interiors and context globally. The budget counts the
+   full grid, so padding is not part of it (see Combinations).
+3. **The keep is a per-domain knob, zero-shot too.** On natural images, block 4
+   at 60% costs 0.003 against padding drop alone and stays above the original.
+   On square aerial tiles it costs 0.008 (−11% relative), and 0.0025 at 80%.
+   There zero-shot objectness is weak to begin with (0.078 mAP), so prune
+   aerial zero-shot only at ≥80%, or not at all.
+
+### TensorRT
+
+`export.export_padding_free_detector` exports tower and heads as one graph:
+image of any multiple of 16 up to 960 x 960 (batch ≤ 8), shared query
+embeddings (≤ 1024), and optional pruning. The token budget is
+`min(keep x 3600, tokens present)`, a TopK whose K TensorRT 11 resolves from
+the input shape at runtime. One engine therefore serves every aspect ratio.
+Outputs are logits, objectness, boxes and each token's index in the full grid.
+`build_engine.build_detector_engine` builds it, `PaddingFreeDetectorTRT` runs
+it, and `tools/arch_speedup/export_pruned.py` does all three and times it.
+`ovd_eval.py --trt-detector-engine` scores it. The register tokens are lifted
+with `where` rather than `scatter_add`, which TensorRT only has as a plugin.
+
+| engine (fp16, 5070 Ti, 80 queries) | COCO mAP (torch) | 960 x 960 | 720 x 960 (4:3) | 544 x 960 (16:9) | COCO mean, B=1 | B=8 at 960 x 960 |
+|---|---|---|---|---|---|---|
+| padding-free, no pruning | 0.5061 (0.5061) with padding drop; 0.4967 (0.4966) square | 9.45 ms | 6.80 ms | 4.89 ms | 6.54 ms | 10.65 ms/image |
+| + block 4, keep 60% | 0.5025 (0.5028) | 6.36 ms | 5.67 ms | 4.93 ms (fits the budget) | 5.62 ms | 7.25 ms/image |
+
+The per-token maximum differences against torch fp16 are large on some
+low-scoring tokens, up to ~5 in a logit, but the kept sets agree to ≥99.8%
+and the mAP to 0.0003. Fine-tuned checkpoints export through the same class
+once their pruning config (fixed keep) is loaded; point-slot heads and the
+adaptive threshold do not export yet.
+
 ## Recommendations
 
 1. **Adopt learned token pruning with a per-image threshold.** All three prune
@@ -291,10 +378,12 @@ benchmark is given.
    against 1.99x packed for 1120 px at −3). FlashAttention's `cu_seqlens` or
    PyTorch's jagged nested tensors pack each image's kept tokens. Everything
    but attention is per token, so only attention needs the varlen kernel.
-3. **Drop all-padding tokens for non-square inputs** (COCO, Fashionpedia,
-   LV-MHP, video frames). No retraining, +0.008 COCO zero-shot, 1.49x at 4:3,
-   2x at 16:9. With pruning, set the keep on the full grid: 1.74x at 4:3 for
-   the same mAP as the base.
+3. **Zero-shot (original weights): drop the all-padding tokens, and prune only
+   for natural images.** Padding drop is free (+0.0095 COCO) and 1.40x on
+   COCO's aspect mix in TensorRT, 1.9x for 16:9 video. Block-4 pruning with
+   the distilled objectness scorer at 60% adds 1.63x total at +0.006 over the
+   original, but costs ~10% relative on aerial tiles. Ship it as the one
+   padding-free TensorRT engine.
 4. **Training-time patch dropout only with a full-token tail, and only where
    pruning cannot be used** (dense scenes, a fixed deployment graph): 1.5x
    training for −0.006, no inference gain. Do not use the density correction.
@@ -328,15 +417,23 @@ from the zero-shot model holds −0.005 at 50% keep.
 
 ## Code, checkpoints and logs
 
-- `tools/arch_speedup/arch_speedup_experiments.patch`: the experiment flags
-  for `OWLv2torch/torch_version/owlv2.py` and `prototype_train/train_text.py`
-  (applies to cf26bba). It adds `--prune-after/-keep/-mode/-registers/-loss-weight/-target-dilate`,
+- Branch `arch-speedup`. The trainer flags are
+  `--prune-after/-keep/-mode/-registers/-loss-weight/-target-dilate`,
   `--train-token-keep/-keep-dilate/-mode/-keep-steps/-density-bias`,
   `--window-layers/-size/-registers`, `--merge-after/-frac/-noprop`,
-  `--image-size` and `--drop-vision-layers`.
+  `--image-size` and `--drop-vision-layers`, all off by default; default
+  outputs are bit-identical to before. The model side adds
+  `OwlV2.padding_free_grid`, padding-free inputs, `load_token_scorer`, and
+  adaptive/full-grid keeps. The export side adds `PaddingFreeDetector`,
+  `export_padding_free_detector`, `build_detector_engine` and
+  `PaddingFreeDetectorTRT`.
+- Zero-shot: `tools/arch_speedup/distill_scorer.py` (scorers in
+  `text_checkpoints/zeroshot_scorers/objectness_scorer_b{3,4,6}.pt`),
+  `tools/arch_speedup/export_pruned.py` (engines in `trt_engines/owlv2_base_padfree*.engine`),
+  and `tools/ovd_eval.py --pad-drop/--prune-scorer/--prune-keep/--prune-threshold/--trt-detector-engine`.
 - `tools/arch_speedup/run_exp.sh`: the P3 `train_all` recipe from
-  `tools/run_aitod_points.sh`, without MLflow; `NAME=<arm> tools/arch_speedup/run_exp.sh <flags>`
-  with the patch applied. Arm flags: E2 `--prune-after 6 --prune-keep 0.25 --prune-mode drop --prune-registers 16`;
+  `tools/run_aitod_points.sh`, without MLflow; `NAME=<arm> tools/arch_speedup/run_exp.sh <flags>`.
+  Arm flags: E2 `--prune-after 6 --prune-keep 0.25 --prune-mode drop --prune-registers 16`;
   E2c/E2b the same with `--prune-after 4` / `3`; E8 adds `--image-size 1120` to
   E2b; E1 `--train-token-keep 0.5`; E1c adds `--train-token-density-bias`; E1b
   adds `--train-token-keep-steps 5500`; E6 `--window-layers 2 3 4 5 6 7 8 --window-size 15 --window-registers 16`;
@@ -344,9 +441,9 @@ from the zero-shot model holds −0.005 at 50% keep.
 - `tools/arch_speedup/arch_probe.py`: the training-free harness (skip,
   windows, pooled K/V, pruning incl. adaptive, merging, registers, padding
   drop), exact against the reference forward in fp32. `OWL_REPO` points it at
-  a patched checkout (needed for `--image-size` checkpoints).
+  another checkout of this repo.
   `prune_sweep.py <final.pth> <prune block> [keeps] [thresholds]` re-scores a
-  pruning checkpoint (set `IMAGE_SIZE=1120 OWL_REPO=<patched checkout>` for E8).
+  pruning checkpoint (set `IMAGE_SIZE=1120` for E8).
   `bench_variants.py infer|train <B> [filter]` gives the speed tables.
   `probe_run.py`, `prune_scorer.py`, `scorer_controls.py`, `adaptive_prune.py`,
   `coco_scorer.py`, `coco_combo.py`, `pad_drop_eval.py`, `attn_locality.py`,

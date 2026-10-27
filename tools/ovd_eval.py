@@ -101,6 +101,16 @@ def detect(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run OWLv2 open-vocabulary detection."""
     batch_size = pixel_values.shape[0]
+    pruning = getattr(model.vision_model.encoder, "prune", None) is not None
+    if pruning or pixel_values.shape[-2:] != (model.image_size, model.image_size):
+        # Token pruning and padding-free (cropped) inputs go through the model's own
+        # detection path; its outputs cover only the tokens the tower kept.
+        query_embeds = model.get_text_features(token_ids, attention_mask)
+        query_mask = token_ids[..., 0] > 0
+        pred_logits, objectness_logits, pred_boxes, _, _ = model.forward_object_detection_from_embeddings(
+            pixel_values, query_embeds, query_mask
+        )
+        return pred_logits, objectness_logits, pred_boxes
 
     # This evaluator accepts one unbatched query bank and expands it for every
     # image. Do this unconditionally: query count can coincidentally equal batch
@@ -743,6 +753,8 @@ def run_owlv2_inference(
     desc: str,
     query_template: str = SATELLITE_QUERY_TEMPLATE,
     query_aliases: dict[str, list[str]] | None = None,
+    pad_drop: bool = False,
+    detector_engine=None,
 ) -> list[dict]:
     queries, indices_by_class = build_query_plan(
         class_names, query_template, query_aliases
@@ -754,8 +766,16 @@ def run_owlv2_inference(
         )
     text_inputs = tokenize(queries, context_length=16, truncate=True).to(device)
     attention_mask = (text_inputs == 0).to(device)
+    if detector_engine is not None:
+        # The engine runs tower and heads; the torch model only encodes the queries once.
+        with torch.inference_mode():
+            query_embeds = model.get_text_features(text_inputs, attention_mask)
+
     def _predict(m, pixels):
-        logits, objectness, boxes = detect(m, pixels, text_inputs, attention_mask)
+        if detector_engine is not None:
+            logits, objectness, boxes, _ = detector_engine(pixels, query_embeds)
+        else:
+            logits, objectness, boxes = detect(m, pixels, text_inputs, attention_mask)
         return pool_query_logits(logits, indices_by_class), objectness, boxes
 
     return run_detection_inference(
@@ -771,6 +791,7 @@ def run_owlv2_inference(
         desc=desc,
         predict_fn=_predict,
         postprocess_model=model,
+        pad_drop=pad_drop,
     )
 
 
@@ -821,6 +842,7 @@ def run_detection_inference(
     predict_fn: Callable,
     postprocess_model,
     preprocess_model=None,
+    pad_drop: bool = False,
 ) -> list[dict]:
     preprocess_model = preprocess_model or model
 
@@ -834,6 +856,13 @@ def run_detection_inference(
     if num_workers > 0:
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 2
+    if pad_drop and isinstance(dataset, CocoFileDetectionDataset):
+        # A padding-free batch shares its largest grid, so batch similar aspect ratios.
+        def aspect(index):
+            x0, y0, x1, y1 = dataset.items[index][1]
+            return (y1 - y0) / max(1, x1 - x0)
+
+        loader_kwargs["sampler"] = sorted(range(len(dataset)), key=aspect)
 
     detections: list[dict] = []
     device_type = torch.device(device).type
@@ -850,6 +879,11 @@ def run_detection_inference(
         pixel_values = preprocess_model.preprocess_image(
             images, fast=fast_preprocess, device=device if fast_preprocess else None
         ).to(device)
+        if pad_drop:
+            # Drop the patches that are all square padding (bottom and right).
+            rows, cols = preprocess_model.padding_free_grid(batch["target_sizes"])
+            patch = preprocess_model.patch_size
+            pixel_values = pixel_values[..., : rows * patch, : cols * patch]
 
         with torch.inference_mode():
             with torch.autocast(
@@ -1183,8 +1217,32 @@ def main() -> None:
         "--alias-pooling", action="store_true",
         help="Pool the eval spec's fine-grained aliases into each fixed target class.",
     )
+    parser.add_argument(
+        "--pad-drop", action="store_true",
+        help="Drop the patches that are all square padding (non-square images; batches are "
+        "sorted by aspect ratio for COCO-format datasets).",
+    )
+    parser.add_argument(
+        "--prune-scorer", type=Path, default=None,
+        help="Token pruning with a scorer from tools/arch_speedup/distill_scorer.py.",
+    )
+    parser.add_argument("--prune-keep", type=float, default=None,
+                        help="Fraction of the full patch grid kept after the scorer's block.")
+    parser.add_argument("--prune-threshold", type=float, default=None,
+                        help="Also keep every token scoring above this logit (adaptive keep).")
+    parser.add_argument(
+        "--trt-detector-engine", type=Path, default=None,
+        help="Engine from tools/arch_speedup/export_pruned.py (tower + heads, pruning baked in); "
+        "combine with --pad-drop for padding-free inputs.",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+    if args.trt_detector_engine is not None and (args.tensorrt or args.prune_scorer or args.checkpoint):
+        raise SystemExit("--trt-detector-engine already holds the tower, heads and pruning of the "
+                         "original weights; drop --tensorrt/--prune-scorer/--checkpoint.")
+    if args.tensorrt and (args.pad_drop or args.prune_scorer):
+        raise SystemExit("--pad-drop/--prune-scorer run the torch tower; the TensorRT vision engine "
+                         "is fixed-size. Use tools/arch_speedup/export_pruned.py for a pruned engine.")
 
     checkpoint = None
     if args.checkpoint:
@@ -1237,6 +1295,15 @@ def main() -> None:
     if checkpoint is not None:
         apply_text_checkpoint(model, checkpoint, wise_alpha=args.wise_alpha)
         print(f"Loaded fine-tuned weights from {args.checkpoint} (wise_alpha={args.wise_alpha})")
+    if args.prune_scorer is not None:
+        model.load_token_scorer(args.prune_scorer, keep=args.prune_keep, threshold=args.prune_threshold)
+        print(f"Token pruning: {model.vision_model.encoder.prune}")
+    detector_engine = None
+    if args.trt_detector_engine is not None:
+        from OWLv2torch.torch_version.owlv2_tensorrt import PaddingFreeDetectorTRT
+
+        detector_engine = PaddingFreeDetectorTRT(args.trt_detector_engine, device=args.device)
+        print(f"TensorRT detector engine: {args.trt_detector_engine}")
     query_template = args.query_template
     if query_template is None:
         query_template = (
@@ -1265,6 +1332,8 @@ def main() -> None:
         desc=f"{title} inference",
         query_template=query_template,
         query_aliases=(eval_spec.get("query_aliases") if args.alias_pooling else None),
+        pad_drop=args.pad_drop,
+        detector_engine=detector_engine,
     )
 
     if args.tile_size and args.tile_nms_iou > 0:
