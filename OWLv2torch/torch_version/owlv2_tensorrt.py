@@ -6,10 +6,11 @@ native TensorRT 11 Python API (``execute_async_v3`` + named-tensor I/O). Torch
 tensors' ``.data_ptr()`` is passed directly to TRT, so there is no host copy
 and no extra dependency beyond ``tensorrt`` itself.
 
-The runner launches on ``torch.cuda.current_stream()`` rather than a private
-stream, so downstream PyTorch ops are automatically serialized without an
-explicit ``cudaStreamSynchronize`` — CPU sync only happens when the caller
-actually pulls data back to host (``.cpu()``, ``.item()``, etc.).
+The runner is ordered on ``torch.cuda.current_stream()``, so downstream
+PyTorch ops are serialized without an explicit ``cudaStreamSynchronize`` — CPU
+sync only happens when the caller actually pulls data back to host (``.cpu()``,
+``.item()``, etc.). When that is the legacy default stream, which TensorRT
+syncs around, it launches on a private stream joined to it by events.
 
 Two engines are used: the vision tower, and a small engine for the
 class/box/objectness heads. The heads are kept separate so a fine-tuned head
@@ -84,6 +85,7 @@ if TRT_AVAILABLE:
             self.device = torch.device(device)
             self.reuse_outputs = reuse_outputs
             self._output_buffers: dict[str, torch.Tensor] = {}
+            self._stream = torch.cuda.Stream(self.device)
 
         @staticmethod
         def _torch_dtype(trt_dtype):
@@ -131,8 +133,15 @@ if TRT_AVAILABLE:
 
             outs = [self._bind_output(name) for name in self.output_names]
 
-            stream = torch.cuda.current_stream(self.device)
+            current = torch.cuda.current_stream(self.device)
+            # TensorRT syncs around launches on the legacy default stream (and
+            # warns), so run on a private stream ordered after and before torch's.
+            stream = self._stream if current.cuda_stream == 0 else current
+            if stream is not current:
+                stream.wait_stream(current)
             ok = self.context.execute_async_v3(stream.cuda_stream)
+            if stream is not current:
+                current.wait_stream(stream)
             if not ok:
                 raise RuntimeError("TensorRT execute_async_v3 returned False.")
             # No explicit sync: downstream torch ops on the same stream are
