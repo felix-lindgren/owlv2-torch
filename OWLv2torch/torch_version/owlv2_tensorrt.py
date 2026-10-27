@@ -14,6 +14,9 @@ actually pulls data back to host (``.cpu()``, ``.item()``, etc.).
 Two engines are used: the vision tower, and a small engine for the
 class/box/objectness heads. The heads are kept separate so a fine-tuned head
 checkpoint only needs the (seconds-long) heads rebuild, not the vision tower.
+Both are fixed to the square input; cropped inputs (``set_preprocessing``
+``pad_drop``/``long_side``) and pruned towers run on a third, padding-free
+engine holding tower and heads together (``export.PaddingFreeDetector``).
 """
 
 import argparse
@@ -180,6 +183,14 @@ class OwlV2TRT(OwlV2):
     model's head weights change afterwards (e.g. a fine-tuned checkpoint is
     loaded), detection falls back to the torch heads with a warning until
     :meth:`build_trt_heads` rebuilds the engine from the current weights.
+
+    Inputs with their padding cropped off and towers pruned by
+    :meth:`load_token_scorer` use the padding-free engine instead, under the same
+    conditions. :meth:`set_preprocessing` and :meth:`load_token_scorer` build it
+    when missing; there is one per pruning setting, next to the vision engine
+    unless ``detector_engine_path`` says otherwise. It returns no ``class_embeds``
+    or feature map (None in their places); ``detection_token_index`` maps its
+    tokens to the full grid.
     """
 
     def __init__(
@@ -189,6 +200,7 @@ class OwlV2TRT(OwlV2):
         onnx_path: str | Path | None = None,
         heads_engine_path: str | Path | None = None,
         heads_onnx_path: str | Path | None = None,
+        detector_engine_path: str | Path | None = None,
         trt_heads: bool = True,
         output_dir: str | Path = ".",
         model_type: str = "base",
@@ -217,6 +229,14 @@ class OwlV2TRT(OwlV2):
         self.heads_onnx_path = self._artifact_path(
             heads_onnx_path, self.heads_engine_path.with_suffix(".onnx")
         )
+        # owlv2_vis_base_sm120.engine -> owlv2_padfree_base_sm120.engine; pruned
+        # settings append their own suffix (see _detector_paths).
+        stem = self.engine_path.stem
+        stem = stem.replace("_vis_", "_padfree_", 1) if "_vis_" in stem else stem + "_padfree"
+        self.detector_engine_path = self._artifact_path(
+            detector_engine_path, self.engine_path.with_name(stem + ".engine")
+        )
+        self._trt_detectors = {}
         self.use_trt_heads = trt_heads
         self.build_missing = build_missing
         self.fp16 = fp16
@@ -418,30 +438,199 @@ class OwlV2TRT(OwlV2):
         # The heads engine scores the full patch grid, so token selection and
         # key masking go through the torch path.
         token_args = keep_idx is not None or prune_force is not None or key_bias is not None
-        if token_args or not self._use_trt_heads_for(pixel_values, query_embeds):
+        if not token_args:
+            detector = self._trt_detector_for(pixel_values, query_embeds)
+            if detector is not None:
+                return self._detect_with_trt_detector(detector, pixel_values, query_embeds, query_mask)
+        if token_args or self._needs_trt_detector(pixel_values) \
+                or not self._use_trt_heads_for(pixel_values, query_embeds):
             return super().forward_object_detection_from_embeddings(
                 pixel_values, query_embeds, query_mask, keep_idx=keep_idx,
                 prune_force=prune_force, key_bias=key_bias,
             )
 
-        batch_size, num_queries = pixel_values.shape[0], query_embeds.shape[0]
+        batch_size = pixel_values.shape[0]
         _, vision_full = self._get_vision_outputs(pixel_values)
         pred_logits, objectness_logits, pred_boxes, class_embeds, image_feats = self.trt_heads(
             vision_full=vision_full, query_embeds=query_embeds
         )
-        if query_mask is not None:
-            if query_mask.shape != (num_queries,):
-                raise ValueError(
-                    "A shared query_mask must have shape "
-                    f"[{num_queries}], got {tuple(query_mask.shape)}"
-                )
-            keep = query_mask.to(device=pred_logits.device, dtype=torch.bool)
-            pred_logits = torch.where(keep, pred_logits, torch.finfo(pred_logits.dtype).min)
+        pred_logits = self._mask_shared_queries(pred_logits, query_mask)
+        self.detection_token_index = None
 
         P = self.sqrt_num_patches
         feature_map = image_feats.view(batch_size, P, P, image_feats.shape[-1])
         text_features = query_embeds.to(pred_logits.dtype).unsqueeze(0).expand(batch_size, -1, -1)
         return pred_logits, objectness_logits, pred_boxes, class_embeds, (feature_map, text_features)
+
+    @staticmethod
+    def _mask_shared_queries(pred_logits, query_mask):
+        if query_mask is None:
+            return pred_logits
+        num_queries = pred_logits.shape[-1]
+        if query_mask.shape != (num_queries,):
+            raise ValueError(
+                "A shared query_mask must have shape "
+                f"[{num_queries}], got {tuple(query_mask.shape)}"
+            )
+        keep = query_mask.to(device=pred_logits.device, dtype=torch.bool)
+        return torch.where(keep, pred_logits, torch.finfo(pred_logits.dtype).min)
+
+    # ------------------------------------------------------- padding-free detector
+
+    # Like the other engines, it bakes in the weights it was built from (tower,
+    # scorer and heads), and is skipped with a warning once they change.
+
+    def _detector_config(self):
+        """Pruning the padding-free engine is built for ({} for none), or None if it cannot export."""
+        prune = getattr(self.vision_model.encoder, "prune", None)
+        if prune is None:
+            return {}
+        if prune.get("mode", "drop") != "drop" or prune.get("threshold") is not None \
+                or self.point_slot_head is not None:
+            return None
+        return {"after": prune["after"], "keep": prune["keep"], "registers": prune.get("registers", 0)}
+
+    def _detector_paths(self, config) -> tuple[Path, Path]:
+        engine = self.detector_engine_path
+        if config:
+            suffix = f"_b{config['after']}_k{round(config['keep'] * 100)}"
+            if config["registers"]:
+                suffix += f"_r{config['registers']}"
+            engine = engine.with_name(engine.stem + suffix + engine.suffix)
+        return engine.with_suffix(".onnx"), engine
+
+    def _detector_fingerprint(self) -> list[float]:
+        return self._vision_fingerprint() + self._heads_fingerprint()
+
+    def _detector_weights_state(self):
+        return self._vision_state() + self._heads_state()
+
+    def _load_trt_detector(self, config, build: bool):
+        onnx_path, engine_path = self._detector_paths(config)
+        if not engine_path.exists() and build and self._can_build():
+            self._build_trt_detector(onnx_path, engine_path)
+        if not engine_path.exists():
+            return None
+        runner = PaddingFreeDetectorTRT(engine_path)
+        fp_path = engine_path.with_name(engine_path.name + ".json")
+        # An engine without a fingerprint is trusted, as for the other engines.
+        if fp_path.exists():
+            fingerprint = json.loads(fp_path.read_text())["fingerprint"]
+        else:
+            fingerprint = self._detector_fingerprint()
+        return {
+            "runner": runner,
+            "path": engine_path,
+            "fingerprint": fingerprint,
+            "state": None,
+            "stale": False,
+            "max_batch": runner.runner.max_shape("image")[0],
+            "max_queries": runner.runner.max_shape("query_embeds")[0],
+        }
+
+    def _build_trt_detector(self, onnx_path: Path, engine_path: Path):
+        from OWLv2torch.torch_version.build_engine import build_detector_engine
+        from OWLv2torch.torch_version.export import export_padding_free_detector
+
+        for path in (engine_path, onnx_path):
+            path.unlink(missing_ok=True)
+        engine_path.parent.mkdir(parents=True, exist_ok=True)
+        kwargs = self.engine_build_kwargs
+        print(f"Exporting OWLv2 padding-free detector ONNX to {onnx_path}")
+        with torch.inference_mode(False):
+            export_padding_free_detector(self, str(onnx_path), fp16=self.fp16, max_batch=kwargs["max_batch"])
+        print(f"Building OWLv2 padding-free detector TensorRT engine to {engine_path}")
+        S = self.image_size
+        build_detector_engine(
+            onnx_file_path=str(onnx_path),
+            engine_file_path=str(engine_path),
+            image_size=S,
+            patch_size=self.patch_size,
+            opt_hw=(S, S),
+            max_batch=kwargs["max_batch"],
+            max_queries=kwargs["max_queries"],
+            workspace_gb=kwargs["workspace_gb"],
+        )
+        if engine_path.exists():
+            engine_path.with_name(engine_path.name + ".json").write_text(
+                json.dumps({"fingerprint": self._detector_fingerprint()})
+            )
+
+    def prepare_trt_detector(self, rebuild: bool = False):
+        """Load the padding-free engine for the current pruning, building it if missing.
+
+        ``rebuild`` re-exports it from the current weights (after a fine-tune).
+        Returns False when there is none (no TensorRT, or an adaptive-threshold,
+        kv or point-slot setup, which does not export).
+        """
+        config = self._detector_config()
+        if config is None or not (TRT_AVAILABLE and torch.cuda.is_available()):
+            return False
+        key = json.dumps(config, sort_keys=True)
+        if rebuild:
+            for path in self._detector_paths(config):
+                path.unlink(missing_ok=True)
+        elif self._trt_detectors.get(key) is not None:
+            return True
+        self._trt_detectors[key] = self._load_trt_detector(config, build=self.build_missing or rebuild)
+        return self._trt_detectors[key] is not None
+
+    def build_trt_detector(self):
+        """Re-export and rebuild the padding-free engine from the current weights."""
+        return self.prepare_trt_detector(rebuild=True)
+
+    def _needs_trt_detector(self, pixel_values) -> bool:
+        """The fixed-size engines cannot serve this input or this tower."""
+        cropped = tuple(pixel_values.shape[-2:]) != (self.image_size, self.image_size)
+        return cropped or getattr(self.vision_model.encoder, "prune", None) is not None
+
+    def _trt_detector_for(self, pixel_values, query_embeds):
+        if not self._needs_trt_detector(pixel_values) or torch.is_grad_enabled():
+            return None
+        config = self._detector_config()
+        if config is None or not (TRT_AVAILABLE and torch.cuda.is_available()):
+            return None
+        key = json.dumps(config, sort_keys=True)
+        if key not in self._trt_detectors:
+            self._trt_detectors[key] = self._load_trt_detector(config, build=False)
+        detector = self._trt_detectors[key]
+        usable = (
+            detector is not None
+            and query_embeds.ndim == 2
+            and query_embeds.shape[-1] == self.text_dim
+            and 0 < query_embeds.shape[0] <= detector["max_queries"]
+            and pixel_values.shape[0] <= detector["max_batch"]
+            and pixel_values.is_cuda
+            and query_embeds.device == pixel_values.device
+            and self._trt_detector_matches_weights(detector)
+        )
+        return detector if usable else None
+
+    def _trt_detector_matches_weights(self, detector) -> bool:
+        state = self._detector_weights_state()
+        if state != detector["state"]:
+            current = self._detector_fingerprint()
+            detector["stale"] = not np.allclose(current, detector["fingerprint"], rtol=1e-6, atol=1e-6)
+            detector["state"] = state
+            if detector["stale"]:
+                warnings.warn(
+                    f"Weights differ from those in {detector['path']}; using torch. "
+                    "Call build_trt_detector() to rebuild the engine.",
+                    stacklevel=4,
+                )
+        return not detector["stale"]
+
+    def _detect_with_trt_detector(self, detector, pixel_values, query_embeds, query_mask):
+        pred_logits, objectness_logits, pred_boxes, token_index = detector["runner"](pixel_values, query_embeds)
+        pred_logits = self._mask_shared_queries(pred_logits, query_mask)
+        self.detection_token_index = token_index.long()
+        text_features = query_embeds.to(pred_logits.dtype).unsqueeze(0).expand(pixel_values.shape[0], -1, -1)
+        return pred_logits, objectness_logits, pred_boxes, None, (None, text_features)
+
+    def load_token_scorer(self, path, keep=None, threshold=None, registers=None):
+        super().load_token_scorer(path, keep=keep, threshold=threshold, registers=registers)
+        self.prepare_trt_detector()
+        return self
 
     # ------------------------------------------------------------------ vision
 
@@ -543,13 +732,14 @@ class OwlV2TRT(OwlV2):
         return pooled_output, full_vision
 
     def set_preprocessing(self, blur: float = 0.0, long_side: int | None = None, pad_drop: bool = False):
-        if self.trt is not None and (pad_drop or (long_side or self.image_size) != self.image_size):
-            raise ValueError("The TensorRT vision engine is fixed-size; crop the padding with "
-                             "PaddingFreeDetectorTRT or an OwlV2 (torch) model instead")
-        return super().set_preprocessing(blur=blur, long_side=long_side, pad_drop=pad_drop)
+        super().set_preprocessing(blur=blur, long_side=long_side, pad_drop=pad_drop)
+        if self.preprocess_pad_drop:
+            self.prepare_trt_detector()
+        return self
 
     def _get_vision_outputs(self, pixel_values):
-        if self.trt is not None and self.trt_vision_matches_weights():
+        square = tuple(pixel_values.shape[-2:]) == (self.image_size, self.image_size)
+        if square and self.trt is not None and self.trt_vision_matches_weights():
             return self.trt_inference(pixel_values)
         return self.vision_model(pixel_values)
 

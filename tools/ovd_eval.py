@@ -1265,9 +1265,8 @@ def main() -> None:
     if args.trt_detector_engine is not None and (args.tensorrt or args.prune_scorer or args.checkpoint):
         raise SystemExit("--trt-detector-engine already holds the tower, heads and pruning of the "
                          "original weights; drop --tensorrt/--prune-scorer/--checkpoint.")
-    if args.tensorrt and (args.pad_drop or args.long_side or args.prune_scorer):
-        raise SystemExit("--pad-drop/--long-side/--prune-scorer run the torch tower; the TensorRT vision engine "
-                         "is fixed-size. Use tools/arch_speedup/export_pruned.py for a pruned engine.")
+    if args.tensorrt and args.prune_threshold is not None:
+        raise SystemExit("--prune-threshold (adaptive keep) does not export to TensorRT; drop one of them.")
 
     checkpoint = None
     if args.checkpoint:

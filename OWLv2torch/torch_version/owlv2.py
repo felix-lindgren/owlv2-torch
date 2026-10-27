@@ -629,6 +629,13 @@ class ClassPredictionHead(nn.Module):
             )
         return (pred_logits, image_class_embeds)
 
+
+def _same_tensor(a: Optional[torch.Tensor], b: Optional[torch.Tensor]) -> bool:
+    if a is None or b is None:
+        return a is b
+    return a.shape == b.shape and a.device == b.device and bool(torch.equal(a, b))
+
+
 class OwlV2(nn.Module):
     def __init__(self, model_type="base"):
         super().__init__()
@@ -719,6 +726,11 @@ class OwlV2(nn.Module):
         self.preprocess_blur = 0.0
         self.preprocess_long_side = None
         self.preprocess_pad_drop = False
+        # Full-square-grid index of the tokens in the last detection's outputs, or
+        # None when they are the full grid in order; see
+        # forward_object_detection_from_embeddings.
+        self.detection_token_index = None
+        self._query_cache = None
 
         self._load_model(self.model_string)
 
@@ -831,8 +843,7 @@ class OwlV2(nn.Module):
         - ``pad_drop``: crop the patches that are all square padding (free in
           accuracy; see :meth:`padding_free_grid`).
 
-        Cropped inputs need the torch tower or ``PaddingFreeDetectorTRT``; the
-        fixed-size ``OwlV2TRT`` engine takes ``blur`` only.
+        ``OwlV2TRT`` runs cropped inputs on its padding-free engine.
         """
         if long_side is not None:
             if long_side % self.patch_size or not 0 < long_side <= self.image_size:
@@ -916,6 +927,31 @@ class OwlV2(nn.Module):
             )
         return self.get_text_features(token_ids, attention_mask), token_ids[..., 0] > 0
 
+    def _detection_query_features(self, token_ids, attention_mask):
+        """:meth:`get_text_features`, reusing the last result for the same queries.
+
+        Detection usually repeats one query set image after image; re-encoding it
+        costs ~4 ms on base. The cache is skipped under autograd and dropped when
+        the text weights or the autocast dtype change.
+        """
+        if torch.is_grad_enabled():
+            self._query_cache = None
+            return self.get_text_features(token_ids, attention_mask)
+        device_type = token_ids.device.type
+        autocast = torch.is_autocast_enabled(device_type) and torch.get_autocast_dtype(device_type)
+        state = (autocast, tuple(
+            (id(p), p.data_ptr(), p._version)
+            for module in (self.text_model, self.text_projection) for p in module.parameters()
+        ))
+        cache = self._query_cache
+        if cache is not None and cache[0] == state and _same_tensor(cache[1], token_ids) \
+                and _same_tensor(cache[2], attention_mask):
+            return cache[3]
+        features = self.get_text_features(token_ids, attention_mask)
+        mask = None if attention_mask is None else attention_mask.clone()
+        self._query_cache = (state, token_ids.clone(), mask, features)
+        return features
+
     def forward(self, pixel_values, token_ids, attention_mask):
         vision_features, vision_pooled, vision_full = self.get_vision_features(pixel_values)
         text_features = self.get_text_features(token_ids, attention_mask)
@@ -936,7 +972,7 @@ class OwlV2(nn.Module):
             batch_size,
             repeat_shared=False,
         )
-        text_features = self.get_text_features(token_ids, attention_mask)
+        text_features = self._detection_query_features(token_ids, attention_mask)
 
         if shared_queries:
             query_mask = token_ids[..., 0] > 0
@@ -969,6 +1005,11 @@ class OwlV2(nn.Module):
         batched ``[batch_size, num_queries, text_dim]``. Shared embeddings are
         expanded as a view, so identical text queries are never re-encoded for each
         image.
+
+        Outputs follow the tokens that reach the heads. When those are not the
+        full square grid in order (padding cropped off, or a pruned tower),
+        ``self.detection_token_index`` holds each one's index in the full square
+        grid, ``[batch_size, num_tokens]``; otherwise it is None.
         """
         batch_size = pixel_values.shape[0]
         if query_embeds.ndim == 2:
@@ -1027,6 +1068,9 @@ class OwlV2(nn.Module):
             _, vision_full = self.vision_model(pixel_values, keep_idx, prune_force, key_bias)
             if pruning:
                 keep_idx = self.vision_model.prune_aux[1]
+            self.detection_token_index = (
+                self.full_grid_index(keep_idx, grid[1]) if self.point_slot_head is None else None
+            )
             feature_map = self.vision_model.post_layernorm(vision_full)
             image_feats = self.layer_norm(feature_map[:, 1:, :] * feature_map[:, :1, :])
             image_feats = self.point_slot_features(image_feats, kept=True)
@@ -1034,6 +1078,7 @@ class OwlV2(nn.Module):
         else:
             _, vision_full = self._get_vision_outputs(pixel_values)
             image_feats, feature_map = self._detection_image_features_from_vision(vision_full, grid)
+            self.detection_token_index = None
             if grid == (self.sqrt_num_patches,) * 2:
                 image_feats = self.point_slot_features(image_feats)
                 box_bias = self.detection_box_bias
@@ -1041,6 +1086,8 @@ class OwlV2(nn.Module):
                 raise ValueError("Point slots need the full square grid; do not crop the padding")
             else:
                 box_bias = self.grid_box_bias(*grid)
+                local = torch.arange(grid[0] * grid[1], device=pixel_values.device)
+                self.detection_token_index = self.full_grid_index(local, grid[1]).expand(batch_size, -1)
         if text_features.dtype != image_feats.dtype:
             text_features = text_features.to(dtype=image_feats.dtype)
 
@@ -1145,6 +1192,11 @@ class OwlV2(nn.Module):
         self.vision_model.encoder.token_scorer.load_state_dict(saved["scorer"])
         return self
 
+    def full_grid_index(self, index: torch.Tensor, cols: int) -> torch.Tensor:
+        """Patch ``index`` in a grid ``cols`` wide (padding cropped) -> index in the full square grid."""
+        P = self.sqrt_num_patches
+        return index if cols == P else index // cols * P + index % cols
+
     def kept_box_bias(self, keep_idx: torch.Tensor, cols: Optional[int] = None) -> torch.Tensor:
         """``[B, M * grid**2, 4]`` box bias for the slots of the kept patch tokens.
 
@@ -1152,8 +1204,8 @@ class OwlV2(nn.Module):
         padding was cropped off (the full grid otherwise).
         """
         S, P = self.point_slot_grid, self.sqrt_num_patches
-        if cols is not None and cols != P:
-            keep_idx = keep_idx // cols * P + keep_idx % cols
+        if cols is not None:
+            keep_idx = self.full_grid_index(keep_idx, cols)
         if S == 1:
             return self.box_bias[keep_idx]
         r, c = keep_idx // P, keep_idx % P
