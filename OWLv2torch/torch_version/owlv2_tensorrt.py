@@ -411,10 +411,17 @@ class OwlV2TRT(OwlV2):
         pixel_values: torch.Tensor,
         query_embeds: torch.Tensor,
         query_mask: torch.Tensor | None = None,
+        keep_idx: torch.Tensor | None = None,
+        prune_force: torch.Tensor | None = None,
+        key_bias: torch.Tensor | None = None,
     ):
-        if not self._use_trt_heads_for(pixel_values, query_embeds):
+        # The heads engine scores the full patch grid, so token selection and
+        # key masking go through the torch path.
+        token_args = keep_idx is not None or prune_force is not None or key_bias is not None
+        if token_args or not self._use_trt_heads_for(pixel_values, query_embeds):
             return super().forward_object_detection_from_embeddings(
-                pixel_values, query_embeds, query_mask
+                pixel_values, query_embeds, query_mask, keep_idx=keep_idx,
+                prune_force=prune_force, key_bias=key_bias,
             )
 
         batch_size, num_queries = pixel_values.shape[0], query_embeds.shape[0]
