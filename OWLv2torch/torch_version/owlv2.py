@@ -817,8 +817,9 @@ class OwlV2(nn.Module):
         (training transforms are untouched); call with no arguments to reset.
 
         - ``blur``: Gaussian sigma in pixels of the resized image. OWLv2 wants
-          slightly soft input: 0.5 gave +0.011 COCO val mAP zero-shot and +0.018
-          on Fashionpedia, nothing on DIOR.
+          slightly soft input: with base, 0.5 gave +0.011 COCO val mAP zero-shot
+          and +0.018 on Fashionpedia, nothing on DIOR. With large only +0.002
+          COCO, and Fashionpedia loses 0.006-0.012, so leave it off there.
         - ``long_side``: resize the long side to this (a multiple of the patch
           size, at most ``image_size``) and place it in the top-left of the
           ``image_size`` canvas, keeping the original position embeddings and box

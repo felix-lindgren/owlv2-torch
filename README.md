@@ -104,8 +104,10 @@ scores, labels, token = model.select_detections(pred_logits, objectness, top_k=3
 boxes = boxes.gather(1, token[..., None].expand(-1, -1, 4))
 ```
 
-- `blur` softens the resized image (sigma in pixels); OWLv2 does better on
-  slightly soft input. It helps natural images and is neutral on aerial.
+- `blur` softens the resized image (sigma in pixels); OWLv2-base does better
+  on slightly soft input. It helps natural images with base and is neutral on
+  aerial. With large it is +0.002 on COCO and hurts Fashionpedia, so leave it
+  off there.
 - `long_side` shrinks the image inside the original canvas and drops the
   padding, keeping the pretrained position embeddings (unlike
   `set_image_size`, which resamples them and breaks zero-shot accuracy).

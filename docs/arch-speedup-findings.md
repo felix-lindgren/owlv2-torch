@@ -407,6 +407,33 @@ worse on full val and Fashionpedia, so √objectness is the default.
   lands on the fixed-keep curve, prompt ensembles change ±0.001, and NMS
   hurts.
 
+**OWLv2-large.** The same sweep on large (1008 px, patch 14) ran on a
+padding-free engine (`export_pruned.py --model-type large`; mini500 0.4975
+against torch 0.4976). Long sides 812 and 742 are the canvas fractions of
+768 and 704. Scores are argmax / multi-label; latency is TRT fp16, B=1, 80
+queries, square / 4:3.
+
+| large | COCO val (5000) | COCO mini500 | Fashionpedia (500) | DIOR (500) | ms, 1:1 / 4:3 |
+|---|---|---|---|---|---|
+| original | 0.4551 / 0.4588 | 0.4975 / 0.5050 | 0.2340 / 0.2631 | 0.0990 / 0.0978 | 48.6 |
+| padding drop | 0.4581 / 0.4621 | 0.5005 / 0.5074 | **0.2347 / 0.2640** | 0.0990 / 0.0978 | 48.6 / 32.2 |
+| + blur 0.5 | **0.4604 / 0.4644** | **0.5029 / 0.5103** | 0.2289 / 0.2522 | 0.0984 / 0.0968 | 48.6 / 32.2 |
+| + blur 0.5, long side 812 | 0.4584 / 0.4619 | 0.5023 / 0.5063 | 0.2249 / 0.2517 | **0.0995** / 0.0931 | 27.9 / 19.0 |
+| + blur 0.5, long side 742 | 0.4560 / 0.4595 | 0.4950 / 0.5003 | 0.2264 / 0.2498 | 0.0986 / 0.0909 | 21.3 / 14.5 |
+
+- Padding drop (+0.003 COCO) and multi-label on natural images (+0.004
+  COCO, +0.03 Fashionpedia) carry over. Multi-label hurts DIOR more on
+  large: −0.001 at full size, −0.006 to −0.008 once shrunk.
+- Blur is mostly a base-model effect. On large it is +0.002 on COCO val,
+  and it costs Fashionpedia 0.006 / 0.012 and DIOR 0.001.
+- Shrinking costs large less on COCO: 812 is 1.7x faster at 4:3 for −0.002.
+  Fashionpedia loses 0.004–0.012, part of which is likely the blur, since
+  shrinking without blur was not run.
+- Zero-shot, large equals base on COCO (0.4551 vs 0.4556) but wins on
+  Fashionpedia (0.234 vs 0.209) and DIOR (0.099 vs 0.078).
+- For large: padding drop plus multi-label for natural images, no blur, and
+  812 as the speed knob.
+
 ## Recommendations
 
 1. **Adopt learned token pruning with a per-image threshold.** All three prune

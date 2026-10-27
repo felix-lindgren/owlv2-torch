@@ -9,6 +9,7 @@ block to ``--keep`` of the full grid. The original weights are used throughout.
 python tools/arch_speedup/export_pruned.py --scorer text_checkpoints/zeroshot_scorers/objectness_scorer_b4.pt \
     --keep 0.5 --out trt_engines/owlv2_base_padfree_b4_k50
 python tools/arch_speedup/export_pruned.py --out trt_engines/owlv2_base_padfree   # padding drop only
+python tools/arch_speedup/export_pruned.py --model-type large --out trt_engines/owlv2_large_padfree
 """
 import argparse
 import time
@@ -85,9 +86,11 @@ def main():
     p.add_argument("--max-batch", type=int, default=8)
     p.add_argument("--max-queries", type=int, default=1024)
     p.add_argument("--rebuild", action="store_true")
+    p.add_argument("--model-type", default="base", choices=["base", "large"])
     args = p.parse_args()
 
-    model = OwlV2("base").eval()
+    model = OwlV2(args.model_type).eval()
+    S, patch = model.image_size, model.patch_size
     if args.scorer is not None:
         model.load_token_scorer(args.scorer, keep=args.keep)
     onnx_path, engine_path = args.out.with_suffix(".onnx"), args.out.with_suffix(".engine")
@@ -98,7 +101,8 @@ def main():
         print(f"exported {onnx_path} ({time.time() - start:.0f}s)")
         start = time.time()
         if build_detector_engine(str(onnx_path), str(engine_path), max_batch=args.max_batch,
-                                 max_queries=args.max_queries) is None:
+                                 max_queries=args.max_queries, image_size=S, patch_size=patch,
+                                 opt_hw=(S, S)) is None:
             raise SystemExit("engine build failed")
         print(f"built {engine_path} ({time.time() - start:.0f}s)")
 
@@ -110,8 +114,8 @@ def main():
         query_embeds = model.get_text_features(tokens, tokens == 0)
     check(model, engine, query_embeds)
     print("TensorRT latency, 80 queries:")
-    bench(engine, query_embeds.repeat(16, 1), [(1, 3, 960, 960), (1, 3, 720, 960), (1, 3, 544, 960), (8, 3, 960, 960),
-                                               (8, 3, 720, 960)])
+    bench(engine, query_embeds.repeat(16, 1), [(b, 3, h, S) for b, h in ((1, S), (1, S * 3 // 4 // patch * patch),
+                                                                (1, S * 9 // 16 // patch * patch), (8, S), (8, S * 3 // 4 // patch * patch))])
 
 
 if __name__ == "__main__":
