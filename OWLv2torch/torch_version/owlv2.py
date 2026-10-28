@@ -15,6 +15,7 @@ import torchvision.transforms.v2.functional as TF
 from torch.utils.checkpoint import checkpoint
 from PIL import Image
 from scipy import ndimage as ndi
+from scipy import sparse as sps
 
 from OWLv2torch.utils.hf_hub_utils import find_safetensors_in_cache
 from OWLv2torch.utils.query_batching import normalize_detection_queries
@@ -121,6 +122,12 @@ def _scipy_resize_axis(content, padded, out, scale):
     Taps landing on the fill are dropped from the operator; the returned
     per-row weight on the image says how much of each row they took.
     """
+    rows, cols, weights, image_weight = _scipy_resize_taps(content, padded, out)
+    return _to_torch_csr(rows, cols, weights * scale, (out, content)), torch.from_numpy(image_weight).float()
+
+
+def _scipy_resize_taps(content, padded, out):
+    """``_scipy_resize_axis``'s operator as ``(rows, cols, weights)`` taps, plus the per-row image weight."""
     factor = padded / out
     sigma = max(0.0, (factor - 1) / 2)
     src = (np.arange(out) + 0.5) * factor - 0.5
@@ -140,16 +147,17 @@ def _scipy_resize_axis(content, padded, out, scale):
     rows = np.broadcast_to(np.arange(out)[:, None], cols.shape)
     keep = cols < content
     rows, cols, weights = rows[keep], cols[keep], weights[keep]
-    image_weight = np.bincount(rows, weights, minlength=out)
+    return rows, cols, weights, np.bincount(rows, weights, minlength=out)
+
+
+def _to_torch_csr(rows, cols, weights, shape):
+    """float32 sparse CSR tensor from COO taps; repeated taps are summed."""
     # torch flags sparse tensors as beta and warns that invariant checks are off.
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="Sparse")
-        op = torch.sparse_coo_tensor(
-            torch.from_numpy(np.stack([rows, cols])),
-            torch.from_numpy(weights * scale),
-            (out, content),
+        return torch.sparse_coo_tensor(
+            torch.from_numpy(np.stack([rows, cols]).astype(np.int64)), torch.from_numpy(weights), shape
         ).coalesce().to(torch.float32).to_sparse_csr()
-    return op, torch.from_numpy(image_weight).float()
 
 
 @functools.lru_cache(maxsize=32)
@@ -160,6 +168,48 @@ def _scipy_resize_operators(h, w, size, scale, device):
     # 0.5 fill of the padded margin, laid out like the (S_x, S_y) result below.
     fill = 0.5 * (1 - torch.outer(ax_weight, ay_weight)).unsqueeze(-1)
     return ay.to(device), ax.to(device), fill.to(device)
+
+
+@functools.lru_cache(maxsize=32)
+def _preprocess_operators(h, w, side, rows, cols, blur, scale, device):
+    """``preprocess_image``'s fast path for an ``h`` x ``w`` image as cached operators.
+
+    SquarePad + ScipyResize to ``side``, the optional Gaussian ``blur``
+    (TF.gaussian_blur's kernel and reflect border, over the whole ``side``
+    square) and the crop to ``rows`` x ``cols`` are all linear, so each axis
+    composes into one sparse operator plus a fill term for the padding, and the
+    normalisation becomes a per-channel scale and shift. Only the kept rectangle
+    is computed and the blur takes no pass of its own: a 640x480 PIL image takes
+    0.40 instead of 0.73 ms to CUDA at blur 0.5 and long side 768 (5070 Ti),
+    within ~1.3e-6 of the separate steps. ScipyResize's clip to the input range
+    is left out; every tap weight is non-negative, so it only ever trimmed
+    rounding (and cost two device syncs).
+    """
+    n = max(h, w)
+    mix = sps.identity(side, format="csr")
+    if blur > 0:
+        radius = max(1, int(3 * blur + 0.5))
+        offsets = np.arange(-radius, radius + 1)
+        kernel = np.exp(-0.5 * (offsets / blur) ** 2)
+        taps = _mirror_index(np.arange(side)[:, None] + offsets, side)
+        mix = sps.csr_matrix(
+            (np.broadcast_to(kernel / kernel.sum(), taps.shape).ravel(),
+             (np.repeat(np.arange(side), len(offsets)), taps.ravel())),
+            shape=(side, side),
+        )
+
+    def axis(content, out, axis_scale):
+        r, c, weights, image_weight = _scipy_resize_taps(content, n, side)
+        resize = sps.csr_matrix((weights * axis_scale, (r, c)), shape=(side, content))
+        op = (mix[:out] @ resize).tocoo()
+        return _to_torch_csr(op.row, op.col, op.data, op.shape).to(device), mix[:out] @ image_weight
+
+    ay, wy = axis(h, rows, scale)
+    ax, wx = axis(w, cols, 1.0)
+    # The 0.5 padding after resize and blur, laid out like the (cols, rows) result.
+    fill = torch.from_numpy(0.5 * (1 - np.outer(wx, wy))).float().unsqueeze(-1).to(device)
+    mean, std = torch.tensor(OPENAI_CLIP_MEAN), torch.tensor(OPENAI_CLIP_STD)
+    return ay, ax, fill, (1 / std).to(device), (-mean / std).to(device)
 
 
 class TorchScipyResize:
@@ -650,6 +700,27 @@ def _same_tensor(a: Optional[torch.Tensor], b: Optional[torch.Tensor]) -> bool:
     return a.shape == b.shape and a.device == b.device and bool(torch.equal(a, b))
 
 
+def _watch(*tensors) -> Optional[tuple]:
+    """The tensors with their version counters, for :func:`_unchanged`.
+
+    None when one is an inference tensor: those keep no version counter, so
+    in-place writes to them cannot be seen.
+    """
+    if any(t is not None and t.is_inference() for t in tensors):
+        return None
+    return tuple((t, None if t is None else t._version) for t in tensors)
+
+
+def _unchanged(watched: Optional[tuple], *tensors) -> bool:
+    """Whether ``tensors`` are the very ones :func:`_watch` saw, not written to since.
+
+    Unlike comparing values, this does not wait for queued GPU work.
+    """
+    return watched is not None and len(watched) == len(tensors) and all(
+        seen is t and (t is None or t._version == version) for (seen, version), t in zip(watched, tensors)
+    )
+
+
 class OwlV2(nn.Module):
     def __init__(self, model_type="base"):
         super().__init__()
@@ -812,29 +883,34 @@ class OwlV2(nn.Module):
         Accepts a single PIL image / file path, or a list/tuple of either.
         Always returns a ``[B, 3, H, W]`` float tensor (B=1 for a single input).
 
-        Both paths give the same pixels; ``fast=False`` runs the original scipy
-        implementation, which is several times slower on the CPU. Images are
+        Both paths give the same pixels (within ~1e-6); ``fast=False`` runs the
+        original scipy implementation, which is several times slower on the CPU.
+        The fast path applies resize, blur, crop and normalisation as one cached
+        operator per image size (see ``_preprocess_operators``). Images are
         preprocessed one at a time (their sizes differ) and stacked into a batch
         so downstream forward passes can run with B>1.
 
-        ``device`` (fast path only) moves each uint8 image there and resizes it
-        on that device, returning the batch on it. On CUDA that gives the CPU
-        path's pixels (within 1e-6) about 4x faster, which matters when the CPU
-        resize would otherwise leave the GPU idle. ``None`` keeps it on the CPU.
+        ``device`` (fast path only) moves each uint8 image there and preprocesses
+        it on that device, returning the batch on it. On CUDA that is several
+        times faster than the CPU, which matters when the CPU resize would
+        otherwise leave the GPU idle. ``None`` keeps it on the CPU.
         """
         if device is not None and not fast:
             raise ValueError("device needs fast=True; the scipy path runs on the CPU only")
 
         images = list(image) if isinstance(image, (list, tuple)) else [image]
         images = [Image.open(img) if isinstance(img, str) else img for img in images]
-        pixel_values = torch.stack([self._preprocess_one(img, fast, device) for img in images])
+        side = self.preprocess_long_side or self.image_size
+        rows = cols = side
         if self.preprocess_pad_drop:
             # Drop the patches that are all padding; the batch shares its largest grid.
             sizes = [(img.height, img.width) if isinstance(img, Image.Image) else tuple(img.shape[-2:])
                      for img in images]
-            rows, cols = self.padding_free_grid(sizes)
-            pixel_values = pixel_values[..., : rows * self.patch_size, : cols * self.patch_size]
-        return pixel_values
+            rows, cols = (n * self.patch_size for n in self.padding_free_grid(sizes))
+        if fast:
+            return torch.stack([self._preprocess_fast(img, device, side, rows, cols) for img in images])
+        pixel_values = torch.stack([self._preprocess_one(img) for img in images])
+        return pixel_values[..., :rows, :cols] if self.preprocess_pad_drop else pixel_values
 
     def set_preprocessing(self, blur: float = 0.0, long_side: Optional[int] = None,
                           pad_drop: bool = False) -> "OwlV2":
@@ -874,26 +950,37 @@ class OwlV2(nn.Module):
         self.preprocess_pad_drop = pad_drop
         return self
 
-    def _preprocess_one(self, image, fast, device):
-        """One image (PIL or ``(C, H, W)`` tensor) to a normalised ``(3, S, S)`` canvas."""
-        if device is not None and isinstance(image, Image.Image):
-            # np.asarray is 5x cheaper than np.array but read-only; the array is
-            # only ever copied to the device, so torch's warning doesn't apply.
+    def _preprocess_fast(self, image, device, side, rows, cols):
+        """One image (PIL or ``(C, H, W)`` tensor) to the normalised ``(3, rows, cols)``
+        top-left crop of its ``side`` canvas."""
+        if isinstance(image, Image.Image):
+            # np.asarray is 5x cheaper than np.array but read-only; nothing
+            # writes to it, so torch's warning doesn't apply.
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
                 hwc = torch.from_numpy(np.asarray(image))
             if hwc.ndim == 2:
                 hwc = hwc.unsqueeze(-1)
-            image = hwc.permute(2, 0, 1)
+        else:
+            hwc = image.as_subclass(torch.Tensor).permute(1, 2, 0)
         if device is not None:
-            image = image.to(device)
+            hwc = hwc.to(device)
+        h, w, c = hwc.shape
+        scale = 1.0 if hwc.is_floating_point() else 1.0 / torch.iinfo(hwc.dtype).max
+        ay, ax, fill, inv_std, shift = _preprocess_operators(
+            h, w, side, rows, cols, self.preprocess_blur, scale, hwc.device
+        )
+        # Contract rows on the (H, W*C) view, then columns on the (W, rows*C) view.
+        y = torch.sparse.mm(ay, hwc.reshape(h, w * c).float())
+        y = y.view(rows, w, c).transpose(0, 1).reshape(w, rows * c)
+        out = torch.sparse.mm(ax, y).view(cols, rows, c).add_(fill)
+        return torch.addcmul(shift, out, inv_std).permute(2, 1, 0)
 
+    def _preprocess_one(self, image):
+        """One image (PIL or ``(C, H, W)`` tensor) to a normalised square canvas, with scipy."""
         long_side = self.preprocess_long_side
         if long_side is None:
-            transform = self.image_transform_fast if fast else self.image_transform_accurate
-            pixel_values = transform(image)
-        elif fast:
-            pixel_values = self.owlv2_img_normalize(TorchScipyResize(long_side)(image))
+            pixel_values = self.image_transform_accurate(image)
         else:
             pixel_values = self.owlv2_img_normalize(ScipyResize(long_side)(SquarePad()(
                 TF.to_dtype(TF.to_image(image), torch.float32, scale=True))))
@@ -961,7 +1048,9 @@ class OwlV2(nn.Module):
 
         Detection usually repeats one query set image after image; re-encoding it
         costs ~4 ms on base. The cache is skipped under autograd and dropped when
-        the text weights or the autocast dtype change.
+        the text weights or the autocast dtype change. Passing the same unmodified
+        tensors again hits without comparing their values, whose device sync held
+        back the next launch (~0.1 ms per image at 768 on a 5070 Ti).
         """
         if torch.is_grad_enabled():
             self._query_cache = None
@@ -972,12 +1061,14 @@ class OwlV2(nn.Module):
             "text", lambda: (p for m in (self.text_model, self.text_projection) for p in m.parameters())
         ))
         cache = self._query_cache
-        if cache is not None and cache[0] == state and _same_tensor(cache[1], token_ids) \
-                and _same_tensor(cache[2], attention_mask):
+        if cache is not None and cache[0] == state and (
+            _unchanged(cache[4], token_ids, attention_mask)
+            or _same_tensor(cache[1], token_ids) and _same_tensor(cache[2], attention_mask)
+        ):
             return cache[3]
         features = self.get_text_features(token_ids, attention_mask)
         mask = None if attention_mask is None else attention_mask.clone()
-        self._query_cache = (state, token_ids.clone(), mask, features)
+        self._query_cache = (state, token_ids.clone(), mask, features, _watch(token_ids, attention_mask))
         return features
 
     def forward(self, pixel_values, token_ids, attention_mask):
