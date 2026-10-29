@@ -908,7 +908,10 @@ class OwlV2(nn.Module):
                      for img in images]
             rows, cols = (n * self.patch_size for n in self.padding_free_grid(sizes))
         if fast:
-            return torch.stack([self._preprocess_fast(img, device, side, rows, cols) for img in images])
+            # Keep pixels float32 under a caller's autocast, which would run the
+            # sparse operators in float16 (~3e-3 off instead of ~1e-6).
+            with torch.autocast("cuda", enabled=False), torch.autocast("cpu", enabled=False):
+                return torch.stack([self._preprocess_fast(img, device, side, rows, cols) for img in images])
         pixel_values = torch.stack([self._preprocess_one(img) for img in images])
         return pixel_values[..., :rows, :cols] if self.preprocess_pad_drop else pixel_values
 
