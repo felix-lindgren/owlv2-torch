@@ -20,6 +20,7 @@ ranks whatever the few examples say nothing about.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
@@ -52,13 +53,44 @@ class Flame:
         alpha: float = 8.0,
         svm_c: float = 1.0,
         batch_size: int = 8,
+        svm_backend: str = "sklearn",
+        n_components: int = 512,
+        svm_max_iter: int = 300,
+        svm_seed: int = 0,
+        svm_tol: float = 1e-3,
+        svm_cache_size_mb: float = 256,
+        svm_working_set_size: int = 512,
     ):
-        """``alpha`` weighs the SVM margin against the zero-shot logit; ``svm_c`` is the SVM's C."""
+        """``alpha`` weighs the SVM margin against the zero-shot logit; ``svm_c`` is C.
+
+        ``svm_backend`` is ``sklearn`` (CPU RBF SVC), ``torch`` (full-kernel
+        C-SVC on the model's device), ``nystrom`` or ``rff``. The Torch C-SVC
+        uses ``svm_tol`` for its global KKT gap, ``svm_cache_size_mb`` MiB for
+        kernel rows, and up to ``svm_working_set_size`` variables per solve.
+        ``svm_max_iter`` bounds working-set solves for the exact Torch backend.
+        The approximations fit ``n_components`` features in Torch on the model's
+        device, using balanced, Huber-smoothed hinge loss (width 0.01).
+        """
+        if svm_backend not in {"sklearn", "torch", "nystrom", "rff"}:
+            raise ValueError(f"Unknown SVM backend: {svm_backend}")
+        if n_components < 1 or svm_max_iter < 1 or not math.isfinite(svm_c) or svm_c <= 0:
+            raise ValueError("n_components, svm_max_iter and svm_c must be positive")
+        if not all(math.isfinite(v) and v > 0 for v in (svm_tol, svm_cache_size_mb)):
+            raise ValueError("svm_tol and svm_cache_size_mb must be finite and positive")
+        if svm_working_set_size < 2:
+            raise ValueError("svm_working_set_size must be at least 2")
         self.model = model.eval()
         self.queries = [queries] if isinstance(queries, str) else list(queries)
         self.alpha = alpha
         self.svm_c = svm_c
         self.batch_size = batch_size
+        self.svm_backend = svm_backend
+        self.n_components = n_components
+        self.svm_max_iter = svm_max_iter
+        self.svm_seed = svm_seed
+        self.svm_tol = svm_tol
+        self.svm_cache_size_mb = svm_cache_size_mb
+        self.svm_working_set_size = svm_working_set_size
         self.device = next(model.parameters()).device
         tokens = tokenize(self.queries, context_length=16, truncate=True).to(self.device)
         with torch.inference_mode():
@@ -99,7 +131,12 @@ class Flame:
         proposals that miss all of its boxes (IoU < 0.3), plus a random sample of the
         rest, become negatives. Proposals in between are left out.
         """
-        embeds, logits, objectness, props = next(self.proposals([image]))
+        self._add_proposals(next(self.proposals([image])), boxes, labels,
+                            hard_negatives=hard_negatives, random_negatives=random_negatives)
+
+    def _add_proposals(self, proposals, boxes, labels=None, *, hard_negatives=50, random_negatives=50):
+        """Add an example from cached proposals, using the same sampling as add_example."""
+        embeds, logits, objectness, props = proposals
         boxes = torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4).to(props.device)
         labels = torch.zeros(len(boxes), dtype=torch.long) if labels is None else torch.as_tensor(labels)
         if len(labels) != len(boxes):
@@ -156,19 +193,40 @@ class Flame:
 
     def fit(self):
         """Train one SVM per query that has both positives and negatives; others stay zero-shot."""
-        from sklearn.svm import SVC
-
         for c, examples in enumerate(self.examples):
             self.svms[c] = None
             if not examples:
                 continue
             x, y = (torch.cat(t) for t in zip(*examples))
-            x, y = x.float(), y.numpy()
+            x = x.float()
             if y.min() == y.max():
                 continue
             mean, std = x.mean(0), x.std(0) + 1e-6
+            z = (x - mean) / std
+            if self.svm_backend != "sklearn":
+                variance = float(z.double().var(correction=0))
+                gamma = 1.0 / (z.shape[1] * variance) if variance else 1.0
+                if self.svm_backend == "torch":
+                    from .flame_svm import fit_rbf
+
+                    fitted = fit_rbf(z, y, gamma=gamma, c=self.svm_c, device=self.device,
+                                     max_iter=self.svm_max_iter, tol=self.svm_tol,
+                                     cache_size_mb=self.svm_cache_size_mb,
+                                     working_set_size=self.svm_working_set_size)
+                else:
+                    from .flame_features import fit_approximate
+
+                    fitted = fit_approximate(
+                        z, y, backend=self.svm_backend, gamma=gamma, c=self.svm_c,
+                        n_components=self.n_components, device=self.device,
+                        seed=self.svm_seed + c, max_iter=self.svm_max_iter,
+                    )
+                self.svms[c] = {"mean": mean, "std": std, **fitted}
+                continue
+            from sklearn.svm import SVC
+
             svc = SVC(C=self.svm_c, kernel="rbf", gamma="scale", class_weight="balanced")
-            svc.fit(((x - mean) / std).numpy(), y)
+            svc.fit(z.numpy(), y.numpy())
             self.svms[c] = {
                 "mean": mean, "std": std, "gamma": float(svc._gamma),
                 "vectors": torch.as_tensor(svc.support_vectors_, dtype=torch.float32),
@@ -180,22 +238,27 @@ class Flame:
             print(f"[FLAME] no positive+negative examples for {missing}; those stay zero-shot")
         return self
 
-    def scores(self, embeds, logits, objectness):
-        """Refined ``[P, C]`` scores for the outputs of :meth:`proposals`.
-
-        ``sigmoid(zero-shot logit + alpha * margin) * sigmoid(objectness)``; queries
-        without an SVM keep their zero-shot score.
-        """
-        out = torch.sigmoid(logits) * torch.sigmoid(objectness)[:, None]
+    def margins(self, embeds):
+        """SVM decision margins ``[P, C]``; zero for queries without a classifier."""
+        out = embeds.new_zeros((len(embeds), len(self.queries)))
         for c, svm in enumerate(self.svms):
             if svm is None:
                 continue
             x = (embeds - svm["mean"].to(embeds.device)) / svm["std"].to(embeds.device)
-            sv = svm["vectors"].to(embeds.device)
-            dist = (x * x).sum(1, keepdim=True) + (sv * sv).sum(1) - 2 * x @ sv.T
-            margin = torch.exp(-svm["gamma"] * dist.clamp_min(0)) @ svm["coef"].to(embeds.device) + svm["bias"]
-            out[:, c] = torch.sigmoid(logits[:, c] + self.alpha * margin) * torch.sigmoid(objectness)
+            if svm.get("backend") == "rff":
+                features = torch.cos(x @ svm["frequencies"].to(embeds.device)
+                                     + svm["phases"].to(embeds.device))
+                margin = features @ svm["coef"].to(embeds.device) + svm["bias"]
+            else:
+                sv = svm["vectors"].to(embeds.device)
+                dist = (x * x).sum(1, keepdim=True) + (sv * sv).sum(1) - 2 * x @ sv.T
+                margin = torch.exp(-svm["gamma"] * dist.clamp_min(0)) @ svm["coef"].to(embeds.device) + svm["bias"]
+            out[:, c] = margin
         return out
+
+    def scores(self, embeds, logits, objectness):
+        """``sigmoid(zero-shot logit + alpha * margin) * sigmoid(objectness)``."""
+        return torch.sigmoid(logits + self.alpha * self.margins(embeds)) * torch.sigmoid(objectness)[:, None]
 
     def detect(self, images, threshold: float = 0.01, top_k: int = 100, nms: float | None = 0.5):
         """Return ``(boxes xyxy, scores, labels)`` for one image, or a list of them for a list.
@@ -213,12 +276,20 @@ class Flame:
     def save(self, path):
         """Save the queries and labelled examples; :meth:`load` refits the SVMs from them."""
         torch.save({"queries": self.queries, "alpha": self.alpha, "svm_c": self.svm_c,
+                    "svm_backend": self.svm_backend, "n_components": self.n_components,
+                    "svm_max_iter": self.svm_max_iter, "svm_seed": self.svm_seed,
+                    "svm_tol": self.svm_tol, "svm_cache_size_mb": self.svm_cache_size_mb,
+                    "svm_working_set_size": self.svm_working_set_size,
                     "examples": self.examples}, path)
 
     @classmethod
     def load(cls, path, model, **kwargs):
         state = torch.load(path, weights_only=True)
-        flame = cls(model, state["queries"], alpha=state["alpha"], svm_c=state["svm_c"], **kwargs)
+        options = {key: state[key] for key in ("svm_backend", "n_components", "svm_max_iter", "svm_seed",
+                                              "svm_tol", "svm_cache_size_mb", "svm_working_set_size")
+                   if key in state}
+        options.update(kwargs)
+        flame = cls(model, state["queries"], alpha=state["alpha"], svm_c=state["svm_c"], **options)
         flame.examples = state["examples"]
         return flame.fit()
 

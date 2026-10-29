@@ -171,6 +171,48 @@ boxes, scores, labels = flame.detect("test.jpg")      # threshold=0.01 by defaul
 flame.save("flame.pt")                                # Flame.load("flame.pt", model)
 ```
 
+For full RBF SVM fitting on the model's GPU:
+
+```python
+flame = Flame(model, queries, svm_backend="torch", svm_tol=1e-3,
+              svm_cache_size_mb=256, svm_working_set_size=512)
+```
+
+This solves the ordinary balanced C-SVC dual with an unregularized intercept,
+using all labelled examples and the same standardization and `gamma="scale"`
+as sklearn. Working sets and a bounded kernel-row cache avoid requiring the
+entire N-by-N kernel matrix. CUDA uses a fused Triton SMO loop when Triton is
+available, with a slower Torch fallback; CPU fitting is also supported.
+`svm_max_iter` limits outer working-set solves (default 300). Each head's
+`flame.svms[c]["fit"]` records the global KKT gap and convergence status;
+an unfinished fit emits a warning. The default remains sklearn.
+See [full-kernel GPU SVM notes](docs/flame-gpu-svm.md) for implementation details
+and the DIOR comparison command.
+
+The earlier approximate RBF backends remain available:
+
+```python
+flame = Flame(model, queries, svm_backend="nystrom", n_components=512)
+# Alternatively: svm_backend="rff" for random Fourier features.
+```
+
+Both use the same standardization, RBF gamma and balanced class penalties as the
+default sklearn SVC. They optimize a hinge loss smoothed over a width of 0.01;
+`svm_max_iter` controls the Torch Newton iteration budget (default 300).
+Nyström includes rare positive examples among its landmarks and folds the
+fitted weights into the existing RBF scorer. `svm_seed` controls reproducibility.
+Saved FLAME files retain the backend configuration; older files use sklearn.
+
+`tools/benchmark_flame_features.py` compares these backends with sklearn on
+identical cached COCO proposals, reporting detection AP, fit time and margin differences. Its
+default protocol samples support outside COCO mini500 and evaluates on mini500:
+
+```bash
+uv run --extra train python tools/benchmark_flame_features.py \
+    --device cuda --components 256 1024 --seeds 0 \
+    --output data/flame_features/results.json
+```
+
 Boxes must cover every instance of every query in that image, because anything
 left unboxed is used as a negative. A query that ends up with no positives stays
 zero-shot. Refined scores are low in absolute terms: F1 peaked at thresholds of
