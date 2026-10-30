@@ -171,7 +171,15 @@ boxes, scores, labels = flame.detect("test.jpg")      # threshold=0.01 by defaul
 flame.save("flame.pt")                                # Flame.load("flame.pt", model)
 ```
 
-For full RBF SVM fitting on the model's GPU:
+Boxed examples train a shared, regularized box-correction head by default when
+`fit()` runs. It uses `ridge=0.01`, `min_iou=0.3` and `strength=0.5`, retains at
+most four visual rows per matched object, and refreshes after more boxed
+examples are added. Use `Flame(model, queries, box_refinement=False)` for
+original boxes. Yes/no-only support keeps the original boxes, and older
+checkpoints retain their saved behavior.
+
+FLAME uses the full-kernel Torch C-SVC fitter by default, on the model's device.
+Its GPU fitting controls are:
 
 ```python
 flame = Flame(model, queries, svm_backend="torch", svm_tol=1e-3,
@@ -185,7 +193,9 @@ entire N-by-N kernel matrix. CUDA uses a fused Triton SMO loop when Triton is
 available, with a slower Torch fallback; CPU fitting is also supported.
 `svm_max_iter` limits outer working-set solves (default 300). Each head's
 `flame.svms[c]["fit"]` records the global KKT gap and convergence status;
-an unfinished fit emits a warning. The default remains sklearn.
+an unfinished fit emits a warning. Use `svm_backend="sklearn"` for the CPU
+reference. Saved files preserve their backend; legacy files without a backend
+field retain their original sklearn behavior.
 See [full-kernel GPU SVM notes](docs/flame-gpu-svm.md) for implementation details
 and the DIOR comparison command.
 
@@ -197,7 +207,7 @@ flame = Flame(model, queries, svm_backend="nystrom", n_components=512)
 ```
 
 Both use the same standardization, RBF gamma and balanced class penalties as the
-default sklearn SVC. They optimize a hinge loss smoothed over a width of 0.01;
+reference sklearn SVC. They optimize a hinge loss smoothed over a width of 0.01;
 `svm_max_iter` controls the Torch Newton iteration budget (default 300).
 Nyström includes rare positive examples among its landmarks and folds the
 fitted weights into the existing RBF scorer. `svm_seed` controls reproducibility.
@@ -212,6 +222,113 @@ uv run --extra train python tools/benchmark_flame_features.py \
     --device cuda --components 256 1024 --seeds 0 \
     --output data/flame_features/results.json
 ```
+
+Experimental [APE feature selection](https://arxiv.org/abs/2304.01195) can reduce
+the SVM input dimensions while retaining the original zero-shot logits:
+
+```python
+flame = Flame(model, queries, ape_channels=384, ape_source="text",
+              ape_similarity_weight=0.9)
+```
+
+It requires at least two queries and is disabled by default. `ape_source="text_support"`
+also uses positive support features for the inter-class similarity criterion;
+`ape_normalize=True` normalizes selected features before SVM standardization.
+This uses APE's channel criterion with FLAME's SVM, rather than APE's cache
+classifier. On a held-out 500-image DIOR subset (three support draws), it reduced
+mean mAP from 32.05 to 31.78 while cutting SVM fit time from 11.5 to 6.7 seconds.
+See the [DIOR experiment](docs/flame-ape-findings.md) for the comparison and
+benchmark commands.
+
+GDA and Tip-Adapter proposal refiners can also be attached after fitting FLAME:
+
+```python
+flame.fit()
+flame.fit_refiner("gda", weight=1.0)
+# Alternatively: flame.fit_refiner("tip", weight=8.0, tip_beta=5.0)
+```
+
+The head uses the stored examples and is included in `detect()` and saved
+checkpoints. To use a refiner alone, call `fit_refiner(..., svm_weight=0)`
+directly, without first fitting SVMs. GDA uses regularized foreground/background
+covariance; Tip-Adapter uses up to 128 positive and 128 negative keys per query
+by default (`tip_negative=False` selects a positive-only cache).
+On the same DIOR subset, mean mAP was 32.05 for FLAME, 32.14 with GDA and 32.01
+with Tip-Adapter. These small differences varied across support draws; both
+heads remain optional. See [refiner results and commands](docs/flame-refiners-findings.md).
+
+The SVM can also use features before the class projection, or combine them with
+the original embeddings:
+
+```python
+flame = Flame(model, queries, feature_source="combined", visual_weight=0.1)
+# feature_source="visual" uses only pre-projection visual features.
+```
+
+Choose the source before adding support examples. The default is `"class"`.
+Combined mode balances the two standardized feature blocks; `visual_weight`
+controls their distance contributions rather than their raw dimension counts.
+`visual_normalize=False` retains raw visual features. Both representations are
+already computed in the same encoder pass, and the original detection heads
+are preserved. Settings and the chosen support features are saved together.
+APE channel selection currently requires the `"class"` source.
+
+On a fresh matched 500-image DIOR cache (three support draws), the 10% visual
+blend improved mean mAP from 32.20 to 32.33, with SVM fit time rising from 11.7
+to 25.1 seconds. Visual-only features reached 31.15. The class source remains
+the default.
+
+The [feature comparison](docs/flame-visual-features-findings.md) records results
+and commands. [Follow-up notes](docs/flame-next-steps.md) track the experiments
+on mining negatives after fitting, balancing instances, and correcting boxes.
+
+Support sampling and one extra hard-negative pass can be compared without
+encoding images again:
+
+```python
+cached = [tuple(t.cpu() for t in p) for p in flame.proposals(support_images)]
+support = list(zip(cached, support_boxes, support_labels))
+flame.fit_support(support, mining_rounds=1)
+# Optional: max_positives_per_object=8, mining_nms=0.7
+```
+
+Mining replaces the hard negatives and keeps the initial random anchors, so
+the sample budget stays fixed. The caller retains the full proposal cache;
+checkpoints save the selected bank and sampling settings. Positive capping is
+also available directly through `add_example(..., max_positives_per_object=8)`.
+On the same 500-image DIOR subset, Torch-fit baseline/capping/mining/both reached
+32.20/32.31/32.29/32.28 mean mAP, with mixed changes across support draws. Sampling
+remains optional. See the [sampling comparison](docs/flame-sampling-findings.md)
+for GPU timings, convergence checks and commands.
+
+Cached support can train the default box head and classifiers together:
+
+```python
+cached = [tuple(t.cpu() for t in p)
+          for p in flame.proposal_features(support_images)]
+flame.fit_support(list(zip(cached, support_boxes, support_labels)))
+boxes, scores, labels = flame.detect("test.jpg")
+```
+
+Full five-tensor `proposal_features()` records include the visual features
+needed by the box head. Historical four-tensor `proposals()` records still
+train classifiers alone. `fit_box_refiner([(visual, proposals, truth), ...])`
+can explicitly fit a head from a separate boxed cache or override its settings.
+
+The linear head uses frozen visual features to predict normalized
+center shifts and log-size changes before NMS. Ridge regularization favors zero
+correction, with explicit bounds on both kinds of offset. Each represented
+support object has equal fitting weight, with at most four proposal rows per
+object. The base model stays frozen, scores are preserved, and detection still
+uses one encoder pass. Checkpoints save the fitted head and compact boxed
+support bank for incremental fitting. Yes/no labels alone cannot fit it.
+
+On the same 500 held-out DIOR images and three support draws, the development-
+selected setting (`min_iou=0.3, ridge=0.01, strength=0.5`) improved mean mAP from
+32.205 to 32.532, AP75 from 31.914 to 33.197, and small-object AP from 13.655 to
+14.189. All three draws improved. It adds 12,304 bytes and about 3.1 ms per
+cached image on CPU; GPU latency was not measured. See the
+[box-head experiment](docs/flame-boxes-findings.md) for details and commands.
 
 Boxes must cover every instance of every query in that image, because anything
 left unboxed is used as a negative. A query that ends up with no positives stays

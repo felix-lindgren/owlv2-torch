@@ -1,7 +1,8 @@
 # Full-kernel FLAME SVM on GPU
 
 `Flame(..., svm_backend="torch")` fits the ordinary binary RBF C-SVC on the
-model's device. sklearn remains the default backend. This backend uses every
+model's device and is the default for new `Flame` instances as of 2026-10-29.
+Use `svm_backend="sklearn"` for the explicit CPU reference. This backend uses every
 labelled proposal, without landmarks, random features, hinge smoothing or a
 regularized intercept. It shares FLAME's float16 example storage, float32
 standardization, sample standard deviation, `gamma="scale"`, `C` and balanced

@@ -1,7 +1,8 @@
 # FLAME with Torch feature approximations
 
 `Flame(..., svm_backend="nystrom" | "rff", n_components=...)` fits on the
-OWLv2 model's device without adding dependencies. The default remains sklearn.
+OWLv2 model's device without adding dependencies. The current default is the
+full-kernel Torch fitter; the measurements below used sklearn as the reference.
 
 The reference and approximate fits share exactly the same labelled proposals,
 per-feature mean and sample standard deviation, `gamma="scale"`, `C=1`, balanced
@@ -76,7 +77,9 @@ fits 2.77 times faster than sklearn and loses 1.83 AP.
 The Nyström 1024 deficit is uneven across classes: sandwich loses 10.15 AP,
 carrot 5.55, dining table 5.38, hot dog 4.68 and skateboard 4.59 relative to
 sklearn. Full per-class values are in the JSON. The tested feature budgets do
-not preserve the reference FLAME gain on this split; sklearn remains the default.
+not preserve the reference FLAME gain on this split. At the time of that
+experiment sklearn remained the default; the full-kernel Torch fitter is now
+the default for new instances.
 
 Final metrics: [coco_newton_seed0.json](../data/flame_features/coco_newton_seed0.json).
 The sklearn control was reused from an earlier pass over the identical cached

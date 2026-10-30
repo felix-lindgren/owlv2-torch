@@ -298,6 +298,10 @@ def pool_query_logits(
     logits: torch.Tensor, indices_by_class: list[list[int]]
 ) -> torch.Tensor:
     """Max-pool alias logits into the fixed evaluation class space."""
+    if len(indices_by_class) == logits.shape[-1] and all(
+        indices == [index] for index, indices in enumerate(indices_by_class)
+    ):
+        return logits
     return torch.stack(
         [logits[..., indices].amax(dim=-1) for indices in indices_by_class], dim=-1
     )

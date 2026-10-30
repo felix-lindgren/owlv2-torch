@@ -407,6 +407,13 @@ worse on full val and Fashionpedia, so √objectness is the default.
   lands on the fixed-keep curve, prompt ensembles change ±0.001, and NMS
   hurts.
 
+Follow-up GPU measurements on 2026-10-28 are in
+[`inference-speed-profile.md`](inference-speed-profile.md): an identity-alias
+pooling bypass makes the evaluator 1.54x faster with identical detections;
+composed preprocessing plus CUDA graphs gives 1.12x on four fixed-size
+PIL-to-host cases. Fixed TensorRT profiles add about 4%, FULL tiling adds
+nothing measurable, and actual 2:4 sparse MLP tactics add only about 3%.
+
 **OWLv2-large.** The same sweep on large (1008 px, patch 14) ran on a
 padding-free engine (`export_pruned.py --model-type large`; mini500 0.4975
 against torch 0.4976). Long sides 812 and 742 are the canvas fractions of

@@ -1,4 +1,4 @@
-"""Compare sklearn FLAME with full-kernel Torch C-SVC or Nyström/RFF on cached proposals.
+"""Compare FLAME SVM backends, APE selection and visual feature sources.
 
 Default support is sampled from val2017 outside the existing mini500 eval set,
 since the local COCO installation has no train2017 annotations. Evaluation
@@ -15,6 +15,7 @@ import argparse
 import copy
 import hashlib
 import json
+import math
 import random
 import time
 from collections import defaultdict
@@ -80,7 +81,20 @@ def main():
                         help="Optional JSON {seed: [image IDs]} to compare nested support sets.")
     parser.add_argument("--seeds", type=int, nargs="+", default=[0])
     parser.add_argument("--components", type=int, nargs="+", default=[256, 1024])
-    parser.add_argument("--backends", nargs="+", choices=["torch", "nystrom", "rff"], default=["nystrom", "rff"])
+    parser.add_argument("--backends", nargs="+", choices=["sklearn", "torch", "nystrom", "rff"],
+                        default=["nystrom", "rff"], help="sklearn is always included as the control.")
+    parser.add_argument("--ape-channels", type=int, nargs="+", default=[],
+                        help="Also fit sklearn FLAME after APE selects these channel budgets.")
+    parser.add_argument("--ape-sources", nargs="+", choices=["text", "text_support"], default=["text_support"])
+    parser.add_argument("--ape-similarity-weights", type=float, nargs="+", default=[0.9])
+    parser.add_argument("--ape-normalize", action="store_true",
+                        help="L2-normalize selected APE features before the SVM standardization.")
+    parser.add_argument("--feature-sources", nargs="+", choices=["class", "visual", "combined"], default=["class"],
+                        help="Also compare sklearn on pre-projection visual or combined features.")
+    parser.add_argument("--visual-weights", type=float, nargs="+", default=[0.25, 0.5, 0.75],
+                        help="Visual branch weights for combined standardized RBF distances.")
+    parser.add_argument("--visual-no-normalize", action="store_true",
+                        help="Use raw pre-projection features instead of L2-normalizing their rows.")
     parser.add_argument("--svm-max-iter", type=int, default=300)
     parser.add_argument("--svm-tol", type=float, default=1e-3)
     parser.add_argument("--svm-cache-size-mb", type=float, default=256)
@@ -94,6 +108,9 @@ def main():
     parser.add_argument("--reference-results", type=Path,
                         help="Reuse a completed sklearn control from the identical support/eval protocol.")
     args = parser.parse_args()
+    if any(not math.isfinite(w) or not 0 < w < 1 for w in args.visual_weights):
+        parser.error("--visual-weights must be between 0 and 1, exclusive")
+    include_visual = any(s != "class" for s in args.feature_sources)
     torch.set_num_threads(8)
     torch.set_float32_matmul_precision("highest")
     device = torch.device(args.device)
@@ -165,7 +182,7 @@ def main():
     def query(name):
         return args.query_template.format(name=name.strip().lower().replace("-", " ").replace("_", " "))
 
-    source = Flame(model, [query(name) for name in names], alpha=args.alpha,
+    source = Flame(model, [query(name) for name in names], alpha=args.alpha, box_refinement=False,
                    svm_c=args.svm_c, batch_size=args.batch_size, svm_tol=args.svm_tol,
                    svm_cache_size_mb=args.svm_cache_size_mb,
                    svm_working_set_size=args.svm_working_set_size)
@@ -174,9 +191,13 @@ def main():
     all_names = [category["name"] for category in sorted(full["categories"], key=lambda c: c["id"])]
     extractor = Flame(model, [query(name) for name in all_names], batch_size=args.batch_size)
     query_columns = [all_names.index(name) for name in names]
+    selectors = {mode: copy.copy(source) for mode in set(args.feature_sources) | {"class"}}
+    for mode, selector in selectors.items():
+        selector.feature_source = mode
+        selector.visual_normalize = not args.visual_no_normalize
 
     def cache_directory(image_root):
-        cache = args.cache_dir / "base_default_float32_v1"
+        cache = args.cache_dir / ("base_visual_float32_v1" if include_visual else "base_default_float32_v1")
         # Keep the original COCO cache usable. Custom datasets/prompts get an
         # explicit namespace containing the physical image root and vocabulary.
         legacy = (args.dataset_label == "coco" and args.annotations is None and args.eval_annotations is None
@@ -205,13 +226,22 @@ def main():
             for image_id in batch_ids:
                 with Image.open(image_root / split_images[image_id]["file_name"]) as image:
                     batch.append(image.convert("RGB"))
-            for image_id, proposals in zip(batch_ids, extractor.proposals(batch)):
+            extraction = extractor.proposal_features(batch) if include_visual else extractor.proposals(batch)
+            for image_id, proposals in zip(batch_ids, extraction):
                 torch.save(tuple(tensor.cpu().clone() for tensor in proposals), caches[split] / f"{image_id}.pt")
     extraction_seconds = time.perf_counter() - extraction_start
 
-    def load(image_id, split="eval"):
-        embeds, logits, objectness, boxes = torch.load(caches[split] / f"{image_id}.pt", weights_only=True)
-        return tuple(tensor.to(device) for tensor in (embeds, logits[:, query_columns], objectness, boxes))
+    def load(image_id, split="eval", feature_source="class"):
+        cached = torch.load(caches[split] / f"{image_id}.pt", weights_only=True)
+        if include_visual:
+            embeds, visual, logits, objectness, boxes = cached
+        else:
+            embeds, logits, objectness, boxes = cached
+            visual = None
+        selected = selectors[feature_source].select_features(
+            embeds.to(device), visual.to(device) if feature_source != "class" else None,
+        )
+        return selected, logits[:, query_columns].to(device), objectness.to(device), boxes.to(device)
 
     payload = {"protocol": {"model": "owlv2-base", "device": str(device),
                             "dataset": args.dataset_label,
@@ -228,12 +258,20 @@ def main():
                             "svm_max_iter": args.svm_max_iter,
                             "svm_tol": args.svm_tol, "svm_cache_size_mb": args.svm_cache_size_mb,
                             "svm_working_set_size": args.svm_working_set_size,
-                            "smoothing": 0.01 if any(b != "torch" for b in args.backends) else 0.0,
+                            "ape_channels": args.ape_channels, "ape_sources": args.ape_sources,
+                            "ape_similarity_weights": args.ape_similarity_weights,
+                            "ape_normalize": args.ape_normalize,
+                            "feature_sources": args.feature_sources, "visual_weights": args.visual_weights,
+                            "visual_normalize": not args.visual_no_normalize,
+                            "feature_cache_kind": "class_and_visual" if include_visual else "class",
+                            "smoothing": 0.01 if any(b in {"nystrom", "rff"} for b in args.backends) else 0.0,
                             "extraction_seconds_this_run": extraction_seconds,
                             "approximate_solver": "newton", "exact_solver": "hierarchical_smo"}, "runs": []}
     previous = None
     if args.reference_results:
         previous = json.loads(args.reference_results.read_text())
+        if include_visual and previous["protocol"].get("cache_directories") != payload["protocol"]["cache_directories"]:
+            parser.error("A visual-feature comparison must reuse a control from the same representation cache")
         for key in ("model", "annotations", "eval_annotations", "eval_image_ids", "classes", "alpha", "svm_c"):
             if previous["protocol"][key] != payload["protocol"][key]:
                 parser.error(f"Reference protocol differs for {key}")
@@ -246,7 +284,9 @@ def main():
         for seed, ids in support_sets.items():
             if previous["protocol"]["support_image_ids"].get(str(seed)) != ids:
                 parser.error(f"Reference support images differ for seed {seed}")
-            if not any(run["backend"] == "sklearn" and run["seed"] == seed for run in previous["runs"]):
+            if not any(run["backend"] == "sklearn" and run["seed"] == seed
+                       and run.get("ape_channels") is None and run.get("feature_source", "class") == "class"
+                       for run in previous["runs"]):
                 parser.error(f"Reference has no completed sklearn control for seed {seed}")
         payload["reference_results"] = str(args.reference_results)
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -269,40 +309,70 @@ def main():
     save()
 
     for seed, support in support_sets.items():
-        source.examples = [[] for _ in names]
-        source._rng = torch.Generator().manual_seed(0)
-        for image_id in tqdm(support, desc=f"support seed {seed}"):
-            anns = [ann for ann in annotations_by_image[image_id] if ann["category_id"] in to_query]
-            boxes = [[x, y, x + w, y + h] for x, y, w, h in (ann["bbox"] for ann in anns)]
-            labels = [to_query[ann["category_id"]] for ann in anns]
-            with torch.inference_mode():
-                source._add_proposals(load(image_id, "support"), boxes, labels)
+        example_banks = {}
+        for mode, selector in selectors.items():
+            selector.examples = [[] for _ in names]
+            selector._rng = torch.Generator().manual_seed(0)
+            for image_id in tqdm(support, desc=f"support {mode} seed {seed}"):
+                anns = [ann for ann in annotations_by_image[image_id] if ann["category_id"] in to_query]
+                boxes = [[x, y, x + w, y + h] for x, y, w, h in (ann["bbox"] for ann in anns)]
+                labels = [to_query[ann["category_id"]] for ann in anns]
+                with torch.inference_mode():
+                    selector._add_proposals(load(image_id, "support", mode), boxes, labels)
+            example_banks[mode] = selector.examples
+        source.examples = example_banks["class"]
+        for mode, bank in example_banks.items():
+            for original, selected in zip(source.examples, bank):
+                original_targets = torch.cat([y for _, y in original]) if original else torch.empty(0)
+                selected_targets = torch.cat([y for _, y in selected]) if selected else torch.empty(0)
+                if not torch.equal(original_targets, selected_targets):
+                    raise RuntimeError(f"Support labels changed with feature source {mode}")
         counts = []
         for examples in source.examples:
             y = torch.cat([targets for _, targets in examples]) if examples else torch.empty(0)
             counts.append({"positive": int((y == 1).sum()), "negative": int((y == 0).sum())})
-        variants = [(backend, rank) for backend in args.backends
+        variants = [(backend, rank, None, None, None, "class", None) for backend in args.backends if backend != "sklearn"
                     for rank in ([0] if backend == "torch" else args.components)]
+        variants += [("sklearn", 0, channels, weight, ape_source, "class", None)
+                     for ape_source in args.ape_sources for weight in args.ape_similarity_weights
+                     for channels in args.ape_channels]
+        if "visual" in args.feature_sources:
+            variants.append(("sklearn", 0, None, None, None, "visual", None))
+        if "combined" in args.feature_sources:
+            variants += [("sklearn", 0, None, None, None, "combined", w) for w in args.visual_weights]
         if previous:
             reused = copy.deepcopy(next(run for run in previous["runs"]
-                                        if run["backend"] == "sklearn" and run["seed"] == seed))
+                                        if run["backend"] == "sklearn" and run["seed"] == seed
+                                        and run.get("ape_channels") is None
+                                        and run.get("feature_source", "class") == "class"))
             reused["reused_from"] = str(args.reference_results)
             payload["runs"].append(reused)
             save()
         else:
-            variants.insert(0, ("sklearn", 0))
+            variants.insert(0, ("sklearn", 0, None, None, None, "class", None))
         reference = None
-        for backend, rank in variants:
+        for backend, rank, channels, weight, ape_source, feature_source, visual_weight in variants:
             flame = copy.copy(source)
             flame.svms = [None] * len(names)
             flame.svm_backend, flame.n_components = backend, rank
             flame.svm_seed, flame.svm_max_iter = seed, args.svm_max_iter
+            flame.ape_channels = channels
+            flame.feature_source = feature_source
+            flame.visual_weight = 0.5 if visual_weight is None else visual_weight
+            flame.visual_normalize = not args.visual_no_normalize
+            flame.examples = example_banks[feature_source]
+            if channels is not None:
+                flame.ape_similarity_weight, flame.ape_source = weight, ape_source
+                flame.ape_normalize = args.ape_normalize
+            variant = f"{backend}/{rank}" if channels is None else f"ape/{ape_source}/{channels}/w{weight:g}"
+            if feature_source != "class":
+                variant = f"{feature_source}" + (f"/w{visual_weight:g}" if visual_weight is not None else "")
             synchronize(device)
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
                 allocated_before = torch.cuda.memory_allocated(device)
             start = time.perf_counter()
-            print(f"Fitting seed={seed} {backend}/{rank} ...", flush=True)
+            print(f"Fitting seed={seed} {variant} ...", flush=True)
             flame.fit()
             synchronize(device)
             fit_seconds = time.perf_counter() - start
@@ -310,14 +380,16 @@ def main():
                        if device.type == "cuda" else None)
             classifier_sizes = [sum(v.numel() * v.element_size() for v in svm.values() if torch.is_tensor(v))
                                 for svm in flame.svms if svm is not None]
-            print(f"seed={seed} {backend}/{rank}: fitted in {fit_seconds:.2f}s; "
+            if flame.ape_indices is not None:
+                classifier_sizes.append(flame.ape_indices.numel() * flame.ape_indices.element_size())
+            print(f"seed={seed} {variant}: fitted in {fit_seconds:.2f}s; "
                   f"classifier {sum(classifier_sizes) / 2**20:.2f} MiB", flush=True)
             detections, sampled_margins = [], []
             synchronize(device)
             start = time.perf_counter()
-            for image in tqdm(eval_images, desc=f"{backend}/{rank} seed {seed}"):
+            for image in tqdm(eval_images, desc=f"{variant} seed {seed}"):
                 with torch.inference_mode():
-                    embeds, logits, objectness, boxes = load(image["id"])
+                    embeds, logits, objectness, boxes = load(image["id"], feature_source=feature_source)
                     margins = flame.margins(embeds)
                     # Sample high-objectness proposals to avoid measuring only background.
                     sample = objectness.topk(min(64, len(objectness))).indices
@@ -327,10 +399,15 @@ def main():
             synchronize(device)
             scoring_seconds = time.perf_counter() - start
             current = torch.cat(sampled_margins)
-            if backend == "sklearn":
+            if backend == "sklearn" and channels is None and feature_source == "class":
                 reference = current
             difference = current - reference if reference is not None else None
             result = {"seed": seed, "backend": backend, "components": rank, "fit_seconds": fit_seconds,
+                      "ape_channels": channels, "ape_similarity_weight": weight, "ape_source": ape_source,
+                      "ape_normalize": args.ape_normalize if channels is not None else None,
+                      "ape_indices": flame.ape_indices.tolist() if flame.ape_indices is not None else None,
+                      "feature_source": feature_source, "feature_dim": flame.feature_dim,
+                      "visual_weight": visual_weight, "visual_normalize": not args.visual_no_normalize,
                       "score_seconds_including_cache_io": scoring_seconds, "peak_fit_extra_mb": peak_mb,
                       "classifier_mb": sum(classifier_sizes) / 2**20, "support_counts": counts,
                       "missing_classes": [name for name, svm in zip(names, flame.svms) if svm is None],
@@ -342,7 +419,7 @@ def main():
                       "metrics": metrics(gt, detections)}
             payload["runs"].append(result)
             save()
-            print(f"RESULT seed={seed} {backend}/{rank}: mAP={result['metrics']['map']:.6f}, "
+            print(f"RESULT seed={seed} {variant}: mAP={result['metrics']['map']:.6f}, "
                   f"AP50={result['metrics']['map_50']:.6f}, fit={fit_seconds:.2f}s, "
                   f"margin MAE={result['margin_mae']}", flush=True)
     print(f"Wrote {args.output}", flush=True)
