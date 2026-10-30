@@ -37,6 +37,15 @@ class BoxRefiner:
         return boxes
 
     @staticmethod
+    def _proposals(boxes, device):
+        """Proposal boxes may be empty: OWLv2 clamps the boxes of padding patches of a non-square
+        image to its edge. An empty box overlaps nothing, so it is never matched or corrected."""
+        boxes = torch.as_tensor(boxes, dtype=torch.float32, device=device).reshape(-1, 4)
+        if not bool(torch.isfinite(boxes).all()) or bool((boxes[:, 2:] < boxes[:, :2]).any()):
+            raise ValueError("Proposal boxes must be finite xyxy coordinates")
+        return boxes
+
+    @staticmethod
     def _design(features):
         x = normalize(features.float(), dim=-1)
         return torch.cat((x, x.new_ones((len(x), 1))), dim=-1)
@@ -50,7 +59,7 @@ class BoxRefiner:
             visual = visual.detach().float().to(device)
             if visual.ndim != 2 or visual.shape[1] == 0 or not bool(torch.isfinite(visual).all()):
                 raise ValueError("Visual features must be a finite [P,D] tensor with D > 0")
-            proposals, truth = self._boxes(proposals, device), self._boxes(truth, device)
+            proposals, truth = self._proposals(proposals, device), self._boxes(truth, device)
             if len(visual) != len(proposals):
                 raise ValueError("Features and proposal boxes must have the same row count")
             chosen = torch.empty(0, dtype=torch.long, device=device)
@@ -90,7 +99,7 @@ class BoxRefiner:
             if dimension is not None and dimension != visual.shape[1]:
                 raise ValueError("All support features must have the same dimension")
             dimension = visual.shape[1]
-            proposals = self._boxes(proposals, device)
+            proposals = self._proposals(proposals, device)
             truth = self._boxes(truth, device)
             if len(visual) != len(proposals):
                 raise ValueError("Features and proposal boxes must have the same row count")

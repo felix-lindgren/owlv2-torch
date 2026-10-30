@@ -90,3 +90,19 @@ def test_load_older_flame_checkpoint(tmp_path):
     restored = Flame.load(path, TextOnlyModel())
     assert restored.svm_backend == "sklearn"
     assert restored.svms[0] is not None
+
+
+def test_box_head_skips_the_empty_boxes_of_padding_patches():
+    from OWLv2torch.torch_version.flame_boxes import BoxRefiner
+
+    # OWLv2 pads a non-square image and clamps its padding patches' boxes to the image edge.
+    proposals = torch.tensor([[10.0, 10.0, 20.0, 20.0], [50.0, 0.0, 50.0, 30.0], [0.0, 40.0, 30.0, 40.0]])
+    visual = torch.randn(3, 8, generator=torch.Generator().manual_seed(0))
+    support = [(visual, proposals, torch.tensor([[9.0, 9.0, 21.0, 21.0]]))]
+
+    head = BoxRefiner().fit(support)
+
+    assert head.stats["selected_proposals"] == 1
+    assert [len(rows) for rows, _, _ in head.prepare_support(support)] == [1]
+    corrected = head(visual, proposals)
+    assert corrected[1, 0] == corrected[1, 2] and corrected[2, 1] == corrected[2, 3]  # still empty
